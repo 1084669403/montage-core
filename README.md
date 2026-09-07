@@ -148,6 +148,15 @@ montage-core/
 
 本轮不引入 Remotion / HyperFrames：产品是拼接 AI 片段（FFmpeg 已覆盖）；Node 运行时会拆仓库；若抄 OpenMontage 合成器会触 AGPL。
 
+## 生态（Ecosystem）
+
+montage-core 按依赖方向拆出两个可独立使用的库（行为与主仓对应层一致）：
+
+- **[montage-providers](https://github.com/1084669403/montage-providers)** — 国产多供应商视频/图像/TTS 统一 SDK：能力表驱动路由、逐 API 面"提示词方言"、黄金 fixture 契约测试，零第三方依赖。
+- **[montage-composer](https://github.com/1084669403/montage-composer)** — 纯 FFmpeg 合成工具库：xfade 转场链、Ken Burns、LUT 调色（含 6 个原创 LUT）、字幕、ducking 混音、平台出片档案，零第三方依赖。
+
+> 演示视频（可灵生成）待补：占位 — TODO(demo video)。
+
 ## 许可证
 
 MIT。代码为全新原创实现；`prompt_library/` 词条来源见 `prompt_library/CREDITS.md`
