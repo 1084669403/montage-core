@@ -1,3 +1,5 @@
+[中文](README.md) | [English](README.en.md)
+
 # montage-core
 
 **中文优先、Agent 驱动的 AI 视频生产系统**（独立项目，全新原创代码，MIT）。
@@ -5,36 +7,6 @@
 > 定位：把"AI 视频生产"做成一条可治理、可扩展、有镜头语言的管线——
 > Agent 读管线配置、调注册表工具、按 checkpoint 门禁逐步推进；
 > 提示词工程是知识资产（中文剧情语义 + 英文画质层常量）。
-
----
-
-## English
-
-**montage-core** is a Chinese-first, agent-driven AI video production system (independent project, original code, MIT).
-
-Turns a one-line idea into a finished film through a governed 7-stage pipeline (research → proposal → script → scene_plan → assets → compose → publish): an LLM agent acts as the **director** making creative decisions, while deterministic Python code acts as the **studio** enforcing schemas, budgets and quality gates.
-
-**Highlights**
-
-- **Agent-as-director architecture** — checkpoint state machine with JSON-Schema artifact gates, human-approval stops, append-only decision/cost ledgers, resumable runs, and a headless mode for unattended/CI use.
-- **Multi-provider routing** — capability-table-driven selectors (no provider if/else) unify 10+ Chinese video/image/TTS services (Jimeng, Wanxiang, CogVideoX, Kling, Hunyuan, Agnes, Doubao TTS, Edge/Piper...) behind one auto-discovered tool registry (~58 tools).
-- **Prompt dialects** — per-API-surface prompt adaptation (citation syntax, duration grids, token budgets, negative prompts) locked by golden-fixture contract tests.
-- **Generation QC** — deterministic FFmpeg checks (black/blur frames) → VLM semantic review (Qwen-VL) → smart retry routing (edit/extend/regenerate), with cross-shot character continuity.
-- **Cost governance** — two-layer budget control (dry-run estimate + per-call hard stop), append-only cost ledger, shot-tier cost policy (video only for hero shots; stills + Ken Burns for filler).
-- **Compose engine** — pure FFmpeg: xfade transitions, Ken Burns, LUT color grading (6 original generated `.cube` LUTs), SRT/ASS subtitles, sidechain-ducked narration/BGM mixing, platform output profiles.
-
-**Quick start**
-
-```bash
-pip install -e .          # core dependency: jsonschema only
-python -m montage doctor  # see which providers are available
-python examples/pipeline_flow.py   # full demo, zero API keys
-python -m montage webui --port 8399 # local dashboard
-```
-
-Requires Python ≥ 3.10 and `ffmpeg`/`ffprobe` on PATH. See the Chinese sections below for the full guide (project is Chinese-first; docs are bilingual where it matters).
-
----
 
 ## 设计原则
 
