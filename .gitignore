@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# 测试临时目录（minitest 工作区）
+.tmp_tests/
+
+# 项目生产工作区（可再生）
+projects/
+
+# 演示输出
+examples/output/
+
+# 可灵真实联调产物（壁纸等测试输出）
+assets/test_outputs/
+
+# AutoEditor 合成测试 fixture（由 scripts/make_test_fixture.py 生成）
+testdata/
+
+# 密钥
+.env
+.env.local
+
+# 本地私有文档（简历与拆分分析，不随公开仓发布）
+docs/RESUME_PROJECT.md
+docs/GITHUB_SPLIT_PLAN.md
+
+# 私人项目数据与临时脚本（聊斋·画皮联调用）
+scripts/huapi_shots.py
+scripts/fix_huapi_scenes.py
+scripts/fix_huapi_scene_plan.py
+tmp_frames/
+_probe_style_tmp.py
+
+# 音频二进制由 resolve / 人工下载落到 INDEX 的 file 路径，不进 git
+assets/bgm/*.mp3
+assets/sfx/*.mp3
+assets/sfx/*.wav
+assets/sfx/*.ogg
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store

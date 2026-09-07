@@ -1,0 +1,42 @@
+{
+  "shot": {
+    "scene_id": "sc01",
+    "shot_kind": "video",
+    "duration_seconds": 10,
+    "visual_details": {
+      "environment": "雨夜赛博朋克城市街道，霓虹招牌倒映在积水路面",
+      "lighting": "霓虹冷色调主光",
+      "cinematography": {
+        "angle": "low",
+        "frame_composition": "主体居中"
+      },
+      "subjects": [
+        {
+          "id": "protagonist",
+          "appearance_anchor": "黑发青年，深灰连帽卫衣",
+          "action": {
+            "verb": "奔跑",
+            "manner": "急促",
+            "emotion": "紧张"
+          }
+        }
+      ]
+    },
+    "audio_prompt": {
+      "dialogue": [
+        {
+          "speaker_id": "protagonist",
+          "text": "站住，别再往前走。"
+        }
+      ]
+    }
+  },
+  "builder_kwargs": {
+    "agnes_audio": true,
+    "provider_max_chars": 3000
+  },
+  "first_frame_prompt": "【角色与外貌】 protagonist: 黑发青年，深灰连帽卫衣。【姿态】 protagonist 奔跑（急促），神情：紧张。【环境】 雨夜赛博朋克城市街道，霓虹招牌倒映在积水路面。【光线】 霓虹冷色调主光。【镜头】 low，主体居中。【质量】 高视觉密度，次要细节可辨",
+  "video_prompt": "【动作】 protagonist 奔跑（急促），情绪：紧张。【台词】 protagonist 说出：\"站住，别再往前走。\"。【音频锁定】全程标准普通话中文发音，禁止英文及任何外语发音",
+  "negative_prompt": "低画质，模糊，脱焦，肢体畸形，手指畸形，面部扭曲，画面闪烁，镜头抖动不稳，过度磨皮的AI感，塑料皮肤，英语语音，英语旁白，英文字幕，画面文字，外语发音，人物朗读对白，水印，标志",
+  "default_english_negative_prompt": "低画质，模糊，脱焦，肢体畸形，手指畸形，面部扭曲，画面闪烁，镜头抖动不稳，过度磨皮的AI感，塑料皮肤，英语语音，英语旁白，英文字幕，画面文字，外语发音，人物朗读对白，水印，标志"
+}

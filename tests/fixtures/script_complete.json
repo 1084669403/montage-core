@@ -1,0 +1,44 @@
+{
+  "title": "雨夜追凶",
+  "tone": "冷峻、潮湿、霓虹压抑",
+  "environment": {
+    "location": "沿海城市旧巷",
+    "space": "室外窄巷，两侧招牌低垂",
+    "lighting": "霓虹冷光，积水反光",
+    "color_tone": "青蓝与品红",
+    "era": "近未来夜",
+    "atmosphere": "雨夜、低能见度、远处警笛"
+  },
+  "props": [
+    {"id": "lighter", "name": "旧打火机", "appearance": "铜壳磨损，侧面一道划痕"}
+  ],
+  "structure": {
+    "hook": "雨夜巷口发现一具无名尸体",
+    "escalation": "追查被旧识阻拦",
+    "reveal": "真凶是旧识",
+    "landing": "黎明选择把证据交出去"
+  },
+  "characters": [
+    {
+      "id": "li_ming",
+      "name": "黎明",
+      "role": "protagonist",
+      "appearance": "黑发青年，左眉一道旧疤",
+      "outfit": "深灰风衣",
+      "speech_style": "短句，语速快",
+      "voice_id": "",
+      "arc": "从逃避到承担"
+    }
+  ],
+  "sections": [
+    {
+      "id": "sc01",
+      "duration_seconds": 10,
+      "narration": "雨还在下。你看清楚没有。",
+      "lines": [
+        {"speaker_id": "li_ming", "text": "雨还在下。", "delivery": "低、压着嗓子"},
+        {"speaker_id": "li_ming", "text": "你看清楚没有。", "delivery": "短促"}
+      ]
+    }
+  ]
+}

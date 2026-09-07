@@ -1,0 +1,24 @@
+[project]
+name = "montage-core"
+version = "0.1.0"
+description = "Chinese-first, agent-driven AI video production system"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["jsonschema>=4.20"]
+
+[project.optional-dependencies]
+http = []  # 已废弃：HTTP 走标准库 urllib，无需 requests
+validate = ["jsonschema>=4.20"]  # 别名：jsonschema 已进核心
+webui = ["fastapi>=0.110", "uvicorn>=0.29"]
+dev = ["pytest>=8.0", "jsonschema>=4.20"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["montage*", "lib*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

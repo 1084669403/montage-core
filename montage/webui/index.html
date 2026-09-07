@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>montage-core 看板</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222c; --line:#2a2f3a;
+    --text:#e8eaed; --muted:#9aa3b2; --accent:#4f8cff; --ok:#3ecf8e;
+    --wait:#f5b942; --err:#ff6b6b; --run:#4f8cff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.6 system-ui,"Microsoft YaHei",sans-serif; }
+  header { display:flex; align-items:center; gap:16px; padding:14px 24px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:10; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .sub { color:var(--muted); font-size:12px; }
+  .tabs { margin-left:auto; display:flex; gap:8px; }
+  .tab { padding:6px 14px; border-radius:8px; cursor:pointer; color:var(--muted); background:var(--panel); border:1px solid var(--line); }
+  .tab.active { color:var(--accent); border-color:var(--accent); }
+  main { padding:24px; max-width:1100px; margin:0 auto; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:14px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; cursor:pointer; transition:border-color .15s; }
+  .card:hover { border-color:var(--accent); }
+  .card h3 { margin:0 0 4px; font-size:15px; }
+  .card .meta { color:var(--muted); font-size:12px; margin-bottom:10px; }
+  .pills { display:flex; gap:4px; flex-wrap:wrap; }
+  .pill { font-size:10px; padding:2px 6px; border-radius:6px; background:var(--panel2); color:var(--muted); border:1px solid var(--line); }
+  .pill.done { color:var(--ok); border-color:var(--ok); }
+  .pill.running { color:var(--run); border-color:var(--run); }
+  .pill.waiting { color:var(--wait); border-color:var(--wait); }
+  .pill.error { color:var(--err); border-color:var(--err); }
+  .pill.blocked { color:var(--err); border-color:var(--err); background:#3a1a1a; }
+  .bar { height:8px; background:var(--panel2); border-radius:6px; overflow:hidden; margin-top:8px; }
+  .bar > span { display:block; height:100%; background:var(--accent); }
+  .bar.over > span { background:var(--err); }
+  .film { display:flex; gap:8px; overflow:auto; padding-bottom:6px; }
+  .shot { min-width:120px; background:var(--panel2); border-radius:8px; padding:6px; font-size:12px; }
+  .shot img { width:100%; height:72px; object-fit:cover; border-radius:6px; background:#000; }
+  .next { margin-top:10px; font-size:12px; color:var(--wait); }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .panel h2 { margin:0 0 12px; font-size:15px; }
+  .back { color:var(--accent); cursor:pointer; font-size:13px; margin-bottom:12px; display:inline-block; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:500; }
+  pre { background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:10px; overflow:auto; max-height:320px; font-size:12px; }
+  input,select,button { background:var(--panel2); border:1px solid var(--line); color:var(--text); border-radius:8px; padding:6px 10px; font-size:13px; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  button { cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+  .muted { color:var(--muted); }
+  .empty { color:var(--muted); text-align:center; padding:40px 0; }
+  .artifact-item { cursor:pointer; padding:6px 8px; border-radius:6px; }
+  .artifact-item:hover { background:var(--panel2); }
+  .stage-line { display:flex; gap:6px; align-items:center; margin-bottom:6px; }
+  .review-summary { margin:8px 0 12px; }
+  .review-summary .row-line { display:flex; gap:8px; margin-bottom:4px; }
+  .review-summary .k { color:var(--muted); min-width:4.5em; }
+  .review-field { margin-bottom:10px; }
+  .review-field label { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }
+  .review-field input,.review-field select,.review-field textarea { width:100%; max-width:520px; }
+  #review-fields { display:none; margin-top:10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎬 montage-core 看板</h1>
+  <span class="sub">AI 视频生产 · 阶段/产物/成本/决策</span>
+  <div class="tabs">
+    <div class="tab active" data-tab="projects">项目</div>
+    <div class="tab" data-tab="tools">工具</div>
+  </div>
+</header>
+<main>
+  <div id="view-projects"></div>
+  <div id="view-detail" style="display:none"></div>
+  <div id="view-tools" style="display:none"></div>
+</main>
+<script>
+const STAGE_NAMES = { research:'调研', proposal:'提案', script:'剧本', scene_plan:'分镜', assets:'素材', compose:'合成', publish:'发布' };
+const $ = s => document.querySelector(s);
+
+async function api(url, opts) {
+  const res = await fetch(url, opts);
+  if (!res.ok) { let d = null; try { d = await res.json(); } catch(e) {} throw new Error((d && d.detail) || res.status); }
+  return res.json();
+}
+
+function pills(progress) {
+  return Object.entries(STAGE_NAMES).map(([k, name]) =>
+    `<span class="pill ${progress[k] || 'idle'}">${name}</span>`).join('');
+}
+
+async function renderProjects() {
+  const data = await api('/api/projects');
+  const el = $('#view-projects');
+  if (!data.length) { el.innerHTML = `<div class="empty">还没有项目 — 用上方表单新建，或用 CLI：montage init &lt;id&gt;</div>`; return; }
+  el.innerHTML = `<div class="grid">` + data.map(p => {
+    const kind = p.kind || 'project';
+    const click = kind === 'episode'
+      ? `openEpisode('${p.parent_id}','${p.episode_id}')`
+      : `openProject('${p.project_id}')`;
+    const idLabel = kind === 'episode' ? `${p.parent_id} / ${p.episode_id}` : p.project_id;
+    const pillsHtml = kind === 'project' ? `<div class="pills">${pills(p.progress || {})}</div>` : `<div class="meta">${kind}</div>`;
+    const nextHtml = kind === 'project'
+      ? (p.next_stage ? `<div class="next">→ 下一阶段：${STAGE_NAMES[p.next_stage] || p.next_stage}</div>` : '<div class="next">✓ 全部完成</div>')
+      : '';
+    return `
+    <div class="card" onclick="${click}">
+      <h3>${p.title}</h3>
+      <div class="meta">${idLabel} · ${p.pipeline_type} · ${(p.created_at||'').slice(0,10)}</div>
+      ${pillsHtml}
+      ${nextHtml}
+    </div>`;
+  }).join('') + `</div>`;
+}
+
+async function openProject(id) {
+  const p = await api('/api/projects/' + id);
+  renderDetail(p, '/api/projects/' + id, false);
+}
+
+async function openEpisode(parentId, episodeId) {
+  const p = await api('/api/projects/' + parentId + '/episodes/' + episodeId);
+  renderDetail(p, '/api/projects/' + parentId + '/episodes/' + episodeId, true);
+}
+
+function renderDetail(p, apiBase, readonly) {
+  $('#view-projects').style.display = 'none';
+  $('#view-detail').style.display = 'block';
+  const el = $('#view-detail');
+  const id = p.project_id;
+  const stages = p.stages.map(s => `
+    <div class="stage-line">
+      <span class="pill ${s.blocked ? 'blocked' : s.status}">${STAGE_NAMES[s.stage] || s.stage}${s.blocked ? ' · 缺产物' : ''}</span>
+      <span class="muted">${s.status}${s.human_approved ? ' · 已审批' : ''}${s.artifact ? ' · ' + s.artifact : ''}</span>
+    </div>`).join('');
+    const pp = p.produce_progress || {};
+    const banner = pp.status
+      ? `<div class="panel" style="border-color:var(--wait)"><strong>出片进度</strong> ${escapeHtml(String(pp.status))}${pp.next && pp.next.note ? ' · ' + escapeHtml(String(pp.next.note)) : ''}</div>`
+      : '';
+    const gateNote = (p.gate && !p.gate.ok)
+    ? `<div class="muted" style="color:var(--err)">下一阶段 ${STAGE_NAMES[p.gate.stage]||p.gate.stage} 缺：${(p.gate.missing||[]).join(', ')} ${(p.gate.invalid||[]).join(', ')}</div>`
+    : '';
+  const artifacts = Object.keys(p.artifacts).length
+    ? Object.keys(p.artifacts).map(k => `<div class="artifact-item" onclick="showArtifact(${JSON.stringify(apiBase)},'${k}')">${k}.json</div>`).join('')
+    : '<div class="muted">暂无产物</div>';
+  const decisions = p.decisions.length ? `
+    <table><tr><th>类别</th><th>主题</th><th>决策</th><th>修订</th></tr>
+    ${p.decisions.map(d => `<tr><td>${d.category}</td><td>${d.subject}</td><td>${d.choice}</td><td>${d.revised ? '是' : ''}</td></tr>`).join('')}
+    </table>` : '<div class="muted">暂无决策记录</div>';
+  const ae = p.auto_edit || {};
+  const aeVideo = (ae.final && ae.final.exists)
+    ? `<video src="/media/${id}/final.mp4" controls style="width:100%;max-height:360px;background:#000;border-radius:8px"></video>`
+    : '<div class="muted">暂无成片 final.mp4（AutoEditor 快速路径产物，不进 7 阶段）</div>';
+  const aeLinks = [
+    ae.plan && ae.plan.exists ? `<a href="/media/${id}/plan.json">plan.json</a>` : '',
+    ae.report && ae.report.exists ? `<a href="/media/${id}/report.json">report.json</a>` : '',
+  ].filter(Boolean).join(' · ') || '<span class="muted">暂无 plan/report</span>';
+  const pm = p.produce_media || {};
+  const seasonOk = p.kind === 'series' && pm.season && pm.season.exists;
+  const produceUrl = seasonOk
+    ? pm.season.url
+    : ((p.kind !== 'series' && pm.final && pm.final.exists) ? pm.final.url : '');
+  const coverUrl = (pm.cover && pm.cover.exists) ? pm.cover.url : '';
+  const emptyFilm = p.kind === 'series'
+    ? '<div class="muted">暂无季片 renders/season.mp4（系列根 --season-concat）</div>'
+    : '<div class="muted">暂无七阶段成片 renders/final.mp4</div>';
+  const produceVideo = produceUrl
+    ? `<video src="${produceUrl}"${coverUrl ? ` poster="${coverUrl}"` : ''} controls style="width:100%;max-height:360px;background:#000;border-radius:8px"></video>`
+    : emptyFilm;
+  const b = p.budget || {};
+  const ceiling = Number(b.ceiling_usd || 0);
+  const used = Number(b.estimated_usd || 0);
+  const pct = ceiling > 0 ? Math.min(100, Math.round(used / ceiling * 100)) : 0;
+  const thumbBase = readonly && p.parent_id
+    ? `/api/projects/${p.parent_id}/episodes/${p.episode_id}/thumbs`
+    : `/api/projects/${id}/thumbs`;
+  const scenes = (p.scenes || []).map(s => `
+    <div class="shot">
+      ${s.thumb ? `<img src="${thumbBase}/${s.thumb}" alt="${s.id}" onerror="this.replaceWith(document.createTextNode('${s.id}'))">` : `<div class="muted">${s.id || '镜头'}</div>`}
+      <div class="muted">${(s.description||'').slice(0,40)}</div>
+    </div>`).join('');
+  const cpPath = (p.parent_id && p.episode_id)
+    ? `/api/projects/${p.parent_id}/episodes/${p.episode_id}/checkpoint`
+    : `/api/projects/${p.meta.project_id || id}/checkpoint`;
+  const checkpoint = `
+      <div class="row" style="margin-top:12px">
+        <select id="cp-stage">${Object.entries(STAGE_NAMES).map(([k,v])=>`<option value="${k}">${v}</option>`).join('')}</select>
+        <select id="cp-status"><option value="in_progress">进行中</option><option value="completed">完成</option><option value="awaiting_human">等待审批</option></select>
+        <label class="muted"><input type="checkbox" id="cp-approved"> 已审批</label>
+        <button class="primary" onclick="writeCheckpoint(${JSON.stringify(cpPath)})">写 checkpoint</button>
+      </div>
+      <div class="muted">机器收口 ≠ 人审。全片请用 CLI / Skill；本页只 retry。</div>`;
+  const retryPath = (p.parent_id && p.episode_id)
+    ? `/api/projects/${p.parent_id}/episodes/${p.episode_id}/retry`
+    : `/api/projects/${p.meta.project_id || id}/retry`;
+  const retryBox = p.kind === 'series' ? '<div class="muted">系列根不能 retry，请打开子集</div>' : `
+      <div class="row" style="margin-top:12px;flex-wrap:wrap">
+        ${(p.shots || []).map(s => `<label class="muted"><input type="checkbox" class="retry-shot" data-shot-id="${s.id}"> ${s.id}</label>`).join('') || '<span class="muted">暂无镜头 id</span>'}
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input id="retry-ids" placeholder="重跑镜 id，逗号分隔" style="flex:1;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px">
+        <button onclick="retryProduce(${JSON.stringify(retryPath)}, false)">预览费用</button>
+        <button class="primary" onclick="retryProduce(${JSON.stringify(retryPath)}, true)">确认重跑</button>
+      </div>
+      <div class="muted">勾选或逗号输入镜头 id。确认后看板会等到该镜结束。await_retry 不是人审。</div>`;
+
+  el.innerHTML = `
+    <span class="back" onclick="backToList()">← 返回项目列表</span>
+    ${banner}
+    <div class="panel">
+      <h2>${p.meta.title} <span class="muted">(${id})</span></h2>
+      <div class="muted">管线：${p.meta.pipeline_type} · 创建：${p.meta.created_at}</div>
+      ${renderReviewPanel(p, apiBase)}
+      ${stages}
+      ${gateNote}
+      ${checkpoint}
+      ${retryBox}
+    </div>
+    ${scenes ? `<div class="panel"><h2>分镜</h2><div class="film">${scenes}</div></div>` : ''}
+    <div class="panel"><h2>成片</h2>${produceVideo}</div>
+    <div class="panel"><h2>AutoEditor</h2>${aeVideo}<div class="row" style="margin-top:8px">${aeLinks}</div></div>
+    <div class="panel"><h2>产物</h2>${artifacts}</div>
+    <div class="panel"><h2>预算</h2>
+      <div class="muted">条目 ${b.entries||0} · 估算 $${used} · 实付 $${b.settled_usd||0}${ceiling ? ' · 封顶 $'+ceiling : ''}</div>
+      ${ceiling ? `<div class="bar ${used>ceiling?'over':''}"><span style="width:${pct}%"></span></div>` : ''}
+    </div>
+    <div class="panel"><h2>决策</h2>${decisions}</div>`;
+}
+
+async function showArtifact(apiBase, name) {
+  const p = await api(apiBase);
+  const raw = JSON.stringify(p.artifacts[name], null, 2);
+  const el = $('#view-detail');
+  el.insertAdjacentHTML('beforeend', `<div class="panel" id="art-${name}"><h2>${name}.json</h2><pre>${escapeHtml(raw.slice(0, 6000))}${raw.length>6000?'\n…(截断)':''}</pre></div>`);
+}
+
+function escapeHtml(s){return s.replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+async function writeCheckpoint(path) {
+  const body = {
+    stage: $('#cp-stage').value,
+    status: $('#cp-status').value,
+    approved: $('#cp-approved').checked,
+  };
+  try { await api(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }); alert('已写入'); }
+  catch(e) { alert('失败：' + e.message); }
+}
+
+async function retryProduce(path, confirm) {
+  const raw = ($('#retry-ids') && $('#retry-ids').value) || '';
+  const typed = raw.split(',').map(s => s.trim()).filter(Boolean);
+  const checked = [...document.querySelectorAll('.retry-shot:checked')]
+    .map(el => (el.getAttribute('data-shot-id') || '').trim()).filter(Boolean);
+  const ids = [...new Set([...checked, ...typed])];
+  try {
+    const result = await api(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ ids, confirm }) });
+    const st = (result.progress || {}).status || '';
+    const est = (result.progress || {}).estimated_usd;
+    if (st === 'await_retry') alert('await_retry 预估 $' + (est || 0) + '（--resume 继续；这不是人审）');
+    else alert('retry：' + (st || 'ok') + '（看板已等到该镜结束）');
+  } catch(e) { alert('失败：' + e.message); }
+}
+
+function backToList() {
+  $('#view-detail').style.display = 'none';
+  $('#view-projects').style.display = 'block';
+  renderProjects();
+}
+
+function choiceList(choices, path) {
+  const bag = choices || {};
+  if (path.includes('skip_turnaround')) return bag.turnaround || [];
+  if (path.includes('output_profile')) return bag.output_profile || [];
+  if (path.includes('playbook')) return bag.playbook || [];
+  if (path.includes('shot_size')) return bag.shot_size || [];
+  if (path.includes('camera_movement')) return bag.camera_movement || [];
+  if (path.includes('cinematography.angle') || path.endsWith('.angle')) return bag.angle || [];
+  if (path.includes('shot_budget_class')) return bag.shot_budget_class || [];
+  if (path.endsWith('.cut') || path.endsWith('].cut')) return bag.cut || [];
+  if (path.endsWith('.role') || path.includes('].role')) return bag.role || [];
+  if (path.startsWith('retry:')) return bag.cast_action || [];
+  return [];
+}
+
+function renderReviewField(f, choices) {
+  const path = String(f.path || '');
+  const label = escapeHtml(f.label || path);
+  const note = f.note ? `<div class="muted">${escapeHtml(String(f.note))}</div>` : '';
+  if (path.startsWith('retry:') || path.includes('[]') || typeof f.value === 'object') {
+    return `<div class="review-field"><label>${label}</label><div class="muted">${escapeHtml(typeof f.value === 'object' ? '请直接改对应 JSON' : String(f.value ?? ''))}（不在此保存）</div>${note}</div>`;
+  }
+  const opts = f.input === 'select' ? choiceList(choices, path) : [];
+  if (opts.length) {
+    const options = opts.map(o => {
+      const id = (o && typeof o === 'object') ? String(o.id || '') : String(o);
+      const lab = (o && typeof o === 'object') ? String(o.label || id) : String(o);
+      const cur = String(f.value ?? '');
+      const sel = (cur === id || cur === lab) ? ' selected' : '';
+      return `<option value="${escapeHtml(id)}"${sel}>${escapeHtml(lab)}</option>`;
+    }).join('');
+    return `<div class="review-field"><label>${label}</label><select class="review-input" data-path="${escapeHtml(path)}">${options}</select>${note}</div>`;
+  }
+  const val = String(f.value ?? '');
+  if (f.input === 'textarea') {
+    return `<div class="review-field"><label>${label}</label><textarea class="review-input" data-path="${escapeHtml(path)}" rows="3">${escapeHtml(val)}</textarea>${note}</div>`;
+  }
+  const kind = f.input === 'number' ? 'number' : 'text';
+  return `<div class="review-field"><label>${label}</label><input class="review-input" data-path="${escapeHtml(path)}" type="${kind}" value="${escapeHtml(val)}">${note}</div>`;
+}
+
+function renderReviewPanel(p, apiBase) {
+  const r = p.review;
+  if (!r || !r.card) return '';
+  const card = r.card;
+  const summary = (card.summary || []).map(row =>
+    `<div class="row-line"><span class="k">${escapeHtml(row.label || '')}</span><span>${escapeHtml(String(row.value ?? ''))}</span></div>`
+  ).join('');
+  const fields = (card.fields || []).map(f => renderReviewField(f, card.choices || {})).join('');
+  const argv = (r.next && r.next.argv) || [];
+  const cmd = argv.length ? `python -m montage ${argv.join(' ')}` : '';
+  const doNot = (card.do_not_edit || []).map(x => escapeHtml(String(x))).join(' · ');
+  return `
+      <h2>导演确认卡 <span class="muted">${escapeHtml(String(r.status || card.status || ''))}</span></h2>
+      <div class="muted">默认只看摘要。保存写入 bible / scene_plan，然后 CLI --resume；看板不会出片。</div>
+      <div class="review-summary">${summary || '<div class="muted">无摘要</div>'}</div>
+      <button type="button" id="review-expand" onclick="toggleReviewFields()">展开全部可改项</button>
+      <div id="review-fields">${fields}
+        <div class="row" style="margin-top:8px">
+          <button onclick="saveReviewFields(${JSON.stringify(apiBase)})">保存到 JSON</button>
+        </div>
+        <div class="muted">改的是 bible / proposal / scene_plan。确认请 CLI --resume；看板不会出片。</div>
+      </div>
+      ${doNot ? `<div class="muted" style="margin-top:8px">不要改：${doNot}</div>` : ''}
+      ${cmd ? `<pre style="margin-top:8px">${escapeHtml(cmd)}</pre>` : ''}
+      ${r.next && r.next.note ? `<div class="muted">${escapeHtml(r.next.note)}</div>` : ''}`;
+}
+
+function toggleReviewFields() {
+  const box = $('#review-fields');
+  const btn = $('#review-expand');
+  if (!box) return;
+  const open = box.style.display === 'block';
+  box.style.display = open ? 'none' : 'block';
+  if (btn) btn.textContent = open ? '展开全部可改项' : '收起全部可改项';
+}
+
+async function saveReviewFields(apiBase) {
+  const fields = [...document.querySelectorAll('.review-input')].map(el => ({
+    path: el.getAttribute('data-path'),
+    value: el.type === 'number' && el.value !== '' ? Number(el.value) : el.value,
+  }));
+  try {
+    const result = await api(apiBase + '/review', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fields }),
+    });
+    const n = (result.applied || []).length;
+    alert('已写入 JSON（' + n + ' 项）。请 CLI --resume，看板不会出片。');
+    const p = await api(apiBase);
+    renderDetail(p, apiBase, apiBase.includes('/episodes/'));
+  } catch (e) {
+    alert('失败：' + e.message);
+  }
+}
+
+async function renderTools() {
+  const data = await api('/api/tools');
+  const rows = Object.entries(data.catalog).map(([cap, names]) =>
+    `<tr><td>${cap}</td><td>${names.join(', ')}</td></tr>`).join('');
+  const offers = data.menu.setup_offers.map(o => `<div class="muted">· ${o.tool}（${o.provider}）→ ${o.hint}</div>`).join('') || '<div class="muted">全部已配置</div>';
+  $('#view-tools').innerHTML = `
+    <div class="panel"><h2>能力目录</h2><table><tr><th>能力</th><th>工具</th></tr>${rows}</table></div>
+    <div class="panel"><h2>待配置</h2>${offers}</div>`;
+}
+
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  ['view-projects','view-detail','view-tools'].forEach(v => $('#'+v).style.display = 'none');
+  if (t.dataset.tab === 'projects') { renderProjects(); $('#view-projects').style.display='block'; }
+  if (t.dataset.tab === 'tools') { renderTools(); $('#view-tools').style.display='block'; }
+});
+
+renderProjects().catch(e => alert('加载失败：' + e.message));
+</script>
+</body>
+</html>
