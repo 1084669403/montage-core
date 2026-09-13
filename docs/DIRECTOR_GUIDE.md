@@ -31,6 +31,7 @@
 | `role` | protagonist / antagonist / supporting / functional / narrator | protagonist |
 | `appearance` | **外貌锚点**：逐字复制到分镜 `character_registry.appearance`，禁止改写 | 黑发青年，左眉一道旧疤，深灰风衣 |
 | `outfit` | 服装锚点：逐字复制到 `outfit_anchor` | 深灰长风衣，白色高领 |
+| `forms[]` | 多形态（如人皮形/鬼形）：`form.appearance`/`outfit_anchor` 覆盖角色同名字段；每形态单独出定妆参考 | `[{"id":"ghost","name":"鬼形","appearance":"青面獠牙"}]` |
 | `personality` | 性格 1-2 句 | 外冷内热，行动先于言语 |
 | `speech_style` | 用词/口癖/语速——对白必须与其一致 | 短句，少用形容词，语速偏快 |
 | `voice_id` | 音色：voices 表 id（`female_soft`）或供应商原生名；空则按角色/性别解析 | `male_low` |
@@ -46,6 +47,9 @@
   拼出的朗读稿。`script_validator`（`purpose=completeness`）缺 speaker 时报告 warning。
 - 只有动作没有对白的角色也要有人物卡。
 - 主环境写入 `script.environment`（对象或一句描述），不要只藏在旁白散文里。
+- 一个角色有多套外观（变身、换装、伪装）时写入 `forms[]`；`form_id` 角色内唯一，
+  `default=true` 至多一个（未声明形态的镜头用它）。不分形态时省略字段，行为同旧版。
+  可灵环忽略 `forms[]`（bible 只给 warning）。
 
 ## 2b. 地点卡（交叉方位，给 Agnes 2.5 用）
 
@@ -100,6 +104,9 @@
 - `scene_plan.character_registry[]` 的 `id` 只引用 `script.characters[].id`，
   `appearance`/`outfit_anchor` **逐字复制**自人物卡（同上 §2）。
 - `scene_plan.scenes[].character_ids[]` 标注本场出镜角色，供 assets 阶段检索。
+- 某镜角色以特定形态出场时，在 `visual_details.subjects[].form_id` 写形态 id
+  （须存在于该角色 `forms[].id`；bible 侧写在 `scenes[].shots[].subjects[].form_id`）。
+  未声明 = 默认形态；同镜同一角色只声明一个形态，否则多占参考图名额（validator warning）。
 - 每个场景的 `description` 用**镜头可读语言**（空间+人物+动作+光线），不要写情绪
   形容词（情绪交给 `shot_language` 与对白）。
 

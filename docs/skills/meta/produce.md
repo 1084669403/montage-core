@@ -34,7 +34,7 @@ python -m montage produce <project_dir> --retry sh01 --yes
 python -m montage produce <series_dir> --season-concat
 ```
 
-可选：`--skip-export`、`--strict-audio`（缺 BGM 失败）、`--keep-scratch`。`--idea` 需要已有 `project.json`（`montage init`），不自动建项目。`--skip-finish` 仍会跑 release（写 `publish_log`）。`--profile` 只给 finish，不读管线 `default_profile`。`--burn-subs` 才把字幕烧进像素（默认只写 `renders/final.srt`）。
+可选：`--skip-export`、`--strict-audio`（缺 BGM 失败）、`--keep-scratch`、`--prune-exports N`（导出后只保留最新 N 个 zip；默认 0=只增不删）。`--idea` 需要已有 `project.json`（`montage init`），不自动建项目。`--skip-finish` 仍会跑 release（写 `publish_log`）。`--profile` 只给 finish，不读管线 `default_profile`。`--burn-subs` 才把字幕烧进像素（默认只写 `renders/final.srt`）。
 
 `--retry a,b` 未确认时只 dry_run，`await_retry`（code=0，`--resume` 继续，不是人审）。`--retry a,b --yes` 一趟确认：强制 GEN、关掉样品停。可灵（`video_loop=kling`）未写 `rework_mode` 默认 **regenerate**；确认卡二选一 `regenerate` / `feature`（≤10s 且需公网成片 URL；`edit` 不在默认二选一）。Seedance 有公网成片 URL 时仍优先 **edit/extend**，否则整镜重抽。系列根 / clip_factory / `await_sample` / `--idea` 时 retry 失败。成片已齐也会重跑指定镜。
 

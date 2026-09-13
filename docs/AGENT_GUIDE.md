@@ -70,6 +70,7 @@ python -m montage auto_edit <project_dir> --audio-only voice.wav --style fresh -
 | script | script | title、sections[]（id/narration/duration_seconds）、characters[]、structure |
 | scene_plan | scene_plan | scenes[]（id/description/narrative_role/shot_language/start/end）、character_registry[] |
 | assets | asset_manifest + shot_prompts | shot_prompts.shots[]（scene_id/shot_kind/visual_details） |
+| assets（观察） | image_bindings | 图/首帧 ↔ 场景文字/形态/实发 `<Picture N>` 冻结绑定；v1 只写不消费，`picture_index` 取实发序号 |
 | compose | **edit_decisions + render_report** | edit_decisions.cuts[]（clip_path/transition）；render_report（output_path/duration/encoding） |
 | publish | publish_log | 发布元数据 |
 
@@ -99,6 +100,9 @@ python -m montage auto_edit <project_dir> --audio-only voice.wav --style fresh -
    再跑视频；`audio_source=agnes_prompt`（台词进视频提示词，**不要** TTS，**不要**
    `place_audio` 叠 BGM）。默认模型 `agnes-video-2.5-flash`（1 RPM）；`AGNES_VIDEO_MODEL=agnes-video-v2.0`
    才回滚 2.0。参考必须是 http(s) URL，本地 png 不能当关键帧。
+   限流/配额按 `AGNES_ACCESS_TYPE`（`default`/`enterprise`/`tokenplan`，不设即免费档）取值：
+   视频实际 RPM 1/2/5，图片按 1K/2K/3K/4K 分档；Token Plan 另有每日 4000 张图 / 500 秒视频配额。
+   仓库只统计 + 告警（`~/.montage/agnes_usage.json`），不阻断出片；排片提示见 `doctor` 与 dry_run `pacing_note`。
    逐镜头提示词仍可用 `visual_prompt_builder`（`purpose=shot` 产出首帧图 + 视频动态双提示词；
    `purpose=portrait|scene_ref` 产出定妆照/场景参考图）。
 4. 配乐先 `soundtrack_planner`（写 `soundtrack.json`，建议 `resolve=true`，钉选曲复制进项目 `assets/music/`），再 `compose_planner` 编译 `edit_decisions`，静图 `realize=true` 之后才 `place_audio`。
@@ -139,7 +143,7 @@ python -m montage auto_edit <project_dir> --audio-only voice.wav --style fresh -
 
 | 能力 | 供应商（契约状态） |
 |------|---------------------|
-| 图片 | 即梦（确定）、万相 dashscope_image（确定）、可灵 kling_image（待联调）、Agnes（确定） |
+| 图片 | 即梦（确定）、万相 dashscope_image（确定）、可灵 kling_image（待联调）、Agnes（确定，`agnes-image-2.5-flash` 单模型：文生/编辑/多图合成；免费期计 0） |
 | 视频 | 即梦（确定）、万相 wan_video（确定）、智谱清影 cogvideo_video（确定）、可灵 kling_video（待联调）、混元 hunyuan_video（待联调）、Agnes（确定，默认 2.5 Flash） |
 | TTS | 豆包（确定，字符级时间戳）、Edge TTS（免费）、**piper 离线**（本地，可商用，需装模型）、DashScope TTS（待联调） |
 | ASR | DashScope（确定，词级时间戳） |
@@ -256,3 +260,32 @@ python -m montage webui --port 8399               # 启动看板
 - 零密钥 + 本机 ffmpeg、磁盘已有 clip：W0 拼片通常能写出 `renders/final.mp4`
 - 真密钥图生视频：样品常漂、常要 `--retry`；跨镜一致性靠定妆 URL + 场记 + 可选千问 VLM（无 `DASHSCOPE_API_KEY` 则跳过）
 - `MONTAGE_HEADLESS=1` 会在样品停 / 未确认 retry / 系列非 `--review none` / 未确认 `await_final_prompt`（含 `--review none`）时进门失败，避免把停点当成成功
+
+### ffmpeg 版本矩阵（换机器必先看这节）
+
+敏感点不做人肉排障：`montage/compose/ffmpeg_compat.py` 对三项能力**真跑一次**探测并进程内缓存。
+
+| 敏感点 | 探测键 | 现代写法 | 旧版/回落 | 使用处 |
+|--------|--------|----------|-----------|--------|
+| LUT 选项名 | `lut3d_file` | `lut3d=file=<path>` | `filename=` | `ffmpeg_engine.lut3d_filter` |
+| 声道归一到 48k 立体声 | `aformat` | `aformat=sample_rates=48000:channel_layouts=stereo` | `aresample=48000:ochl=stereo` | `ffmpeg_engine._audio_norm_filter` |
+| xfade 硬切 | `xfade_cut` | 调用方把 cut 拆成 concat | `xfade` 无 `cut`（9.x 直接失败） | `assemble` 转场链 |
+
+- 探测结果**只反映本机**、不跨进程缓存；缺 ffmpeg 时对现代选项名返回 `True`（只构造命令字符串的单元测试不退化），真实渲染前 `check_ffmpeg()` 仍会拦。
+- `render_report.json` 带 `ffmpeg_version` + `ffmpeg_capabilities` 快照，事后可归因；本机（gyan build）实测：`9.0-full_build`，`lut3d_file/aformat=True`、`xfade_cut=False`。
+- 回归兜底在 `tests/test_ffmpeg_compat.py`（lavfi 生成素材、真跑、`probe()` 断言语义）：`python -m pytest -m ffmpeg` 可单独筛，`scripts/minitest.py` 会显式报告跳过数而不是静默通过。
+
+### Agnes 合同陷阱（首帧/reference 互斥、720P、5 张上限、Picture 语义）
+
+1. **首帧与参考图互斥**：`proposal_packet.frames_mode` 三选一——
+   - `preview`（默认）：首帧不进生成，只当审图素材；produce 直接跳过 `await_frames`。
+   - `reference_first`：首帧进 `images[0]`（`<Picture 1>` = 本镜首帧）。
+   - `keyframe`：真 I2V，只发 `first_frame`/`last_frame`，`mode=keyframe`，不再叠 `aspect_ratio`；与 `images`/`audios`/`videos` 互斥。
+   - 踩坑症状：`images` 非空即 `mode=reference` 并清空 first/last——首帧白花配额却对画面零影响。
+2. **720P 是硬限，且分辨率非标准**：视频 `size` 写死 `"720P"`；实测 16:9 = `1280×704`（**不是** 1280×720）、9:16 = `720×1280`，竖屏成片 1080×1920 即 1.5× 上采样。图片 2K 实测 16:9 = `2624×1472`、9:16 = `1472×2624`、1:1 = `2048×2048`，同样不是 1920×1080。
+   - 铁律：缩放/letterbox 一律以 ffprobe 实测为准（`render_report` 已记 `width`/`height`/`clips`/`images`）；`AGNES_V25_VIDEO_SIZES`/`AGNES_IMAGE_2K_SIZES` 只作知识兜底，`_V20_WH` 只服务已退役的 v2.0。
+3. **参考图 ≤5 张、音频 ≤3 段，且必须公网 http(s)**：超限会 400 或截断；本地 png / Data URI 被丢弃并出 finding（Data URI 只在图片侧合法）。`extract_last_frame` 产出的尾帧是本地文件，Agnes 视频天然不能用。图片侧多图合成必须在提示词写明每张图的角色（图例 `【参考图角色】`）。
+   - 身份图**每个出场形态只发一张**：默认 `portrait`；`turnaround` 需在 `form.cast_ref_kind` / `character.cast_ref_kind` / `proposal_packet.cast_ref_kind` 之一显式写 `turnaround`。四视图是分格拼板，参考生图会抄版面（首帧重复人物），且图例附「禁止分格/拼贴」约束——**opt-in 仍有风险**，默认用 portrait 省名额。
+   - **名额不够时默认切段续拍**（`proposal_packet.ref_overflow_mode=segment`）：段是时间轴切片，段数 `max(参考组, 时长段)`、各段秒数之和不变（同一 `shot_id`），段 2 起用「上段尾帧 + 本段参考」图片侧合成 <Picture 1> 续接帧（占 1 个视频名额，故段 2+ 有效参考 = 上限−1）。硬封顶 4 段；`身份+场景` 超每段名额、时长切不动、超封顶时**不开跑**，回退丢弃+finding。`single` 一键回旧行为；`frames_mode=keyframe` 强制 `single`。桥接帧用 continuation 描述（不复用首帧提示词）。
+4. **`<Picture N>` 只有一套来源**：`_agnes_flash_image_plan` 的最终有序表（rank：`first_frame`(-1) → 身份图（`identity=True`，每形态选中一张，统一 rank 0）→ `scene_ref` → `prop` → `style_anchor` → `turnaround`）。四视图**不再因多角色镜被硬丢**，只按 `cast_ref_kind` 决定是否入候选。N 是**实发顺序下标**，不是 manifest 序号；截断掉 `scene_ref`/`prop` 会出 finding；引用行与实发 `images` 必须逐下标同 kind（`tests/test_visual_prompt_builder.py` 锁住）。
+5. **其余静默丢弃**：`videos[]` 对 Flash 有效内容直接 400（工具直调也不读该字段）；Agnes 片内音（`audio_source=agnes_prompt`）不要 TTS、不要 `place_audio` 盖对白。

@@ -105,7 +105,7 @@ v30 家族**保留为降级**：方舟未开通、2.5 联调失败、只要 reca
 
 切换策略：双跑对照稳定后，**另开** `agnes_v25` 档案与 adapter；默认模型再改 2.5，然后弃 2.0。切换时才动 2.0 提示词路径（等于退役）。未稳定不弃、不改 2.0 写法。
 
-图：继续 `agnes-image-2.1-flash` 文生、`agnes-image-2.0-flash` 参考/编辑；视频用图必须先拿到公网 URL。
+图：统一 `agnes-image-2.5-flash`（文生/编辑/多图合成一个模型全覆盖；参考图 URL 或 Data URI，装箱见 `pack_agnes_image`；免费期图/视频 `estimate_cost` 报 0）；视频用图必须先拿到公网 URL。
 
 ---
 

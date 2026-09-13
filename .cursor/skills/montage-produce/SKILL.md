@@ -17,7 +17,7 @@ description: >-
 
 - `init <id> --title "..."`（可加 `--pipeline`）
 - `doctor`（可加 `--pipeline` / `--project` / `--json`）
-- `produce <dir>` 及现有旗标：`--resume` `--idea` `--review`（`bible|none|each_episode|director`，**默认 director**） `--retry` `--yes` `--tts` `--trim-hero` `--all-video` `--profile` `--skip-finish` `--burn-subs` `--skip-export` `--strict-audio` `--keep-scratch` `--season-concat`
+- `produce <dir>` 及现有旗标：`--resume` `--idea` `--review`（`bible|none|each_episode|director`，**默认 director**） `--retry` `--yes` `--tts` `--trim-hero` `--all-video` `--profile` `--skip-finish` `--burn-subs` `--skip-export` `--strict-audio` `--keep-scratch` `--prune-exports N`（导出后只留最新 N 个 zip，默认只增不删） `--season-concat`
 - 读 `artifacts/`、`artifacts/REVIEW.md`、`REVIEW.md`、`renders/`、`cost.jsonl`
 
 真密钥默认导演八步停点。`--all-video` 与无 `--idea` 的 `--review none` 在过 `await_final_prompt` 前也会强制停一次提示词预览，不会直接烧完全片。
