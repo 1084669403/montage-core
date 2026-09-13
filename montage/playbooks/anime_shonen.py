@@ -38,8 +38,9 @@ PLAYBOOK: dict = {
         "sfx_style": "刀风、脚步、环境 sparingly，拟声留给字幕而非 TTS",
     },
     "asset_generation": {
+        "stylized_image": True,
         "character_appearance_default": "东亚动漫面容，标志性发色与瞳色固定，校服或战斗装有可复述的符号配件",
-        "image_negative_prompt": "photorealistic, skin pores, live action, 3d render, extra fingers, watermark, realistic photograph",
+        "image_negative_prompt": "写实照片, 皮肤毛孔, 真人实拍, 3D渲染, 多余手指, 水印, 真实照片",
         "consistency_anchors": [
             "发色瞳色与标志物全片不得改",
             "赛璐璐平涂，禁止写实皮肤",

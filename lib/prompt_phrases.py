@@ -8,66 +8,67 @@ from __future__ import annotations
 
 import re
 
-# 把 shot_language 枚举映射为用于提示词的自然语言
+# 把 shot_language 枚举映射为用于提示词的自然语言（2026-09 全中文政策：值一律中文）。
 _SHOT_SIZE_PHRASES = {
-    "extreme_wide": "extreme wide shot showing vast environment",
-    "wide": "wide shot capturing full scene",
-    "medium_wide": "medium-wide shot framing subject with surroundings",
-    "medium": "medium shot from waist up",
-    "medium_close": "medium close-up from chest up",
-    "close_up": "close-up focusing on face or detail",
-    "extreme_close_up": "extreme close-up on fine detail",
-    "over_shoulder": "over-the-shoulder perspective",
-    "insert": "insert shot of specific detail",
-    "establishing": "establishing shot setting the location",
+    "extreme_wide": "大远景，展现广阔环境全貌",
+    "wide": "全景，人物与环境同框",
+    "medium_wide": "中全景，主体连同周围环境入画",
+    "medium": "中景，取腰部以上半身",
+    "medium_close": "中近景，取胸部以上",
+    "close_up": "近景，聚焦面部或细节",
+    "extreme_close_up": "特写，聚焦细微局部",
+    "over_shoulder": "过肩视角",
+    "insert": "插入镜头，交代具体细节",
+    "establishing": "建立镜头，交代地点与环境",
+    "close": "特写，聚焦局部细节",
 }
 
 _MOVEMENT_PHRASES = {
-    "static": "locked-off static camera",
-    "pan_left": "smooth pan to the left",
-    "pan_right": "smooth pan to the right",
-    "tilt_up": "gentle tilt upward",
-    "tilt_down": "gentle tilt downward",
-    "dolly_in": "slow dolly in toward subject",
-    "dolly_out": "slow dolly out from subject",
-    "tracking_left": "tracking shot moving left alongside subject",
-    "tracking_right": "tracking shot moving right alongside subject",
-    "crane_up": "crane shot rising upward",
-    "crane_down": "crane shot descending",
-    "handheld": "handheld camera with natural movement",
-    "steadicam": "smooth steadicam following movement",
-    "whip_pan": "fast whip pan",
-    "orbital": "orbital camera circling subject",
-    "zoom_in": "slow zoom in",
-    "zoom_out": "slow zoom out",
-    "rack_focus": "rack focus shift between foreground and background",
+    "static": "固定机位，画面稳定",
+    "pan_left": "向左平稳摇镜",
+    "pan_right": "向右平稳摇镜",
+    "tilt_up": "镜头上摇",
+    "tilt_down": "镜头下摇",
+    "dolly_in": "缓慢向主体推进",
+    "dolly_out": "缓慢拉远离开主体",
+    "tracking_left": "向左跟拍主体",
+    "tracking_right": "向右跟拍主体",
+    "crane_up": "镜头升起",
+    "crane_down": "镜头降下",
+    "handheld": "手持拍摄，带自然晃动",
+    "steadicam": "稳定器跟随移动",
+    "whip_pan": "快速甩摇",
+    "orbital": "环绕主体运镜",
+    "zoom_in": "缓慢推近",
+    "zoom_out": "缓慢拉远",
+    "rack_focus": "焦点在前景与后景之间切换",
 }
 
 _LIGHTING_PHRASES = {
-    "high_key": "bright high-key lighting, minimal shadows",
-    "low_key": "dramatic low-key lighting with deep shadows",
-    "natural": "natural ambient lighting",
-    "golden_hour": "warm golden hour sunlight",
-    "blue_hour": "cool blue hour twilight",
-    "tungsten_warm": "warm tungsten interior lighting",
-    "neon": "neon-lit with vibrant color spill",
-    "silhouette": "backlit silhouette",
-    "rim_lit": "rim lighting highlighting edges",
-    "volumetric": "volumetric light with visible rays",
-    "overcast_soft": "soft overcast diffused light",
+    "high_key": "明亮高调布光，阴影很少",
+    "low_key": "低调布光，阴影深重",
+    "natural": "自然环境光",
+    "golden_hour": "暖色黄昏光",
+    "blue_hour": "冷色蓝调暮光",
+    "tungsten_warm": "暖色钨丝灯室内光",
+    "neon": "霓虹光，彩色光晕外溢",
+    "silhouette": "逆光剪影",
+    "rim_lit": "轮廓光勾边",
+    "volumetric": "体积光，可见光束",
+    "overcast_soft": "阴天柔和漫射光",
 }
 
 _DOF_PHRASES = {
-    "shallow": "shallow depth of field with bokeh",
-    "medium": "medium depth of field",
-    "deep": "deep focus with everything sharp",
+    "shallow": "浅景深，背景虚化",
+    "medium": "中等景深",
+    "deep": "大景深，前后景均清晰",
 }
 
 _COLOR_TEMP_PHRASES = {
-    "cool": "cool blue-toned color palette",
-    "neutral": "neutral balanced colors",
-    "warm": "warm amber-toned color palette",
-    "mixed": "mixed color temperatures for contrast",
+    "cool": "冷色调，偏蓝",
+    "neutral": "中性色调，色彩均衡",
+    "warm": "暖色调，偏琥珀色",
+    "mixed": "冷暖色调混用，形成对比",
 }
 
 _SHOT_SIZE_ZH = {
@@ -81,6 +82,7 @@ _SHOT_SIZE_ZH = {
     "over_shoulder": "过肩",
     "insert": "插入特写",
     "establishing": "建立镜头",
+    "close": "特写",
 }
 
 _MOVEMENT_ZH = {
@@ -117,7 +119,7 @@ _BLOCKING_Y_ZH = {
     "上": "上方", "中": "中段", "下": "下方",
 }
 _CLOSE_SIZES = frozenset({
-    "close_up", "extreme_close_up", "medium_close", "insert",
+    "close", "close_up", "extreme_close_up", "medium_close", "insert",
 })
 _WIDE_SIZES = frozenset({
     "extreme_wide", "wide", "establishing", "medium_wide",

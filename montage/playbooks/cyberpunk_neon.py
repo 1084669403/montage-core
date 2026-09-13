@@ -34,8 +34,9 @@ PLAYBOOK: dict = {
         "sfx_style": "雨声、电流、全息提示音、远处警笛",
     },
     "asset_generation": {
+        "stylized_image": True,
         "character_appearance_default": "东亚面容，短发或贴发，义体义眼细节，机能风外套",
-        "image_negative_prompt": "photorealistic sunny day, bright daylight, low quality, blurry, watermark",
+        "image_negative_prompt": "写实照片晴天, 明亮日光, 低画质, 模糊, 水印",
         "consistency_anchors": [
             "青蓝霓虹（#00E5FF）与品红（#FF2A6D）双主色贯穿",
             "雨夜湿润反射的路面贯穿全片",

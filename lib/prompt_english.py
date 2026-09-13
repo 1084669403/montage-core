@@ -139,10 +139,22 @@ def _append_english_visual_layer(
 
 
 def _is_stylized_playbook(style_context: dict[str, Any] | None) -> bool:
-    """当 playbook 的图片负面提示词拒绝 photoreal / 3D 时返回 True。"""
+    """风格化图片 playbook 判定：显式 ``stylized_image`` 优先，字符串兜底。
+
+    2026-09 全中文政策：负面词已中文化，「拒绝写实/3D」的中文表述
+    （``写实照片`` / ``3D渲染``）也须被识别；同时保留英文旧值兜底，
+    以兼容未打标志的旧项目产物。
+    """
     gen = (style_context or {}).get("asset_generation") or {}
+    if "stylized_image" in gen:
+        return bool(gen["stylized_image"])
     neg = str(gen.get("image_negative_prompt") or "").lower()
-    return "photorealistic" in neg or "3d render" in neg
+    return (
+        "photorealistic" in neg
+        or "3d render" in neg
+        or "写实照片" in neg
+        or "3d渲染" in neg
+    )
 
 
 def _image_english_layer_text(style_context: dict[str, Any] | None = None) -> str:
@@ -172,7 +184,7 @@ def _image_negative_text(
     extra = str(gen.get("image_negative_prompt") or "").strip()
     if extra:
         parts.append(extra)
-    return ", ".join(parts)
+    return "，".join(parts)
 
 
 def _append_first_frame_english_layer(

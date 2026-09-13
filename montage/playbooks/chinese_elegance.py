@@ -40,8 +40,9 @@ PLAYBOOK: dict = {
         "sfx_style": "笔触、水滴、纸页翻动",
     },
     "asset_generation": {
+        "stylized_image": True,
         "character_appearance_default": "中国古典审美面容，东方人特征，发髻或盘发，素色服饰",
-        "image_negative_prompt": "photorealistic, 3d render, neon, cluttered, low quality, modern digital art",
+        "image_negative_prompt": "写实照片, 3D渲染, 霓虹, 杂乱, 低画质, 现代数字艺术",
         "consistency_anchors": [
             "墨色为主基调，朱砂色仅作点睛",
             "宣纸留白背景贯穿全片",

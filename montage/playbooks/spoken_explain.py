@@ -46,7 +46,7 @@ PLAYBOOK: dict = {
     },
     "asset_generation": {
         "character_appearance_default": "东亚面容，干净出镜，日常得体服装，无夸张妆造",
-        "image_negative_prompt": "crowded background, cinematic bokeh chaos, extra people, text overlay, watermark, low quality",
+        "image_negative_prompt": "拥挤背景, 电影虚化混乱, 多余人物, 文字覆盖, 水印, 低画质",
         "consistency_anchors": [
             "单一讲解主体，背景干净",
             "面部始终清晰可见",

@@ -6,7 +6,7 @@ API 面：`kling_omni_30`、`kling_t2v_30`、`kling_i2v_30`、`kling_motion_30`�
 
 - 中文叙事。引用：`@element_N` 点名工牌；`@image_N` **只对应 refer_image**（通常场景空镜）。first/last **不写 id、不占 @image_1**。不要 `<<<image_N>>>`、不要 `@图片N`、不要 `<Picture N>`、不要 `【剧情】`。
 - 对白一行：`对白：{说话人}：{全文}`。单说话人才 `audio=native`，多说话人/无对白 `off`。
-- 逐镜必须显式 `multi_shot=false`。`feature_video` 才 true，并用 `shot 1, {秒}, {正文};`；`audio=off`；时长 3–10。`base_video` 与首尾帧互斥，`audio=original`。
+- 逐镜必须显式 `multi_shot=false`。`feature_video` 才 true，并用 `镜头 1, {秒}, {正文};`；`audio=off`；时长 3–10。`base_video` 与首尾帧互斥，`audio=original`。
 - 有工牌则 prompt 必须出现对应 `@element_N`，否则 valid=False。
 - 时长 3–15s；视频默认 1080p；静图 Image Omni 默认 2k。水印走 `options.watermark_info.enabled=false`。
 - 拼板：一张 16:9 白底格线，prompt 含该角色 appearance/outfit。道具写死纯白底。

@@ -35,7 +35,7 @@ PLAYBOOK: dict = {
     },
     "asset_generation": {
         "character_appearance_default": "东亚面容，自然裸妆，棉麻日常服饰，温暖神情",
-        "image_negative_prompt": "dark, moody, horror, saturated neon, low quality, blurry, watermark",
+        "image_negative_prompt": "昏暗, 阴郁, 恐怖, 高饱和霓虹, 低画质, 模糊, 水印",
         "consistency_anchors": [
             "奶油白高光基调贯穿全片",
             "自然柔光，无硬阴影",

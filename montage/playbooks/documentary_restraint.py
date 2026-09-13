@@ -41,8 +41,9 @@ PLAYBOOK: dict = {
         "sfx_style": "环境底噪真实保留，不刻意消除",
     },
     "asset_generation": {
+        "stylized_image": True,
         "character_appearance_default": "自然真实的中式面容，无妆感，日常便服",
-        "image_negative_prompt": "cinematic filter, heavy color grade, dramatic lighting, photorealistic 3d, stylized, low quality",
+        "image_negative_prompt": "电影滤镜, 浓重调色, 戏剧布光, 写实照片3D, 风格化, 低画质",
         "consistency_anchors": [
             "真实自然光，无舞台光",
             "低饱和中性色调贯穿全片",

@@ -37,8 +37,9 @@ PLAYBOOK: dict = {
         "sfx_style": "拟声留给字幕；音效只点关键动作",
     },
     "asset_generation": {
+        "stylized_image": True,
         "character_appearance_default": "漫画线稿面容，标志性发型固定，黑白或有限套色，眼睛高光明确",
-        "image_negative_prompt": "photorealistic, cinematic color grade, soft film grain, watercolor blur, extra limbs, watermark",
+        "image_negative_prompt": "写实照片, 电影调色, 柔和胶片颗粒, 水彩虚化, 多余肢体, 水印",
         "consistency_anchors": [
             "高对比描边贯穿",
             "角色剪影与发型固定",

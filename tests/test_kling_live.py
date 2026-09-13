@@ -96,7 +96,7 @@ def test_live_looksheet_and_bridge(tmp_path):
         pytest.skip("KLING_IMAGE_OMNI_MODEL=kling-v1 禁止用于 Image Omni")
     out = tmp_path / "look.png"
     still = KlingImage().execute({
-        "prompt": "white background character turnaround sheet, four views, no text",
+        "prompt": "纯白背景角色四视图拼板，四个视角，画面无文字",
         "result_type": "single",
         "aspect_ratio": "16:9",
         "output_path": str(out),

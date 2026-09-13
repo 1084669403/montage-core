@@ -46,8 +46,9 @@ PLAYBOOK: dict = {
         "sfx_style": "慌乱小碎步、沉爪步、甩刀呼啸、擦脸慢镜呼啸、苹果闷响、酱油瓶碎裂、打滑与水花",
     },
     "asset_generation": {
+        "stylized_image": True,
         "character_appearance_default": "原创拟人角色，海军蓝棒球帽配米白袖学院夹克 / 裂壳绿芽条形码种子",
-        "image_negative_prompt": "3d render, game engine, cel shading, cartoon, comic effect, halftone, pop art, subtitle, watermark, slow motion",
+        "image_negative_prompt": "3D渲染, 游戏引擎, 赛璐璐着色, 卡通, 漫画效果, 网点, 波普艺术, 字幕, 水印, 慢动作",
         "consistency_anchors": [
             "屏幕方向恒左→右推进，猎物右前、追赶者左后，不越轴",
             "三次抓捕一次比一次接近（半米→擦及→几乎按住）",
