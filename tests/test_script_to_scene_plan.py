@@ -117,3 +117,17 @@ def test_long_section_caps_shots():
     shots = convert_script_to_scene_plan(script)["scene_plan"]["scenes"][0]["shots"]
     assert len(shots) == 2  # 10s 网格最多 2 镜
     assert abs(sum(s["duration_seconds"] for s in shots) - 10) < 0.01
+
+
+def test_registry_mirrors_character_forms():
+    script = _fixture()
+    script["characters"][0]["forms"] = [
+        {"id": "human", "name": "人皮形", "appearance": "清秀书生"},
+        {"id": "ghost", "appearance": "青面獠牙", "skip_turnaround": True},
+    ]
+    plan = convert_script_to_scene_plan(script, get_playbook("cyberpunk_neon"))["scene_plan"]
+    reg = plan["character_registry"][0]
+    assert reg["forms"] == script["characters"][0]["forms"]
+    # 逐字镜像且非同一引用：改 plan 不回写 script
+    reg["forms"][0]["appearance"] = "改写"
+    assert script["characters"][0]["forms"][0]["appearance"] == "清秀书生"

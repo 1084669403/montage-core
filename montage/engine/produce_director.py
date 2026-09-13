@@ -17,7 +17,7 @@ from montage.engine.director import (
     validate_setup,
     write_director_review,
 )
-from montage.engine.policy import load_loop_policy
+from montage.engine.policy import load_loop_policy, normalize_frames_mode
 from montage.engine.runtime import run_tool
 from montage.toolbase import BaseTool, ToolResult
 from montage.tools.shot_runner import (
@@ -193,6 +193,15 @@ def _director_compile(
 
 def _director_loop(root: Path) -> str:
     return str(load_loop_policy(root).get("video_loop") or "").strip().lower()
+
+
+def _frames_mode(root: Path) -> str:
+    return normalize_frames_mode(load_loop_policy(root).get("frames_mode"))
+
+
+def _preview_skips_frames(root: Path) -> bool:
+    """preview 下 Agnes 首帧不参与 v25 生成，跳过 await_frames 省图片配额与墙钟。"""
+    return _director_loop(root) == "agnes" and _frames_mode(root) == "preview"
 
 
 def _cast_lookup(root: Path) -> dict[str, Any]:
@@ -477,10 +486,15 @@ def run_director_produce(
                     return _director_cast(
                         root, progress, bible, bag, runner, extra, retry_ids=retry_ids,
                     )
+            if _preview_skips_frames(root):
+                # preview：首帧不参与生成，跳过 frames 出图与 await_frames 停点。
+                return _director_prompts_preview(root, progress, bag, runner, extra)
             return _director_frames(
                 root, progress, bag, runner, extra, retry_ids=retry_ids,
             )
         if status == "await_frames":
+            if _preview_skips_frames(root):
+                return _director_prompts_preview(root, progress, bag, runner, extra)
             missing = frames_missing(
                 store.read("scene_plan"),
                 store.read("asset_manifest"),

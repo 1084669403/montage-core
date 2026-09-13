@@ -121,6 +121,41 @@ def test_fight_fails_grab_collar_passes():
     assert not [f for f in good if f["severity"] == "critical"]
 
 
+def test_bible_hero_over_cap_warns_not_blocks():
+    """hero 占比 >30% 在圣经期出 warning；不升 critical、不挡 pass。"""
+    bible = _ok_bible()
+    bible["scenes"][0]["shots"] = [_ok_shot(shot_budget_class="hero")]
+    result = validate_script(bible, purpose="bible")
+    hero = [f for f in result["findings"] if "hero 时长占比" in f["message"]]
+    assert hero and hero[0]["severity"] == "warning"
+    assert "over_hero" in hero[0]["message"]
+    assert hero[0]["proposed_fix"]
+    assert result["pass"] is True
+
+
+def test_bible_hero_within_cap_no_warning():
+    """hero 显式时长占 20%（2/10s）→ 不出预警。"""
+    bible = _ok_bible()
+    bible["scenes"][0]["shots"] = [
+        _ok_shot(shot_id="sc01_01", shot_budget_class="hero", duration_seconds=2),
+        _ok_shot(shot_id="sc01_02", duration_seconds=4),
+        _ok_shot(shot_id="sc01_03", duration_seconds=4),
+    ]
+    assert not [f for f in check_bible(bible) if "hero 时长占比" in f["message"]]
+
+
+def test_bible_hero_uses_scene_share_when_shot_duration_missing():
+    """镜头缺 duration_seconds 时按场均分（10/4=2.5s=25%）→ 不误报。"""
+    bible = _ok_bible()
+    bible["scenes"][0]["shots"] = [
+        _ok_shot(shot_id="sc01_01", shot_budget_class="hero"),
+        _ok_shot(shot_id="sc01_02"),
+        _ok_shot(shot_id="sc01_03"),
+        _ok_shot(shot_id="sc01_04"),
+    ]
+    assert not [f for f in check_bible(bible) if "hero 时长占比" in f["message"]]
+
+
 def test_missing_appearance_critical():
     bible = _ok_bible()
     bible["characters"][0]["appearance"] = ""
@@ -199,6 +234,14 @@ def test_purpose_all_does_not_run_bible_gates():
     assert result["pass"] is True
 
 
+def test_bible_shot_duration_overrides_scene_plan():
+    """bible 逐镜 duration_seconds 会抄进 scene_plan（作者可显式指定镜长）。"""
+    bible = _ok_bible()
+    bible["scenes"][0]["shots"] = [_ok_shot(duration_seconds=7)]
+    out = compile_bible(bible)
+    assert out["scene_plan"]["scenes"][0]["shots"][0]["duration_seconds"] == 7
+
+
 def test_compile_overlays_action_and_caps_props():
     bible = _ok_bible()
     bible["props"] = bible["props"] + [
@@ -247,6 +290,48 @@ def test_compile_aligns_location_id_from_locations():
     assert shot.get("location_sensory") == "霓虹积水"
     assert "霓虹积水" in str((shot.get("visual_details") or {}).get("environment") or "")
     assert out["scene_plan"].get("locations")
+    errors = ArtifactStore.validate(out["scene_plan"], get_schema("scene_plan"))
+    assert errors == []
+
+
+def test_location_sensory_crop_is_single_source():
+    """裁切结果同时写 location_sensory 与 vd.environment，裁切不再被绕过。"""
+    bible = _ok_bible()
+    bible["locations"] = [{
+        "id": "alley",
+        "name": "沿海旧巷",
+        "sensory": "近处积水反霓虹；远处巷口有灯",
+        "appearance": "雨夜旧巷无人",
+    }]
+    bible["scenes"][0]["shots"] = [_ok_shot(shot_language={"shot_size": "close_up"})]
+    out = compile_bible(bible)
+    shot = out["scene_plan"]["scenes"][0]["shots"][0]
+    expected = "近处积水反霓虹；远处巷口有灯轮廓"
+    assert shot["location_sensory"] == expected
+    assert shot["visual_details"]["environment"] == expected
+    assert "积水反霓虹" in shot["location_sensory"]
+
+
+def test_location_sensory_by_time_picks_matching_time():
+    """scene.environment.time 驱动 sensory_by_time 选句（晨/夜），不再靠 scratch 补丁。"""
+    bible = _ok_bible()
+    bible["locations"] = [{
+        "id": "alley",
+        "name": "沿海旧巷",
+        "sensory": "夜雨，霓虹积水",
+        "sensory_by_time": {
+            "晨": "晨光里巷口积水泛白",
+            "夜": "夜雨，霓虹积水",
+        },
+    }]
+    bible["scenes"][0]["environment"] = {"location": "沿海旧巷", "time": "晨"}
+    bible["scenes"][0]["shots"] = [_ok_shot(shot_language={"shot_size": "medium"})]
+    out = compile_bible(bible)
+    scene = out["scene_plan"]["scenes"][0]
+    shot = scene["shots"][0]
+    assert "晨光" in shot["location_sensory"]
+    assert "霓虹" not in shot["location_sensory"]
+    assert scene["environment"]["time"] == "晨"
     errors = ArtifactStore.validate(out["scene_plan"], get_schema("scene_plan"))
     assert errors == []
 
@@ -324,3 +409,125 @@ def test_none_loop_skips_jimeng_grid():
     assert not any("网格" in f["message"] for f in none_findings)
     volc = check_shot_completeness(plan, video_loop="volcengine")
     assert any("网格" in f["message"] for f in volc)
+
+
+def test_bible_forms_valid_passes():
+    bible = _ok_bible()
+    bible["characters"][0]["forms"] = [
+        {"id": "human", "name": "人皮形", "appearance": "清秀书生，青衫折扇"},
+        {"id": "ghost", "name": "鬼形", "appearance": "青面獠牙，破红嫁衣", "default": True},
+    ]
+    findings = check_bible(bible)
+    assert not [
+        f for f in findings
+        if f["severity"] == "critical" and ".forms" in f["field"]
+    ]
+
+
+def test_bible_forms_duplicate_or_empty_id_critical():
+    bible = _ok_bible()
+    bible["characters"][0]["forms"] = [
+        {"id": "human", "appearance": "青衫"},
+        {"id": "human", "appearance": "红袍"},
+    ]
+    findings = check_bible(bible)
+    assert any("重复" in f["message"] for f in findings if f["severity"] == "critical")
+
+    bible["characters"][0]["forms"] = [{"id": "", "appearance": "青衫"}]
+    findings = check_bible(bible)
+    assert any("非空 id" in f["message"] for f in findings if f["severity"] == "critical")
+
+
+def test_bible_forms_multiple_default_and_over_cap_critical():
+    bible = _ok_bible()
+    bible["characters"][0]["forms"] = [
+        {"id": "f1", "appearance": "a1", "default": True},
+        {"id": "f2", "appearance": "a2", "default": True},
+    ]
+    findings = check_bible(bible)
+    assert any("default=true" in f["message"] for f in findings if f["severity"] == "critical")
+
+    bible["characters"][0]["forms"] = [
+        {"id": f"f{i}", "appearance": f"a{i}"} for i in range(5)
+    ]
+    findings = check_bible(bible)
+    assert any("上限" in f["message"] for f in findings if f["severity"] == "critical")
+
+
+def test_bible_forms_kling_warns_only():
+    bible = _ok_bible()
+    bible["characters"][0]["forms"] = [{"id": "human", "appearance": "青衫"}]
+    findings = check_bible(bible, video_loop="kling")
+    kling = [f for f in findings if "可灵环忽略" in f["message"]]
+    assert kling and kling[0]["severity"] == "warning"
+
+
+def test_bible_forms_can_carry_appearance_when_char_empty():
+    bible = _ok_bible()
+    bible["characters"][0]["appearance"] = ""
+    bible["characters"][0]["forms"] = [
+        {"id": "human", "appearance": "清秀书生，青衫折扇"},
+        {"id": "ghost", "appearance": "青面獠牙，破红嫁衣"},
+    ]
+    findings = check_bible(bible)
+    assert not [
+        f for f in findings
+        if f["severity"] == "critical" and f["field"].endswith("characters[0].appearance")
+    ]
+
+
+def test_overlay_shot_propagates_form_id():
+    from montage.engine.bible import overlay_visuals
+
+    plan = {"scenes": [{"id": "sc01", "shots": [
+        {
+            "shot_id": "sc01_01",
+            "visual_details": {"subjects": [
+                {"id": "a", "appearance_anchor": "黑发旧疤"},
+                {"id": "b", "form_id": "keep"},
+            ]},
+        },
+    ]}]}
+    scenes = [{"id": "sc01", "shots": [
+        {"shot_id": "sc01_01", "subjects": [
+            {"id": "a", "form_id": "ghost", "action": {"verb": "抓住衣领推向墙", "contact": "衣领"}},
+            {"id": "b", "action": {"verb": "站定"}},
+        ]},
+    ]}]
+    overlay_visuals(plan, scenes, [])
+    subs = {s["id"]: s for s in plan["scenes"][0]["shots"][0]["visual_details"]["subjects"]}
+    assert subs["a"]["form_id"] == "ghost"
+    # bible 未声明 form_id 时不清空 plan 原值
+    assert subs["b"]["form_id"] == "keep"
+
+
+def test_bible_subject_form_id_valid_and_unknown():
+    bible = _ok_bible()
+    bible["characters"][0]["forms"] = [
+        {"id": "human", "appearance": "清秀书生"},
+        {"id": "ghost", "appearance": "青面獠牙"},
+    ]
+    bible["scenes"][0]["shots"][0]["subjects"][0]["form_id"] = "ghost"
+    findings = check_bible(bible)
+    assert not [f for f in findings if "未知形态" in f["message"]]
+
+    bible["scenes"][0]["shots"][0]["subjects"][0]["form_id"] = "nope"
+    findings = check_bible(bible)
+    assert any("未知形态" in f["message"] for f in findings if f["severity"] == "critical")
+
+
+def test_check_subject_forms_multi_form_same_shot_warns():
+    from montage.tools.script_validator import check_subject_forms
+
+    plan = {
+        "character_registry": [{"id": "a", "forms": [{"id": "human"}, {"id": "ghost"}]}],
+        "scenes": [{"id": "sc01", "shots": [{
+            "shot_id": "sc01_01",
+            "visual_details": {"subjects": [
+                {"id": "a", "form_id": "human"},
+                {"id": "a", "form_id": "ghost"},
+            ]},
+        }]}],
+    }
+    findings = check_subject_forms(plan, {"characters": [{"id": "a"}]})
+    assert any("多占参考图名额" in f["message"] for f in findings if f["severity"] == "warning")

@@ -10,6 +10,39 @@ from __future__ import annotations
 
 from typing import Any
 
+# 身份参考图类型：portrait（单张定妆，默认） / turnaround（四视图拼板）。
+# 三级优先级：form.cast_ref_kind > character.cast_ref_kind > proposal_packet.cast_ref_kind。
+CAST_REF_KIND_VALUES: list[str] = ["portrait", "turnaround"]
+
+# 人物形态（form）：同一角色在不同场景/状态的独立外观（如画皮鬼的人皮形/鬼形）。
+# 缺省（无 forms[]）= 单隐式形态 form_id=""，行为与旧版一致。
+CHARACTER_FORM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["id"],
+    "properties": {
+        "id": {
+            "type": "string",
+            "description": "角色内唯一；非空。隐式形态不写此字段（form_id=\"\"）",
+        },
+        "name": {"type": "string", "description": "形态名（如「人皮形」）；缺省回落角色 name"},
+        "appearance": {"type": "string", "description": "该形态外貌锚点；缺省回落角色 appearance"},
+        "outfit_anchor": {"type": "string", "description": "该形态服装锚点；缺省回落角色 outfit"},
+        "skip_turnaround": {
+            "type": "boolean",
+            "description": "该形态跳过四视图；缺省回落 characters[].skip_turnaround",
+        },
+        "cast_ref_kind": {
+            "type": "string",
+            "enum": CAST_REF_KIND_VALUES,
+            "description": "该形态的默认身份参考图类型；缺省回落 character/packet",
+        },
+        "default": {
+            "type": "boolean",
+            "description": "镜头未声明形态时的默认形态；每角色至多一个 true",
+        },
+    },
+}
+
 # 剧本环境：结构化对象（抬到镜头时拍扁成字符串）。也允许纯字符串以免旧写法炸 schema。
 ENVIRONMENT_SCHEMA: dict[str, Any] = {
     "description": "主环境。对象字段全 optional；喂提示词前用 flatten_environment 拍扁成一句",
@@ -20,6 +53,7 @@ ENVIRONMENT_SCHEMA: dict[str, Any] = {
             "properties": {
                 "location": {"type": "string", "description": "地点"},
                 "space": {"type": "string", "description": "室内/室外/空间尺度"},
+                "time": {"type": "string", "description": "晨/日/暮/夜 或具体时刻；驱动 sensory_by_time 选句"},
                 "lighting": {"type": "string", "description": "光线基调"},
                 "color_tone": {"type": "string", "description": "色调"},
                 "era": {"type": "string", "description": "时代"},
@@ -49,6 +83,10 @@ VISUAL_DETAILS_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string"},
+                    "form_id": {
+                        "type": "string",
+                        "description": "该镜出场形态（引用 character.forms[].id）；缺省=默认形态",
+                    },
                     "appearance_anchor": {"type": "string"},
                     "position": {"type": "string"},
                     "action": {
@@ -266,6 +304,19 @@ SCRIPT_SCHEMA: dict[str, Any] = {
                         "type": "boolean",
                         "description": "导演定妆步跳过该角色四视图；默认出",
                     },
+                    "cast_ref_kind": {
+                        "type": "string",
+                        "enum": CAST_REF_KIND_VALUES,
+                        "description": "该角色身份参考图类型；缺省回落 proposal_packet.cast_ref_kind",
+                    },
+                    "forms": {
+                        "type": "array",
+                        "description": (
+                            "该角色的多个形态（可选）。缺省=单隐式形态，行为与旧版一致；"
+                            "可灵环忽略 forms"
+                        ),
+                        "items": CHARACTER_FORM_SCHEMA,
+                    },
                     "cast_note": {
                         "type": "string",
                         "description": "定妆重抽时附带的一句修正",
@@ -329,6 +380,7 @@ SCENE_PLAN_SCHEMA: dict[str, Any] = {
                     "type": {"type": "string"},
                     "narrative_role": {"type": "string"},
                     "hero_moment": {"type": "boolean"},
+                    "environment": ENVIRONMENT_SCHEMA,
                     "start_seconds": {"type": "number"},
                     "end_seconds": {"type": "number"},
                     "character_ids": {
@@ -377,6 +429,11 @@ SCENE_PLAN_SCHEMA: dict[str, Any] = {
                     "id": {"type": "string"},
                     "appearance": {"type": "string"},
                     "outfit_anchor": {"type": "string"},
+                    "forms": {
+                        "type": "array",
+                        "items": CHARACTER_FORM_SCHEMA,
+                        "description": "逐字镜像 script.characters[].forms；分镜阶段禁止改写",
+                    },
                     "ethnicity_default": {"type": "string"},
                     "voice_id": {"type": "string", "description": "音色 id（voice_director / voices 表）"},
                 },
@@ -528,6 +585,14 @@ RENDER_REPORT_SCHEMA: dict[str, Any] = {
         "output_path": {"type": "string"},
         "duration_seconds": {"type": "number"},
         "encoding": {"type": "string"},
+        # 实测分辨率：Agnes 720P 实为 1280x704，图片 2K 非 1920x1080；
+        # 落盘实际像素供下游按需缩放，禁止反推 1280x720/1920x1080。
+        "width": {"type": "integer"},
+        "height": {"type": "integer"},
+        "clips": {"type": "array", "items": {"type": "object"}},
+        "images": {"type": "array", "items": {"type": "object"}},
+        "ffmpeg_version": {"type": "string"},
+        "ffmpeg_capabilities": {"type": "object"},
     },
 }
 
@@ -612,6 +677,24 @@ PROPOSAL_PACKET_SCHEMA: dict[str, Any] = {
         "concept": {"type": "string"},
         "playbook": {"type": "string"},
         "output_profile": {"type": "string"},
+        "frames_mode": {
+            "type": "string",
+            "enum": ["preview", "reference_first", "keyframe"],
+            "description": (
+                "首帧如何参与 Agnes 2.5 视频生成。preview（默认）不把首帧喂给模型，"
+                "只作审图；reference_first 把首帧作为 images[0] 参考；"
+                "keyframe 走 mode=keyframe 真 I2V（角色一致性下降）。"
+            ),
+        },
+        "ref_overflow_mode": {
+            "type": "string",
+            "enum": ["single", "segment"],
+            "description": (
+                "参考图超出名额时的策略。segment（默认）把同一 shot 按时间轴切多段，"
+                "段间以尾帧续接，段数封顶 4 后回退 single；single 直接丢弃多余参考"
+                "并出 finding（旧行为）。keyframe 首帧模式强制 single。"
+            ),
+        },
         "render_runtime": {"type": "string", "enum": ["ffmpeg"]},
         "video_loop": {
             "type": "string",
@@ -625,6 +708,14 @@ PROPOSAL_PACKET_SCHEMA: dict[str, Any] = {
         "lock_preferred_provider": {"type": "boolean"},
         "budget_ceiling_usd": {"type": "number"},
         "cost_estimate_usd": {"type": "number"},
+        "cast_ref_kind": {
+            "type": "string",
+            "enum": CAST_REF_KIND_VALUES,
+            "description": (
+                "全局默认身份参考图类型；被 character/form 级 cast_ref_kind 覆盖。"
+                "可灵环强制等价 turnaround"
+            ),
+        },
     },
 }
 
@@ -648,6 +739,10 @@ ASSET_MANIFEST_SCHEMA: dict[str, Any] = {
                     "provider": {"type": "string"},
                     "license": {"type": "string"},
                     "url": {"type": "string"},
+                    # 实测媒体参数：Agnes 720P 实为 1280x704、图片 2K 非 1920x1080。
+                    "duration_seconds": {"type": "number"},
+                    "width": {"type": "integer"},
+                    "height": {"type": "integer"},
                 },
             },
         },
@@ -669,6 +764,10 @@ ASSET_MANIFEST_SCHEMA: dict[str, Any] = {
                         "description": "空镜对齐 bible.locations[].id",
                     },
                     "prop_id": {"type": "string", "description": "对齐 script.props[].id"},
+                    "form_id": {
+                        "type": "string",
+                        "description": "该参考图所属角色形态（form）；缺省/空=单隐式形态",
+                    },
                     "path": {"type": "string"},
                     "url": {"type": "string"},
                     "provider": {"type": "string"},
@@ -816,6 +915,27 @@ LOCATION_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": "交叉方位环境句（左侧近处/右侧更远处/画面中上方等），不是单段气氛词",
         },
+        "sensory_by_time": {
+            "description": (
+                "按时间/光线的环境句变体；overlay 按 scene.environment.time "
+                "（回落 lighting）优先选，未命中再回落 sensory。"
+            ),
+            "anyOf": [
+                {"type": "object", "additionalProperties": {"type": "string"}},
+                {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "time": {"type": "string"},
+                            "lighting": {"type": "string"},
+                            "sensory": {"type": "string"},
+                        },
+                        "required": ["sensory"],
+                    },
+                },
+            ],
+        },
         "appearance": {"type": "string", "description": "空镜可生图描述"},
         "cast_note": {
             "type": "string",
@@ -887,6 +1007,7 @@ SERIES_BIBLE_SCHEMA: dict[str, Any] = {
                                 "shot_id": {"type": "string"},
                                 "blocking": NESTED_SHOT_SCHEMA["properties"]["blocking"],
                                 "shot_budget_class": NESTED_SHOT_SCHEMA["properties"]["shot_budget_class"],
+                                "duration_seconds": NESTED_SHOT_SCHEMA["properties"]["duration_seconds"],
                                 "cut": NESTED_SHOT_SCHEMA["properties"]["cut"],
                                 "location_id": NESTED_SHOT_SCHEMA["properties"]["location_id"],
                                 "subjects": VISUAL_DETAILS_SCHEMA["properties"]["subjects"],
@@ -942,6 +1063,77 @@ FORMAT_CARD_SCHEMA: dict[str, Any] = {
     },
 }
 
+# 图 ↔ 场景文字 冻结绑定（observe-only）。宽松 schema，便于后续扩字段。
+IMAGE_BINDING_REF_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string"},
+        "kind": {"type": "string"},
+        "role": {"type": "string"},
+        "form_id": {"type": "string"},
+        "character_id": {"type": "string"},
+        "location_id": {"type": "string"},
+        "prop_id": {"type": "string"},
+        "path": {"type": "string"},
+        "url": {"type": "string"},
+        # 实发下标；回填重算时为 null（源不可信）。
+        "picture_index": {"type": ["integer", "null"]},
+        "source": {"type": "string"},
+    },
+}
+
+IMAGE_BINDING_SEGMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "index": {"type": "integer"},
+        "seconds": {"type": "number"},
+        "bridge": {"type": "boolean"},
+        "refs": {"type": "array", "items": IMAGE_BINDING_REF_SCHEMA},
+    },
+}
+
+IMAGE_BINDING_SHOT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "scene_id": {"type": ["string", "null"]},
+        "location_id": {"type": ["string", "null"]},
+        "location_sensory": {"type": "string"},
+        "environment": {"type": "string"},
+        "character_forms": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "character_id": {"type": "string"},
+                    "form_id": {"type": "string"},
+                },
+            },
+        },
+        "prop_ids": {"type": "array", "items": {"type": "string"}},
+        "refs": {"type": "array", "items": IMAGE_BINDING_REF_SCHEMA},
+        "segments": {"type": "array", "items": IMAGE_BINDING_SEGMENT_SCHEMA},
+        "first_frame": {"type": ["object", "null"]},
+        "video": {"type": ["object", "null"]},
+    },
+}
+
+IMAGE_BINDINGS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": "生成的图/首帧 ↔ 场景文字/形态/实发 <Picture N> 的冻结绑定（v1 observe-only）",
+    "properties": {
+        "version": {"type": "integer"},
+        "shots": {
+            "type": "object",
+            "additionalProperties": IMAGE_BINDING_SHOT_SCHEMA,
+        },
+        "cast": {
+            "type": "object",
+            "additionalProperties": IMAGE_BINDING_REF_SCHEMA,
+        },
+    },
+    "required": ["shots", "cast"],
+}
+
 SCHEMAS: dict[str, dict[str, Any]] = {
     "research_brief": RESEARCH_BRIEF_SCHEMA,
     "proposal_packet": PROPOSAL_PACKET_SCHEMA,
@@ -963,6 +1155,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     "clip_plan": CLIP_PLAN_SCHEMA,
     "auto_edit_plan": AUTO_EDIT_PLAN_SCHEMA,
     "auto_edit_report": AUTO_EDIT_REPORT_SCHEMA,
+    "image_bindings": IMAGE_BINDINGS_SCHEMA,
 }
 
 

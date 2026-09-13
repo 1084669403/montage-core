@@ -109,7 +109,7 @@ def _gen_bag(proj: Path):
 
 def test_step_ids_not_mixed():
     assert "shot_dry_run" not in STEP_IDS
-    assert GEN_STEP_IDS == ("shot_dry_run", "shot_generate", "voice")
+    assert GEN_STEP_IDS == ("shot_dry_run", "shot_generate", "shot_bind", "voice")
     assert STEP_IDS[-3:] == ("finish", "release", "export")
 
 
@@ -156,6 +156,39 @@ def test_gen_then_soundtrack(tmp_path):
     cost = (proj / "cost.jsonl")
     if cost.is_file():
         assert "shot_runner/dry_run" not in cost.read_text(encoding="utf-8")
+
+
+def test_shot_bind_backfills_and_preserves_index(tmp_path):
+    """shot_bind 回填绑定并保留 inline 真序号；幂等，schema 校验通过。"""
+    proj = _seed_gen(tmp_path)
+    store = ArtifactStore(proj)
+    store.write("asset_manifest", {
+        "items": [],
+        "reference_assets": [{
+            "id": "portrait_li", "kind": "portrait", "character_id": "li",
+            "path": "assets/images/p.png", "url": "https://example.test/p.png",
+        }],
+    })
+    store.write("image_bindings", {"version": 1, "shots": {"sh01": {"refs": [
+        {"id": "portrait_li", "kind": "portrait", "picture_index": 1, "source": "sent_plan"},
+    ]}}, "cast": {}})
+    from montage.engine.produce import _run_shot_bind
+    from montage.schemas import get_schema
+
+    progress = {"steps": {}}
+    _run_shot_bind(proj, progress)
+    bindings = store.read("image_bindings")
+    refs = bindings["shots"]["sh01"]["refs"]
+    assert [r["id"] for r in refs] == ["portrait_li"]
+    # 回填写 recomputed，但真序号按 id 平移回来（不被洗掉）
+    assert refs[0]["picture_index"] == 1
+    assert bindings["cast"]["portrait_li"]["kind"] == "portrait"
+    assert progress["steps"]["shot_bind"]["status"] == "ok"
+    # 幂等：再跑一次结果一致
+    _run_shot_bind(proj, {"steps": {}})
+    again = store.read("image_bindings")
+    assert again["shots"]["sh01"]["refs"][0]["picture_index"] == 1
+    assert ArtifactStore.validate(again, get_schema("image_bindings")) == []
 
 
 def test_partial_clips_only_fill_missing(tmp_path):

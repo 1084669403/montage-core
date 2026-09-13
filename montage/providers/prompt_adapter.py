@@ -186,7 +186,12 @@ def _citation_lines(syntax: str, refs: list[dict[str, Any]] | None, *, body: str
         elif syntax == "<<<image_N>>>":
             lines.append(f"<<<image_{idx}>>>")
         elif syntax == "<Picture N>":
-            lines.append(f"<Picture {idx}>")
+            # 带图例的最终有序表（Agnes 2.5）已把 <Picture N> 写进正文；此处只
+            # 兜底补缺失标签，绝不另起一套编号（否则与实发 images[] 错位）。
+            tag = f"<Picture {idx}>"
+            if tag in text or tag in lines:
+                continue
+            lines.append(tag)
     return "\n".join(lines)
 
 

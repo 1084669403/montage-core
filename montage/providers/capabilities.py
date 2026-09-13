@@ -10,6 +10,7 @@ VIDEO_SURFACES 按 api_id 建档（含尚未接线的 2.5 / Omni）；doctor 读
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 # image_reference: 生图时能否喂定妆照/参考图
@@ -67,6 +68,7 @@ IMAGE_BY_TOOL: dict[str, dict[str, Any]] = {
         "ref_url_fields": ("reference_urls",),
         "ref_path_fields": (),
         "reference_operation": "image_reference",
+        "max_ref_images": 6,  # 来源待证（官方 Flash 文档只写明视频 images ≤ 5）
         "turnaround": True,
     },
     "dashscope_image": dict(_NO_IMAGE),
@@ -124,16 +126,18 @@ VIDEO_BY_TOOL: dict[str, dict[str, Any]] = {
     "agnes_video": {
         "first_frame": False,
         "last_frame": False,
-        "first_url_fields": (),
+        "first_url_fields": ("first_frame",),
         "first_path_fields": (),
-        "last_url_fields": (),
+        "last_url_fields": ("last_frame",),
         "last_path_fields": (),
+        "requires_first_frame": False,
         "mode": "reference",
         "continuity_mode": "image_ref",
-        "max_ref_images": 5,
+        "max_ref_images": 5,  # 官方 Flash 文档：images ≤ 5
+        "max_ref_audios": 3,  # 官方 Flash 文档：audios ≤ 3（agnes._payload_v25 实际消费）
         "video_ref": False,
         "keyframe_chain": False,
-        "keyframe_field": "",
+        "keyframe_field": "first_frame",
         "modes": ("text", "keyframe", "reference"),
         "duration_policy": {"kind": "range", "min": 4, "max": 12, "step": 1},
         "native_audio": True,
@@ -509,6 +513,10 @@ VIDEO_SURFACES: dict[str, dict[str, Any]] = {
         "fallback_api_id": "",
         "first_frame": False,
         "last_frame": False,
+        "first_url_fields": ("first_frame",),
+        "first_path_fields": (),
+        "last_url_fields": ("last_frame",),
+        "last_path_fields": (),
         "multi_shot": False,
         "multi_shot_max": 0,
         "native_audio": True,
@@ -528,7 +536,8 @@ VIDEO_SURFACES: dict[str, dict[str, Any]] = {
         "prompt_profile": "agnes_v25",
         "models": ["agnes-video-2.5-flash"],
         "continuity_mode": "image_ref",
-        "max_ref_images": 5,
+        "max_ref_images": 5,  # 官方 Flash 文档：images ≤ 5
+        "max_ref_audios": 3,  # 官方 Flash 文档：audios ≤ 3（纯占位，无消费者）
         "video_ref": False,
         "env_keys_hint": ("AGNES_CN_API_KEY", "AGNES_API_KEY"),
     },
@@ -660,6 +669,40 @@ def _kling_image_omni_from_refs(
     return elements, images, notes
 
 
+def agnes_image_ref_entries(
+    refs: list[dict[str, Any]],
+    caps: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Agnes 图片多图合成的实发有序表（URL 优先、本地路径兜底、去重保序、按上限截断）。
+
+    与 ``apply_image_refs`` 的 agnes 分支共用，保证提示词里的角色图例与
+    实际塞进 ``extra_body.image`` 的顺序逐条第对齐。返回的每项都是原 ref
+    dict 并附 ``_sent``（真正送出的 url/path），供图例按同序说明角色。
+    """
+    notes: list[str] = []
+    limit = int(caps.get("max_ref_images") or 0)
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in refs:
+        if not isinstance(item, dict):
+            continue
+        val = str(item.get("url") or "").strip()
+        if val and val not in seen:
+            seen.add(val)
+            entries.append({**item, "_sent": val})
+    for item in refs:
+        if not isinstance(item, dict) or str(item.get("url") or "").strip():
+            continue
+        val = str(item.get("path") or "").strip()
+        if val and val not in seen:
+            seen.add(val)
+            entries.append({**item, "_sent": val})
+    if limit > 0 and len(entries) > limit:
+        entries = entries[:limit]
+        notes.append(f"参考图超过上限 {limit}，已截断保留前 {limit} 张")
+    return entries, notes
+
+
 def apply_image_refs(
     payload: dict[str, Any],
     refs: list[dict[str, Any]],
@@ -702,11 +745,19 @@ def apply_image_refs(
     paths = _first_filled([str(r.get("path") or "") for r in refs])
     path_fields = tuple(caps.get("ref_path_fields") or ())
     op = str(caps.get("reference_operation") or "")
-    if op and not urls:
-        notes.append(f"{op} 需要参考图 URL，本次仅有本地路径，降级纯文生")
-        return notes
     if op:
+        # agnes_image（image_reference）：实发有序表见 agnes_image_ref_entries，
+        # 提示词侧的角色图例复用同一函数，杜绝编号与实发错位。
+        entries_info, extra = agnes_image_ref_entries(refs, caps)
+        notes.extend(extra)
+        if not entries_info:
+            notes.append(f"{op} 需要参考图 URL 或本地路径，两者皆无，降级纯文生")
+            return notes
         payload["operation"] = op
+        payload[url_fields[0] if url_fields else "reference_urls"] = [
+            e["_sent"] for e in entries_info
+        ]
+        return notes
     if urls and url_fields:
         field = url_fields[0]
         if field == "image_list":
@@ -750,7 +801,7 @@ def apply_video_frames(
         elif first_path or first_url:
             notes.append("首帧未填入（无匹配字段），降级文生视频")
     elif first_path or first_url:
-        notes.append("当前视频供应商不支持首帧，降级纯文生")
+        notes.append("当前能力表未声明首帧，已忽略 first_frame（其余生成路径不变）")
 
     if last_path or last_url:
         if not caps.get("last_frame"):
@@ -1081,14 +1132,73 @@ def apply_kling_omni_videos(
     return notes
 
 
-# RPM / 时长网格（编排层 pacing 用；默认按免费档，避免 429）
-# durations 含 API 仍接受的 3s；转换器读 duration_policy，不含 3s
+# RPM / 时长网格（编排层 pacing 用）
+# durations 含 API 仍接受的 3s；转换器读 duration_policy，不含 3s。
+# 仅记录，全仓无消费方（保留以便未来校验网格）。
 VIDEO_META: dict[str, dict[str, Any]] = {
-    "agnes_video": {"rpm": 1, "durations": [4, 8, 12], "prompt_max": 3000},
+    "agnes_video": {"durations": list(range(4, 13)), "prompt_max": 3000},
 }
-IMAGE_META: dict[str, dict[str, Any]] = {
-    "agnes_image": {"rpm": {"1K": 20, "2K": 10, "3K": 1, "4K": 1}},
+
+# ---- 实测输出分辨率（2026-09 实测；官方只给 720P/档位，不列像素）----
+# 视频 2.5 Flash：720P 硬限。16:9 实出 1280x704（上下各 8px 黑边，非 1280x720）、
+# 9:16 实出 720x1280。竖屏成片 1080x1920 即 1.5x 上采样。
+# 图片 2.5 Flash：2K 档 16:9=2624x1472、9:16=1472x2624、1:1=2048x2048，
+# 均非 1920x1080 / 1280x720。
+# 这两张表只作知识与兜底：compose/report 一律以 ffprobe 实测为准，不得据此
+# 反推缩放/letterbox（也不得假设 1280x720 / 1920x1080）。
+AGNES_V25_VIDEO_SIZES: dict[str, tuple[int, int]] = {
+    "16:9": (1280, 704),
+    "9:16": (720, 1280),
 }
+AGNES_IMAGE_2K_SIZES: dict[str, tuple[int, int]] = {
+    "16:9": (2624, 1472),
+    "9:16": (1472, 2624),
+    "1:1": (2048, 2048),
+}
+
+
+def measured_output_size(kind: str, *, ratio: str = "", size: str = "") -> tuple[int, int] | None:
+    """实测输出像素（仅知识/兜底，不能替代 ffprobe）。未知组合返回 None。"""
+    key = str(ratio or "").strip()
+    if kind == "video":
+        return AGNES_V25_VIDEO_SIZES.get(key)
+    if kind == "image" and str(size or "").strip().upper() == "2K":
+        return AGNES_IMAGE_2K_SIZES.get(key)
+    return None
+
+# Agnes 访问类型 RPM：官方 Token Plan FAQ（取「实际 RPM」，比「允许发起」更保守）。
+# 同类型多密钥共享同一限制池、不叠加；default = 未声明 Token Plan/企业认证的免费用户。
+# 文本 RPM（20/40/1000）不建：仓库无任何 agnes 文本调用。
+AGNES_RPM: dict[str, dict[str, Any]] = {
+    "default": {"video": 1, "image": {"1K": 20, "2K": 10, "3K": 1, "4K": 1}},
+    "enterprise": {"video": 2, "image": {"1K": 40, "2K": 20, "3K": 1, "4K": 1}},
+    "tokenplan": {"video": 5, "image": {"1K": 100, "2K": 80, "3K": 1, "4K": 1}},
+}
+
+
+def agnes_access_tier() -> str:
+    """AGNES_ACCESS_TYPE=default|enterprise|tokenplan；未知/未设回 default（免费档）。
+
+    未声明即免费：代码不得从密钥/额度等其它信号推断 Token Plan。
+    """
+    val = str(os.environ.get("AGNES_ACCESS_TYPE") or "").strip().lower()
+    return val if val in AGNES_RPM else "default"
+
+
+def agnes_video_rpm(tier: str | None = None) -> float:
+    key = str(tier).strip().lower() if tier else agnes_access_tier()
+    if key not in AGNES_RPM:
+        key = "default"
+    return float(AGNES_RPM[key]["video"])
+
+
+def agnes_image_rpm(size: str, tier: str | None = None) -> float:
+    """按 size 档取 RPM；未知 size 兜底 2K 档。"""
+    key = str(tier).strip().lower() if tier else agnes_access_tier()
+    if key not in AGNES_RPM:
+        key = "default"
+    table = AGNES_RPM[key]["image"]
+    return float(table.get(str(size or "").strip().upper()) or table["2K"])
 
 
 def policy_for_loop(video_loop: Any = None) -> dict[str, Any]:

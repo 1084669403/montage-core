@@ -42,6 +42,7 @@ def _doctor_payload(reg: ToolRegistry, args: argparse.Namespace) -> dict:
     except ImportError:
         has_schema = False
     from montage.engine.envfile import injected_key_count
+    from montage.providers.agnes_usage import usage_snapshot
     from montage.providers.capabilities import doctor_video_surfaces
 
     payload: dict = {
@@ -49,6 +50,7 @@ def _doctor_payload(reg: ToolRegistry, args: argparse.Namespace) -> dict:
         "setup_offers": summary.get("setup_offers") or [],
         "import_errors": summary.get("import_errors") or [],
         "video_surfaces": doctor_video_surfaces(),
+        "agnes_usage": usage_snapshot(),
         "ffmpeg": bool(shutil.which("ffmpeg")),
         "jsonschema": has_schema,
         "dotenv_injected": injected_key_count(),
@@ -105,6 +107,22 @@ def _cmd_doctor(reg: ToolRegistry, args: argparse.Namespace) -> int:
         print("== 发现时导入失败 ==")
         for item in errors:
             print(f"  {item}")
+    usage = payload.get("agnes_usage") or {}
+    tier = str(usage.get("tier") or "default")
+    if usage.get("declared"):
+        print(f"agnes 访问档位: {tier}")
+    else:
+        print("agnes 访问档位: default（免费/默认档，未声明 Token Plan）")
+    if usage.get("image_limit") is not None:
+        print(
+            f"  今日图片: {usage.get('images', 0):g}/{usage['image_limit']:g}"
+            f"（余 {usage.get('image_remaining', 0):g}）"
+        )
+    if usage.get("video_limit") is not None:
+        print(
+            f"  今日视频: {usage.get('video_seconds', 0):g}/{usage['video_limit']:g} 秒"
+            f"（余 {usage.get('video_remaining', 0):g}）"
+        )
     print(f"ffmpeg: {'OK' if payload['ffmpeg'] else 'MISSING'}")
     print(f"jsonschema: {'OK' if payload['jsonschema'] else 'MISSING（核心依赖，pip install -e .）'}")
     print(f"dotenv: 已从 .env 注入 {payload['dotenv_injected']} 个键")
@@ -331,6 +349,7 @@ def _cmd_produce(args: argparse.Namespace) -> int:
         skip_export=bool(args.skip_export),
         strict_audio=bool(args.strict_audio),
         keep_scratch=bool(args.keep_scratch),
+        prune_exports=int(getattr(args, "prune_exports", 0) or 0),
         idea=getattr(args, "idea", None),
         review=str(getattr(args, "review", None) or "director"),
         tts=bool(getattr(args, "tts", False)),
@@ -455,6 +474,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_prod.add_argument("--skip-export", dest="skip_export", action="store_true")
     p_prod.add_argument("--strict-audio", dest="strict_audio", action="store_true", help="缺 BGM 则失败")
     p_prod.add_argument("--keep-scratch", dest="keep_scratch", action="store_true", help="保留中间文件")
+    p_prod.add_argument(
+        "--prune-exports", dest="prune_exports", type=int, default=0, metavar="N",
+        help="导出后只保留最新 N 个 zip（默认 0=只增不删）",
+    )
     p_prod.add_argument("--idea", default=None, help="W1：级联分析并收编圣经（不生成、不拼片）")
     p_prod.add_argument("--tts", action="store_true", help="W2：生成后合成对白（默认不合成）")
     p_prod.add_argument("--trim-hero", dest="trim_hero", action="store_true", help="W3：把超额 pending hero 降为 talk")

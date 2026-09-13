@@ -1,5 +1,7 @@
 """Agnes 官方契约：域名、2.0/2.5 端点、TTS 降级、解析函数。"""
 
+import base64
+
 from jsonschema import validate
 
 from montage.providers import agnes
@@ -328,6 +330,32 @@ def test_v25_images_win_over_first_frame(monkeypatch, tmp_path):
     assert payload["seconds"] == "8"
 
 
+def test_v25_keyframe_uses_first_frame_url_and_omits_ratio(monkeypatch, tmp_path):
+    """keyframe 真 I2V：认 first_frame_url，且不叠可能冲突的 aspect_ratio。"""
+    monkeypatch.setenv("AGNES_CN_API_KEY", "k")
+    posted: list[dict] = []
+
+    def fake_post(url, payload, headers=None, timeout=180):
+        posted.append(payload)
+        return {"id": "video_k", "status": "completed", "url": "https://cdn.example/k.mp4"}
+
+    monkeypatch.setattr(agnes, "post_json", fake_post)
+    monkeypatch.setattr(agnes, "_download", lambda url, dest: str(dest))
+
+    result = agnes.AgnesVideo().execute({
+        "prompt": "首帧",
+        "seconds": 6,
+        "first_frame_url": "https://cdn.example/f.png",
+        "aspect_ratio": "16:9",
+        "output_path": str(tmp_path / "k.mp4"),
+    })
+    assert result.success
+    payload = posted[0]
+    assert payload["mode"] == "keyframe"
+    assert payload["first_frame"] == "https://cdn.example/f.png"
+    assert "aspect_ratio" not in payload
+
+
 def test_is_v25_recognizes_flash():
     assert agnes._is_v25("agnes-video-2.5-flash")
     assert agnes._is_v25("agnes-video-2.5")
@@ -357,3 +385,314 @@ def test_clip_prompt_does_not_slice_without_fallback():
     clipped, err2 = agnes._clip_prompt(long_text, fallback=True)
     assert not err2
     assert len(clipped) <= 3000
+
+
+# ---- Agnes Image 2.5 Flash 契约 ----
+
+def test_image_t2i_payload_contract(monkeypatch):
+    """文生图：单模型 2.5、档位+ratio、response_format 进 extra_body 禁顶层。"""
+    monkeypatch.setenv("AGNES_CN_API_KEY", "k")
+    posted: list[tuple[str, dict]] = []
+
+    def fake_post(url, payload, headers=None, timeout=300):
+        posted.append((url, payload))
+        return {"created": 1, "data": [{"url": "https://cdn.example/out.png", "b64_json": None, "revised_prompt": None}]}
+
+    monkeypatch.setattr(agnes, "post_json", fake_post)
+    result = agnes.AgnesImage().execute({"prompt": "浮空城市", "size": "2K", "ratio": "16:9"})
+    assert result.success
+    url, payload = posted[0]
+    assert url.endswith("/images/generations")
+    assert payload["model"] == "agnes-image-2.5-flash"
+    assert payload["prompt"] == "浮空城市"
+    assert payload["size"] == "2K"
+    assert payload["ratio"] == "16:9"
+    assert payload["extra_body"] == {"response_format": "url"}
+    assert "response_format" not in payload
+    assert "tags" not in payload
+    assert "resolution" not in payload
+    assert "return_base64" not in payload
+    assert result.data["url"] == "https://cdn.example/out.png"
+    assert result.data["revised_prompt"] is None
+
+
+def test_image_edit_multi_image_composition_contract(monkeypatch):
+    """编辑/多图合成：extra_body.image 保序多张、同模型 2.5、档位+ratio 统一。"""
+    monkeypatch.setenv("AGNES_CN_API_KEY", "k")
+    posted: list[tuple[str, dict]] = []
+
+    def fake_post(url, payload, headers=None, timeout=300):
+        posted.append((url, payload))
+        return {"created": 1, "data": [{"url": "https://cdn.example/comp.png", "b64_json": None, "revised_prompt": None}]}
+
+    monkeypatch.setattr(agnes, "post_json", fake_post)
+    refs = ["https://cdn.example/char-1.png", "https://cdn.example/char-2.png"]
+    result = agnes.AgnesImage().execute({
+        "prompt": "合成战斗场景",
+        "operation": "image_edit",
+        "reference_urls": refs,
+        "size": "2K",
+        "ratio": "3:2",
+    })
+    assert result.success
+    payload = posted[0][1]
+    assert payload["model"] == "agnes-image-2.5-flash"
+    assert payload["size"] == "2K"
+    assert payload["ratio"] == "3:2"
+    assert payload["extra_body"]["image"] == refs
+    assert payload["extra_body"]["response_format"] == "url"
+    assert "response_format" not in payload
+    assert "tags" not in payload
+
+
+def test_image_t2i_return_base64(monkeypatch, tmp_path):
+    """文生图 Base64：顶层 return_base64=true → data[0].b64_json 落盘。"""
+    monkeypatch.setenv("AGNES_CN_API_KEY", "k")
+    posted: list[tuple[str, dict]] = []
+    b64 = base64.b64encode(b"png-bytes").decode("ascii")
+
+    def fake_post(url, payload, headers=None, timeout=300):
+        posted.append((url, payload))
+        return {"created": 1, "data": [{"url": None, "b64_json": b64, "revised_prompt": None}]}
+
+    monkeypatch.setattr(agnes, "post_json", fake_post)
+    out = tmp_path / "b64.png"
+    result = agnes.AgnesImage().execute({"prompt": "玻璃方块", "return_base64": True, "output_path": str(out)})
+    assert result.success
+    assert posted[0][1]["return_base64"] is True
+    assert "extra_body" not in posted[0][1]
+    assert result.data["local_path"] == str(out)
+    assert out.read_bytes() == b"png-bytes"
+
+
+def test_image_t2i_return_base64_warns_no_public_url(monkeypatch, tmp_path):
+    """return_base64 输出无公网 URL，meta.warnings 提醒不能直接喂视频。"""
+    monkeypatch.setenv("AGNES_CN_API_KEY", "k")
+    b64 = base64.b64encode(b"png-bytes").decode("ascii")
+
+    def fake_post(url, payload, headers=None, timeout=300):
+        return {"created": 1, "data": [{"url": None, "b64_json": b64}]}
+
+    monkeypatch.setattr(agnes, "post_json", fake_post)
+    out = tmp_path / "b64w.png"
+    result = agnes.AgnesImage().execute({
+        "prompt": "玻璃方块", "return_base64": True, "output_path": str(out),
+    })
+    assert result.success
+    warnings = (result.meta or {}).get("warnings") or []
+    assert any("无公网 URL" in w for w in warnings)
+
+
+def test_v25_drops_local_refs_and_overflow_with_warnings():
+    urls = [f"https://cdn.example/p{i}.png" for i in range(1, 7)]
+    payload, warnings = agnes._payload_v25(
+        {"images": ["/local/a.png", "data:image/png;base64,xx", *urls], "seconds": 6},
+        "m",
+        "p",
+    )
+    assert payload["mode"] == "reference"
+    assert payload["images"] == urls[:5]
+    assert any("非公网" in w for w in warnings)
+    assert any("超过上限" in w for w in warnings)
+
+
+def test_v25_ignores_local_first_frame_with_warning():
+    payload, warnings = agnes._payload_v25(
+        {"first_frame": "/local/f.png", "seconds": 6}, "m", "p",
+    )
+    assert payload["mode"] == "text"
+    assert any("首帧非公网" in w for w in warnings)
+
+
+def test_image_edit_b64_json_response(monkeypatch, tmp_path):
+    """编辑 b64_json：extra_body.response_format=b64_json → 落盘。"""
+    monkeypatch.setenv("AGNES_CN_API_KEY", "k")
+    b64 = base64.b64encode(b"edit-bytes").decode("ascii")
+    posted: list[tuple[str, dict]] = []
+
+    def fake_post(url, payload, headers=None, timeout=300):
+        posted.append((url, payload))
+        return {"created": 1, "data": [{"url": None, "b64_json": b64, "revised_prompt": None}]}
+
+    monkeypatch.setattr(agnes, "post_json", fake_post)
+    out = tmp_path / "edit.png"
+    result = agnes.AgnesImage().execute({
+        "prompt": "改橙色",
+        "operation": "image_edit",
+        "reference_urls": ["https://cdn.example/in.png"],
+        "response_format": "b64_json",
+        "output_path": str(out),
+    })
+    assert result.success
+    payload = posted[0][1]
+    assert payload["extra_body"]["response_format"] == "b64_json"
+    assert "return_base64" not in payload
+    assert out.read_bytes() == b"edit-bytes"
+
+
+def test_image_edit_packs_local_paths_as_data_uri(monkeypatch, tmp_path):
+    """本地路径装箱：https 直传 + 本地 png 转 data:image/png;base64；缺文件硬失败。"""
+    monkeypatch.setenv("AGNES_CN_API_KEY", "k")
+    posted: list[tuple[str, dict]] = []
+    local_png = tmp_path / "portrait.png"
+    local_png.write_bytes(b"local-img")
+
+    def fake_post(url, payload, headers=None, timeout=300):
+        posted.append((url, payload))
+        return {"created": 1, "data": [{"url": "https://cdn.example/o.png", "b64_json": None, "revised_prompt": None}]}
+
+    monkeypatch.setattr(agnes, "post_json", fake_post)
+    result = agnes.AgnesImage().execute({
+        "prompt": "定妆参考",
+        "operation": "image_reference",
+        "reference_urls": ["https://cdn.example/in.png", str(local_png)],
+    })
+    assert result.success
+    image = posted[0][1]["extra_body"]["image"]
+    assert image[0] == "https://cdn.example/in.png"
+    assert image[1].startswith("data:image/png;base64,")
+    assert base64.b64decode(image[1].split(",", 1)[1]) == b"local-img"
+
+    missing = agnes.AgnesImage().execute({
+        "prompt": "x",
+        "operation": "image_edit",
+        "reference_urls": [str(tmp_path / "nope.png")],
+    })
+    assert not missing.success
+    assert "不存在" in missing.error
+
+
+def test_image_t2i_ignores_response_format_and_edit_ignores_return_base64(monkeypatch):
+    """防非法组合：文生图忽略 response_format 输入；编辑忽略 return_base64 输入。"""
+    monkeypatch.setenv("AGNES_CN_API_KEY", "k")
+    seen: list[dict] = []
+
+    def fake_post(url, payload, headers=None, timeout=300):
+        seen.append(payload)
+        return {"created": 1, "data": [{"url": "https://cdn.example/o.png", "b64_json": None, "revised_prompt": None}]}
+
+    monkeypatch.setattr(agnes, "post_json", fake_post)
+    r1 = agnes.AgnesImage().execute({"prompt": "x", "response_format": "b64_json"})
+    assert r1.success
+    assert seen[0]["extra_body"] == {"response_format": "url"}
+    assert "return_base64" not in seen[0]
+
+    r2 = agnes.AgnesImage().execute({
+        "prompt": "x",
+        "operation": "image_edit",
+        "reference_urls": ["https://cdn.example/in.png"],
+        "return_base64": True,
+    })
+    assert r2.success
+    assert "return_base64" not in seen[1]
+    assert seen[1]["extra_body"]["response_format"] == "url"
+
+
+def test_image_and_video_estimate_cost_zero(monkeypatch):
+    """免费期：图/视频 estimate_cost 均报 0（预算门禁对 0 安全旁路）。"""
+    monkeypatch.setenv("AGNES_CN_API_KEY", "k")
+    assert agnes.AgnesImage().estimate_cost({"size": "4K", "reference_urls": ["u"] * 6}) == 0.0
+    assert agnes.AgnesVideo().estimate_cost({"seconds": 12}) == 0.0
+
+
+def test_pack_agnes_image_rejects_bad_suffix(tmp_path):
+    bad = tmp_path / "ref.xyz"
+    bad.write_bytes(b"junk")
+    packed, errors = agnes.pack_agnes_image([str(bad)])
+    assert packed == []
+    assert errors and "不受支持" in errors[0]
+
+    packed, errors = agnes.pack_agnes_image(["https://x/a.png", "", "https://x/a.png"])
+    assert errors == []
+    assert packed == ["https://x/a.png"]
+
+
+# ---- Video 2.5 Flash：aspect_ratio / audios 上限 ----
+
+def test_v25_aspect_ratio_passthrough_and_garbage_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGNES_CN_API_KEY", "k")
+    posted: list[dict] = []
+
+    def fake_post(url, payload, headers=None, timeout=180):
+        posted.append(payload)
+        return {"id": "v", "status": "completed", "url": "https://cdn.example/v.mp4"}
+
+    monkeypatch.setattr(agnes, "post_json", fake_post)
+    monkeypatch.setattr(agnes, "_download", lambda url, dest: str(dest))
+
+    agnes.AgnesVideo().execute({
+        "prompt": "雨夜", "seconds": 5, "aspect_ratio": "9:16",
+        "output_path": str(tmp_path / "a.mp4"),
+    })
+    assert posted[0]["aspect_ratio"] == "9:16"
+    assert "2:3" not in agnes.AGNES_VIDEO_RATIOS
+
+    agnes.AgnesVideo().execute({
+        "prompt": "雨夜", "seconds": 5, "aspect_ratio": "2:3",
+        "output_path": str(tmp_path / "b.mp4"),
+    })
+    assert posted[1]["aspect_ratio"] == "16:9"  # 非法（仅图片合法）落回默认
+
+
+def test_v25_caps_audios_at_three_with_warning(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGNES_CN_API_KEY", "k")
+    posted: list[dict] = []
+
+    def fake_post(url, payload, headers=None, timeout=180):
+        posted.append(payload)
+        return {"id": "v", "status": "completed", "url": "https://cdn.example/v.mp4"}
+
+    monkeypatch.setattr(agnes, "post_json", fake_post)
+    monkeypatch.setattr(agnes, "_download", lambda url, dest: str(dest))
+
+    audios = [f"https://cdn.example/a{i}.mp3" for i in range(1, 6)]
+    result = agnes.AgnesVideo().execute({
+        "prompt": "广场", "seconds": 5, "audios": audios,
+        "output_path": str(tmp_path / "v.mp4"),
+    })
+    assert result.success
+    payload = posted[0]
+    assert payload["mode"] == "reference"
+    assert payload["audios"] == audios[:3]
+    assert "<Audio 3>" in payload["prompt"]
+    assert "<Audio 4>" not in payload["prompt"]
+    assert any("audio" in w for w in (result.meta or {}).get("warnings") or [])
+
+
+def test_v25_reference_keeps_images_at_five(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGNES_CN_API_KEY", "k")
+    posted: list[dict] = []
+
+    def fake_post(url, payload, headers=None, timeout=180):
+        posted.append(payload)
+        return {"id": "v", "status": "completed", "url": "https://cdn.example/v.mp4"}
+
+    monkeypatch.setattr(agnes, "post_json", fake_post)
+    monkeypatch.setattr(agnes, "_download", lambda url, dest: str(dest))
+
+    urls = [f"https://cdn.example/p{i}.png" for i in range(1, 8)]
+    result = agnes.AgnesVideo().execute({
+        "prompt": "广场", "seconds": 5, "images": urls,
+        "output_path": str(tmp_path / "v.mp4"),
+    })
+    assert result.success
+    assert posted[0]["images"] == urls[:5]
+    assert agnes.AGNES_IMAGE_RATIOS == frozenset(agnes._RATIOS)
+
+
+def test_http_error_status_propagated_for_429(monkeypatch, tmp_path):
+    """429 状态码必须进 meta["http_status"]，供上层退避（不做字符串匹配）。"""
+    from montage.providers.http import HttpError
+
+    monkeypatch.setenv("AGNES_CN_API_KEY", "k")
+
+    def boom(*_a, **_k):
+        raise HttpError(429, "https://api.example/v1/videos", "rate limited")
+
+    monkeypatch.setattr(agnes, "post_json", boom)
+    r_img = agnes.AgnesImage().execute({"prompt": "x"})
+    assert not r_img.success
+    assert (r_img.meta or {}).get("http_status") == 429
+    r_vid = agnes.AgnesVideo().execute({"prompt": "x", "seconds": 5})
+    assert not r_vid.success
+    assert (r_vid.meta or {}).get("http_status") == 429

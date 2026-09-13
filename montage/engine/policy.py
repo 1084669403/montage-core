@@ -32,6 +32,59 @@ VIDEO_LOOP_PROVIDERS: dict[str, list[str]] = {
 NATIVE_AUDIO_SOURCES = frozenset({"agnes_prompt", "jimeng_prompt", "kling_prompt"})
 NATIVE_AUDIO_LOOPS = frozenset({"agnes", "ark", "seedance"})
 
+FRAMES_MODES = ("preview", "reference_first", "keyframe")
+DEFAULT_FRAMES_MODE = "preview"
+
+# 参考图溢出策略：single（丢弃 + finding，旧行为）/ segment（镜内分段续拍）。
+REF_OVERFLOW_MODES = ("single", "segment")
+DEFAULT_REF_OVERFLOW_MODE = "segment"
+# 镜内分段续拍硬上限；超过则回退 single + finding（避免静默多倍花钱）。
+MAX_REF_SEGMENTS = 4
+
+# 身份参考图类型：portrait（单张定妆，默认） / turnaround（四视图拼板）。
+# 三级优先级：form.cast_ref_kind > character.cast_ref_kind > proposal_packet.cast_ref_kind。
+CAST_REF_KINDS = ("portrait", "turnaround")
+DEFAULT_CAST_REF_KIND = "portrait"
+
+
+def normalize_frames_mode(raw: Any) -> str:
+    """未知/空值一律回落 preview（已拍板默认；另两档实现但默认关闭）。"""
+    text = str(raw or "").strip().lower()
+    return text if text in FRAMES_MODES else DEFAULT_FRAMES_MODE
+
+
+def normalize_ref_overflow_mode(raw: Any) -> str:
+    """未知/空值一律回落 segment（已拍板默认；仅溢出时触发）。"""
+    text = str(raw or "").strip().lower()
+    return text if text in REF_OVERFLOW_MODES else DEFAULT_REF_OVERFLOW_MODE
+
+
+def normalize_cast_ref_kind(raw: Any) -> str:
+    """未知/空值一律回落 portrait（已拍板默认）。"""
+    text = str(raw or "").strip().lower()
+    return text if text in CAST_REF_KINDS else DEFAULT_CAST_REF_KIND
+
+
+def resolve_cast_ref_kind(
+    packet_kind: Any,
+    character: dict[str, Any] | None = None,
+    form: dict[str, Any] | None = None,
+    *,
+    video_loop: str = "",
+) -> str:
+    """身份参考图类型：form > character > packet；可灵环强制 turnaround。
+
+    可灵用 look_sheet（一张拼板即四视图）机制，故无论声明什么一律等价 turnaround。
+    """
+    if str(video_loop or "").strip().lower() == "kling":
+        return "turnaround"
+    for source in (form, character):
+        if isinstance(source, dict):
+            value = str(source.get("cast_ref_kind") or "").strip().lower()
+            if value in CAST_REF_KINDS:
+                return value
+    return normalize_cast_ref_kind(packet_kind)
+
 
 def infer_project_dir(*paths: Any) -> Path | None:
     """从产物/媒体路径推断项目根；无法确定时返回 None（不猜）。"""
@@ -114,6 +167,9 @@ def load_loop_policy(project_dir: str | Path | None) -> dict[str, Any]:
         "render_runtime": packet.get("render_runtime") or "ffmpeg",
         "output_profile": packet.get("output_profile"),
         "playbook": packet.get("playbook"),
+        "frames_mode": normalize_frames_mode(packet.get("frames_mode")),
+        "ref_overflow_mode": normalize_ref_overflow_mode(packet.get("ref_overflow_mode")),
+        "cast_ref_kind": normalize_cast_ref_kind(packet.get("cast_ref_kind")),
     }
 
 

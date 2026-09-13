@@ -258,6 +258,68 @@ def test_agnes_v25_spatial_prompt_plaza():
     assert cropped.count("更远处") <= 1
 
 
+def test_agnes_v25_picture_numbering_matches_final_plan():
+    """图例逐下标与最终有序表一致：每个 <Picture i> 恰好一次、无越界，adapter 不重复。"""
+    from lib.shot_prompt_builder import build_agnes_v25_prompt
+    from montage.providers.prompt_adapter import _citation_lines
+    from montage.tools._shot_refs import _agnes_flash_image_plan, agnes_plan_adapter_refs
+
+    identity = [
+        {"url": "https://x/turn.png", "kind": "turnaround", "character_id": "c1"},
+        {"url": "https://x/port.png", "kind": "portrait", "character_id": "c1"},
+        {"url": "https://x/scene.png", "kind": "scene_ref", "location_id": "alley"},
+        {"url": "/local/prop.png", "kind": "prop", "prop_id": "p1"},
+        {"url": "https://x/p2.png", "kind": "prop", "prop_id": "p2"},
+    ]
+    plan = _agnes_flash_image_plan(identity)
+    assert plan["urls"] == [
+        "https://x/port.png",
+        "https://x/scene.png",
+        "https://x/p2.png",
+        "https://x/turn.png",
+    ]
+    shot = {
+        "duration_seconds": 6,
+        "location_sensory": "夜巷",
+        "shot_language": {"shot_size": "medium"},
+        "visual_details": {"subjects": [{"id": "c1"}]},
+    }
+    text = build_agnes_v25_prompt(shot, refs=plan["entries"])
+    for i in range(1, len(plan["urls"]) + 1):
+        assert f"参考图{i}（<Picture {i}>）" in text
+    n = len(plan["urls"])
+    assert f"参考图{n + 1}（<Picture {n + 1}>）" not in text
+    # 锁外貌的句子也须指向人物参考的下标，不能写死 <Picture 1>
+    assert "<Picture 1> 一致" in text
+    assert _citation_lines("<Picture N>", agnes_plan_adapter_refs(plan), body=text) == ""
+
+
+def test_image_ref_legend_matches_sent_order():
+    """图片侧多图合成图例：逐条按实发顺序说明每张参考图的角色。"""
+    from lib.shot_prompt_builder import image_ref_legend
+    from montage.providers.capabilities import agnes_image_ref_entries, image_caps
+
+    refs = [
+        {"kind": "portrait", "name": "王生", "url": "https://x/p.png"},
+        {"kind": "scene_ref", "name": "老宅", "path": "local/scene.png"},
+        {"kind": "prop", "name": "铜镜", "path": "local/mirror.png"},
+    ]
+    entries, _ = agnes_image_ref_entries(refs, image_caps(tool="agnes_image"))
+    legend = image_ref_legend(entries)
+    assert legend.startswith("【参考图角色】")
+    assert "参考图1（<Picture 1>）为王生基础形象的定妆照" in legend
+    assert "参考图2（<Picture 2>）为老宅的场景环境参考" in legend
+    assert "参考图3（<Picture 3>）为铜镜的道具参考" in legend
+    # url 项在前、path 兜底项在后；图例顺序与实发一致
+    assert legend.index("王生") < legend.index("老宅") < legend.index("铜镜")
+
+
+def test_image_ref_legend_empty_when_no_role_info():
+    from lib.shot_prompt_builder import image_ref_legend
+    assert image_ref_legend(None) == ""
+    assert image_ref_legend([{"kind": "unknown"}]) == ""
+
+
 def test_build_kling_prompt_plaza_and_look_sheet():
     from lib.shot_prompt_builder import (
         build_kling_look_sheet_prompt,
@@ -406,3 +468,56 @@ def test_location_scene_uses_chinese_sensory():
     assert "左侧近处" in scene["description"]
     assert "无人空镜" in scene["description"]
     assert "empty establishing" not in scene["description"]
+
+
+def test_resolve_appearance_prefers_declared_form():
+    from lib.shot_prompt_builder import _resolve_appearance
+
+    registry = [{
+        "id": "g",
+        "appearance": "基础人形",
+        "outfit_anchor": "素衣",
+        "forms": [
+            {"id": "human", "appearance": "清秀书生"},
+            {"id": "ghost", "name": "鬼形", "appearance": "青面獠牙", "outfit_anchor": "破红嫁衣"},
+        ],
+    }]
+    # 未声明形态 → 角色基础外观
+    assert _resolve_appearance({"id": "g"}, registry, None) == "基础人形"
+    # 声明形态 → 形态外观；形态无 outfit 时回落角色 outfit
+    assert _resolve_appearance(
+        {"id": "g", "form_id": "human", "appearance_anchor": "基础人形"}, registry, None,
+    ) == "清秀书生, 素衣"
+    # 形态 outfit 覆盖角色
+    assert _resolve_appearance(
+        {"id": "g", "form_id": "ghost", "appearance_anchor": "基础人形"}, registry, None,
+    ) == "青面獠牙, 破红嫁衣"
+    # 作者显式改写 anchor（≠ 角色基础外貌）→ anchor 优先
+    assert _resolve_appearance(
+        {"id": "g", "form_id": "ghost", "appearance_anchor": "戴斗笠"}, registry, None,
+    ) == "戴斗笠"
+
+
+def test_subject_display_name_uses_form_name():
+    from lib.shot_prompt_builder import _subject_display_name
+
+    registry = [{"id": "g", "forms": [{"id": "ghost", "name": "鬼形"}, {"id": "human"}]}]
+    assert _subject_display_name({"id": "g", "form_id": "ghost"}, registry) == "g·鬼形"
+    assert _subject_display_name({"id": "g", "form_id": "human"}, registry) == "g（human）"
+    assert _subject_display_name({"id": "g"}, registry) == "g"
+
+
+def test_ref_legend_form_name_and_turnaround_single_frame():
+    from lib.shot_prompt_builder import _ref_header_lines, image_ref_legend
+
+    refs = [
+        {"kind": "turnaround", "name": "画皮鬼·鬼形", "url": "https://x/t.png"},
+        {"kind": "portrait", "name": "画皮鬼·人皮形", "url": "https://x/p.png"},
+    ]
+    legend = image_ref_legend(refs)
+    assert "画皮鬼·鬼形" in legend
+    assert "画皮鬼·人皮形" in legend
+    # 四视图附单幅/禁分格约束；定妆照不带
+    assert "禁止分格/拼贴" in legend
+    portrait_line = _ref_header_lines([{"kind": "portrait", "name": "画皮鬼·人皮形"}])[0]
+    assert "禁止分格" not in portrait_line

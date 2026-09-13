@@ -163,6 +163,36 @@ def test_lower_third_adds_character_name(tmp_path):
     assert jobs["lower_third"] == "雨夜 · 林"
 
 
+def test_srt_shifts_by_title_card_duration(tmp_path):
+    """片头插在正片之前：SRT 必须整体后移，否则成片里字幕早 2s。"""
+    proj = _seed_project(tmp_path)
+    ArtifactStore(proj).write("script", {"title": "雨夜", "sections": []})
+    tools, _order, _bgm = _bag_finish_ops(proj)
+    inner = tools["compose_planner"]._handler
+
+    def compose(inputs):
+        result = inner(inputs)
+        if not inputs.get("realize"):
+            store = ArtifactStore(proj)
+            plan = store.read("compose_plan") or {}
+            shots = list(plan.get("shots") or [{"shot_id": "sh01"}])
+            shots[0] = dict(shots[0])
+            shots[0]["subtitle_cues"] = [
+                {"text": "你好", "start_seconds": 0, "end_seconds": 2},
+            ]
+            plan["shots"] = shots
+            store.write("compose_plan", plan)
+        return result
+
+    tools["compose_planner"] = FakeTool("compose_planner", compose)
+    tools["subtitle_builder"] = SubtitleBuilder()
+    result = _run(proj, tools)
+    assert result["success"]
+    assert result["progress"]["steps"]["finish"]["title_dur"] == 2.0
+    srt = (proj / "renders" / "final.srt").read_text(encoding="utf-8")
+    assert "00:00:02,000 --> 00:00:04,000" in srt
+
+
 def test_produce_title_card_and_lower_third(tmp_path):
     proj = _seed_project(tmp_path)
     ArtifactStore(proj).write("script", {

@@ -136,10 +136,10 @@ VIDEO_PROMPT_PROFILES: dict[str, dict[str, Any]] = {
         "negative": False,
         "seed": True,
         "duration_policy": {"kind": "none"},
-        "citation_syntax": "@image_N",
+        "citation_syntax": "<<<image_N>>>",
         "audio_syntax": "",
         "forbidden": (
-            "【剧情】", "【全局音频】", "<Picture", "<<<image_", "@图片",
+            "【剧情】", "【全局音频】", "<Picture", "@图片",
         ),
         "models": [],
         "passthrough": False,
@@ -191,6 +191,7 @@ VIDEO_PROMPT_PROFILES: dict[str, dict[str, Any]] = {
         "agnes_audio": True,
         "english_visual": False,
         "provider_max_chars": 3000,
+        # 记录值：负面词实际已中文化（lib/prompt_english.py），全仓无消费者，保留不改值
         "negative_language": "en",
     },
     "agnes_v25": {

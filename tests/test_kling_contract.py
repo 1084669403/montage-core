@@ -293,7 +293,7 @@ def test_omni_feature_and_base_mutex():
     assert path == "/omni-video/kling-3.0-omni"
     assert feat["settings"]["multi_shot"] is True
     assert feat["settings"]["audio"] == "off"
-    assert feat["contents"][0]["text"].startswith("shot 1, 8,")
+    assert feat["contents"][0]["text"].startswith("镜头 1, 8,")
     assert _types(feat) == ["prompt", "feature_video"]
     _, base = _video_payload("kling_omni_30", {
         "video_url": "https://x/v.mp4",
@@ -577,7 +577,13 @@ def test_element_crud_payload_drops_face(monkeypatch):
         return {"task_id": "el-1"}
 
     def fake_get(url, headers=None, timeout=60, params=None):
-        return {"task_status": "succeed", "data": {"element_id": 162}}
+        # 官方查询响应：element_id 位于 data.task_result.elements[0]（数组元素内）。
+        return {
+            "data": {
+                "task_status": "succeed",
+                "task_result": {"elements": [{"element_id": 162}]},
+            }
+        }
 
     import montage.providers.kling as kling_mod
 
@@ -634,7 +640,13 @@ def test_voice_skips_local_and_clones_https(tmp_path, monkeypatch):
         return {"task_id": "vo-1"}
 
     def fake_get(url, headers=None, timeout=60, params=None):
-        return {"task_status": "succeed", "data": {"voice_id": "v-9"}}
+        # 官方查询响应：voice_id 位于 data.task_result.voices[0]（数组元素内）。
+        return {
+            "data": {
+                "task_status": "succeed",
+                "task_result": {"voices": [{"voice_id": "v-9"}]},
+            }
+        }
 
     import montage.providers.kling as kling_mod
 
@@ -650,6 +662,30 @@ def test_voice_skips_local_and_clones_https(tmp_path, monkeypatch):
     assert cloned["voice_id"] == "v-9"
     assert captured["url"].endswith("/general/custom-voices")
     assert captured["payload"]["voice_url"] == "https://cdn.example/v.wav"
+
+
+def test_asset_field_reads_flat_and_nested_shapes():
+    """官方查询把 id 放在 task_result.elements[]/voices[]；旧扁平形状须仍可读。"""
+    from montage.providers.kling import _asset_field
+
+    nested_element = {
+        "data": {
+            "task_status": "succeed",
+            "task_result": {"elements": [{"element_id": 162}]},
+        }
+    }
+    nested_voice = {
+        "data": {
+            "task_status": "succeed",
+            "task_result": {"voices": [{"voice_id": "v-9"}]},
+        }
+    }
+    flat = {"task_status": "succeed", "data": {"element_id": 162}}
+    assert _asset_field(nested_element, "element_id") == "162"
+    assert _asset_field(nested_voice, "voice_id") == "v-9"
+    assert _asset_field(flat, "element_id") == "162"
+    assert _asset_field({}, "element_id") == ""
+    assert _asset_field(None, "element_id") == ""
 
 
 def test_look_sheet_cell_fractions():

@@ -103,11 +103,11 @@ def build_shot_prompt(
     # 第 1 层：镜头 —— 焦距与景深
     camera_parts = []
     if sl.get("lens_mm"):
-        camera_parts.append(f"{sl['lens_mm']}mm lens")
+        camera_parts.append(f"{sl['lens_mm']}mm 焦段")
     if sl.get("depth_of_field"):
         camera_parts.append(_DOF_PHRASES.get(sl["depth_of_field"], ""))
     if camera_parts:
-        layers.append(", ".join(filter(None, camera_parts)))
+        layers.append("，".join(filter(None, camera_parts)))
 
     # 第 2 层：运动 —— 景别与运镜
     movement_parts = []
@@ -116,15 +116,15 @@ def build_shot_prompt(
     if sl.get("camera_movement") and sl["camera_movement"] != "static":
         movement_parts.append(_MOVEMENT_PHRASES.get(sl["camera_movement"], sl["camera_movement"]))
     if movement_parts:
-        layers.append(", ".join(movement_parts))
+        layers.append("，".join(movement_parts))
 
     # 第 3 层：主体 —— 场景描述 + 质感关键词
     description = scene.get("description", "")
     texture = scene.get("texture_keywords", [])
     subject_parts = [description]
     if texture:
-        subject_parts.append(", ".join(texture))
-    layers.append(". ".join(filter(None, subject_parts)))
+        subject_parts.append("，".join(texture))
+    layers.append("。".join(filter(None, subject_parts)))
 
     # 第 4 层：光线 —— 布光基调与色温
     lighting_parts = []
@@ -133,7 +133,7 @@ def build_shot_prompt(
     if sl.get("color_temperature"):
         lighting_parts.append(_COLOR_TEMP_PHRASES.get(sl["color_temperature"], ""))
     if lighting_parts:
-        layers.append(", ".join(filter(None, lighting_parts)))
+        layers.append("，".join(filter(None, lighting_parts)))
 
     # 第 5 层：风格 —— 取自 playbook（非逐字前缀）
     if style_context:
@@ -141,9 +141,9 @@ def build_shot_prompt(
         visual_lang = style_context.get("visual_language", {})
         style_hint = visual_lang.get("aesthetic", "") or mood
         if style_hint:
-            layers.append(f"Style: {style_hint}")
+            layers.append(f"风格：{style_hint}")
 
-    return ". ".join(filter(None, layers))
+    return "。".join(filter(None, layers))
 
 
 def build_batch_prompts(
@@ -186,6 +186,52 @@ def _strip_abstract_words(section: str) -> str:
     return _ABSTRACT_WORD_RE.sub("", section)
 
 
+def _find_form(char: dict[str, Any], form_id: str) -> dict[str, Any] | None:
+    """角色 forms[] 里按 id 找形态；找不到返回 None。"""
+    fid = str(form_id or "").strip()
+    if not fid:
+        return None
+    for form in char.get("forms") or []:
+        if isinstance(form, dict) and str(form.get("id") or "").strip() == fid:
+            return form
+    return None
+
+
+def _form_appearance(char: dict[str, Any], form: dict[str, Any]) -> str:
+    """形态外观文本：form.appearance/outfit 优先，缺省回落角色同名字段。"""
+    app = str(form.get("appearance") or char.get("appearance") or "").strip()
+    outfit = str(
+        form.get("outfit_anchor")
+        or form.get("outfit")
+        or char.get("outfit_anchor")
+        or char.get("outfit")
+        or ""
+    ).strip()
+    if not app and not outfit:
+        return ""
+    return app + (f", {outfit}" if outfit else "")
+
+
+def _subject_display_name(
+    subject: dict[str, Any],
+    character_registry: list[dict[str, Any]] | None,
+) -> str:
+    """身份行显示名：声明形态且有形态名时用「角色·形态」。"""
+    cid = str(subject.get("id") or "")
+    fid = str(subject.get("form_id") or "").strip()
+    if not cid or not fid or not character_registry:
+        return cid
+    for char in character_registry:
+        if char.get("id") != cid:
+            continue
+        form = _find_form(char, fid)
+        if form is None:
+            return cid
+        fname = str(form.get("name") or "").strip()
+        return f"{cid}·{fname}" if fname else f"{cid}（{fid}）"
+    return cid
+
+
 def _resolve_appearance(
     subject: dict[str, Any],
     character_registry: list[dict[str, Any]] | None,
@@ -193,27 +239,42 @@ def _resolve_appearance(
 ) -> str:
     """解析某个主体的外貌文本。
 
-    优先级：subject.appearance_anchor（已从 registry 逐字取得）
+    优先级：显式 subject.appearance_anchor（作者覆写）
+    > 声明形态的 form.appearance/outfit（缺省回落角色）
+    > subject.appearance_anchor（编译期自动抄的角色基础外貌）
     > character_registry[subjects[].id].appearance
     > style_context character_appearance_default
     > 硬编码的东亚默认值。
     """
-    anchor = subject.get("appearance_anchor") or ""
+    cid = subject.get("id")
+    fid = str(subject.get("form_id") or "").strip()
+    anchor = str(subject.get("appearance_anchor") or "").strip()
+    char: dict[str, Any] | None = None
+    if character_registry:
+        for row in character_registry:
+            if row.get("id") == cid:
+                char = row
+                break
+    # 声明了形态：形态外观优先。编译期会把角色基础外貌写进 appearance_anchor，
+    # 因此只有作者显式写了不同 anchor 时才让 anchor 压过形态。
+    if char is not None and fid:
+        form = _find_form(char, fid)
+        if form is not None:
+            form_text = _form_appearance(char, form)
+            base = str(char.get("appearance") or "").strip()
+            if form_text and (not anchor or anchor == base):
+                return form_text
     if anchor:
         return anchor
-
-    cid = subject.get("id")
-    if character_registry:
-        for char in character_registry:
-            if char.get("id") == cid:
-                reg_appearance = char.get("appearance")
-                if reg_appearance:
-                    return reg_appearance
-                # ethnicity_default 覆盖 playbook 默认值
-                ethnicity = char.get("ethnicity_default")
-                outfit = char.get("outfit_anchor") or ""
-                body = ethnicity or _DEFAULT_EAST_ASIAN_APPEARANCE
-                return f"{body}" + (f", {outfit}" if outfit else "")
+    if char is not None:
+        reg_appearance = char.get("appearance")
+        if reg_appearance:
+            return reg_appearance
+        # ethnicity_default 覆盖 playbook 默认值
+        ethnicity = char.get("ethnicity_default")
+        outfit = char.get("outfit_anchor") or ""
+        body = ethnicity or _DEFAULT_EAST_ASIAN_APPEARANCE
+        return f"{body}" + (f", {outfit}" if outfit else "")
 
     if style_context:
         gen = style_context.get("asset_generation") or {}
@@ -434,12 +495,24 @@ def _ref_header_lines(refs: list[dict[str, Any]] | None) -> list[str]:
             continue
         kind = str(ref.get("kind") or "").strip()
         name = str(ref.get("name") or ref.get("id") or "").strip()
-        if kind in ("portrait", "turnaround") or str(ref.get("role") or "") in ("角色外貌", "角色体态"):
+        if kind == "first_frame":
+            if ref.get("bridge"):
+                lines.append(
+                    f"参考图{i}（<Picture {i}>）为续接上一段的起始帧，"
+                    "锁构图、景别与人物姿态连续。"
+                )
+            else:
+                lines.append(
+                    f"参考图{i}（<Picture {i}>）为本镜首帧，锁构图、景别与人物姿态。"
+                )
+        elif kind in ("portrait", "turnaround") or str(ref.get("role") or "") in ("角色外貌", "角色体态"):
             who = name or "角色"
             kind_zh = "角色四视图" if kind == "turnaround" or "体态" in str(ref.get("role") or "") else "定妆照"
-            lines.append(
-                f"参考图{i}（<Picture {i}>）为{who}基础形象的{kind_zh}，锁外貌与体态。"
-            )
+            line = f"参考图{i}（<Picture {i}>）为{who}基础形象的{kind_zh}，锁外貌与体态"
+            if kind == "turnaround":
+                # 四视图是分格拼板：只作身份参考，输出必须是单幅画面。
+                line += "；仅供身份参考，禁止分格/拼贴，只输出单幅画面"
+            lines.append(line + "。")
         elif kind == "scene_ref" or "场景" in str(ref.get("role") or ""):
             place = name or "场景"
             lines.append(
@@ -450,6 +523,34 @@ def _ref_header_lines(refs: list[dict[str, Any]] | None) -> list[str]:
         else:
             continue
     return lines
+
+
+def image_ref_legend(refs: list[dict[str, Any]] | None) -> str:
+    """图片多图合成的角色图例：说明每张输入参考图是什么。
+
+    顺序必须与实发 ``extra_body.image`` 完全一致（见
+    ``capabilities.agnes_image_ref_entries``），否则模型会把角色图当场景用。
+    """
+    lines = _ref_header_lines(refs)
+    if not lines:
+        return ""
+    return "【参考图角色】" + "".join(lines)
+
+
+CONTINUATION_FRAME_HINT = (
+    "续接上一段尾帧的画面：保持同一人物、服装、构图、光线与场景，"
+    "只在此基础上推进下一段动作；只输出单幅画面，禁止分格/拼贴。"
+)
+
+
+def build_bridge_frame_prompt(refs: list[dict[str, Any]] | None = None) -> str:
+    """段间桥接首帧的生图提示词：以「接尾帧继续」为核心，附本段参考图例。
+
+    不沿用整镜 ``first_frame_prompt``（那会把画面拉回镜头起始姿态），
+    也不复刻 v2.0 的 refine hint。
+    """
+    legend = image_ref_legend(refs)
+    return f"{CONTINUATION_FRAME_HINT}\n{legend}" if legend else CONTINUATION_FRAME_HINT
 
 
 def _v25_audio_line(shot: dict[str, Any]) -> str:
@@ -533,9 +634,26 @@ def build_agnes_v25_prompt(
         body_bits.append(dialogue + "。")
     pic_lock = ""
     if refs:
-        pic_lock = "保持外观与 <Picture 1> 一致。"
-        if any(str(r.get("kind") or "") == "scene_ref" for r in refs if isinstance(r, dict)):
-            pic_lock = "保持人物外貌与 <Picture 1> 一致，场景结构与场景参考图一致。"
+        # 编号不能写死 1：refs 是最终有序表，首位未必是人物定妆。
+        rows = [r for r in refs if isinstance(r, dict)]
+        portrait_idx = next(
+            (i for i, r in enumerate(rows, 1)
+             if str(r.get("kind") or "") in ("portrait", "turnaround")),
+            0,
+        )
+        scene_idx = next(
+            (i for i, r in enumerate(rows, 1) if str(r.get("kind") or "") == "scene_ref"),
+            0,
+        )
+        if portrait_idx and scene_idx:
+            pic_lock = (
+                f"保持人物外貌与 <Picture {portrait_idx}> 一致，"
+                f"场景结构与 <Picture {scene_idx}> 一致。"
+            )
+        elif portrait_idx:
+            pic_lock = f"保持外观与 <Picture {portrait_idx}> 一致。"
+        elif scene_idx:
+            pic_lock = f"保持场景结构与 <Picture {scene_idx}> 一致。"
     if pic_lock:
         body_bits.append(pic_lock)
     story.append(beat + "".join(body_bits))
@@ -1214,7 +1332,7 @@ def _section_assembler(
     for subj in vd.get("subjects", []):
         appearance = _resolve_appearance(subj, character_registry, style_context)
         position = subj.get("position") or ""
-        name = subj.get("id") or ""
+        name = _subject_display_name(subj, character_registry)
         role_parts.append(f"{name}: {appearance}" + (f"，{position}" if position else ""))
     if role_parts:
         sections.append("【角色与外貌】 " + "；".join(role_parts))

@@ -112,6 +112,35 @@ from montage.engine.produce_director import (
     _skip_director_cast,
 )
 
+def _run_shot_bind(root: Path, progress: dict[str, Any]) -> None:
+    """回填 + 对账 image_bindings（observe-only，非致命）。
+
+    保留 inline 写下的真 ``picture_index``（按 ref id 平移），只补缺失镜、
+    报告参考集合漂移。任何异常都只记 ``skipped``，绝不阻断出片。
+    """
+    try:
+        from montage.schemas import get_schema
+        from montage.tools._shot_refs import reconcile_image_bindings
+
+        store = ArtifactStore(root)
+        scene_plan = store.read("scene_plan")
+        manifest = store.read("asset_manifest")
+        shots = collect_shots(scene_plan, store.read("shot_prompts"))
+        merged, drift = reconcile_image_bindings(
+            store.read("image_bindings"),
+            shots=shots,
+            manifest=manifest,
+            scene_plan=scene_plan,
+            script=store.read("script"),
+            project_dir=str(root),
+        )
+        store.write("image_bindings", merged, schema=get_schema("image_bindings"))
+        _mark(progress, "shot_bind", "ok", extra={"findings": drift} if drift else None)
+    except Exception as exc:  # noqa: BLE001
+        _mark(progress, "shot_bind", "ok", extra={"skipped": f"绑定回填跳过: {exc}"})
+    save_progress(root, progress)
+
+
 def _run_generate(
     root: Path,
     progress: dict[str, Any],
@@ -377,6 +406,9 @@ def _run_generate(
         _mark(progress, "shot_generate", "ok")
         save_progress(root, progress)
 
+    if not _step_done(progress, "shot_bind", resume):
+        _run_shot_bind(root, progress)
+
     if not _step_done(progress, "voice", resume):
         lines = collect_dialogue(store.read("scene_plan"), store.read("script"))
         voice_tool = bag.get("voice_director")
@@ -463,6 +495,7 @@ def run_series_produce(
     skip_export: bool = False,
     strict_audio: bool = False,
     keep_scratch: bool = False,
+    prune_exports: int = 0,
     review: str = "bible",
     tts: bool = False,
     sample_hero: bool = True,
@@ -573,6 +606,7 @@ def run_series_produce(
                 skip_export=skip_export,
                 strict_audio=strict_audio,
                 keep_scratch=keep_scratch,
+                prune_exports=prune_exports,
                 review=nested_review,
                 tts=tts,
                 sample_hero=want,
@@ -662,6 +696,24 @@ def _commit_final(tmp: Path, film: Path) -> None:
         os.replace(str(tmp), str(film))
     except OSError:
         shutil.copy2(tmp, film)
+
+
+def _shift_cues(cues: list[dict[str, Any]], offset: float) -> list[dict[str, Any]]:
+    """字幕时间轴整体后移（秒）。``offset<=0`` 原样返回。
+
+    `finish` 会把片头卡片 concat 到正片之前，但 cue 时间是按正片（assemble 输出）
+    算的；不后移就会让成片里的字幕早 ``title_dur`` 秒。
+    """
+    if offset <= 0:
+        return cues
+    return [
+        {
+            **cue,
+            "start_seconds": float(cue.get("start_seconds") or 0) + offset,
+            "end_seconds": float(cue.get("end_seconds") or 0) + offset,
+        }
+        for cue in cues
+    ]
 
 
 def _apply_film_health(
@@ -842,10 +894,12 @@ def _apply_finish(
         if sub is None:
             extra["findings"].append({"severity": "warning", "field": "srt", "message": "缺少 subtitle_builder，跳过字幕旁路"})
         else:
+            # 片头插在正片之前：字幕必须整体后移 title_dur，否则成片里字幕会早 2s。
+            cues = _shift_cues(jobs["cues"], float(extra.get("title_dur") or 0.0))
             result = _call(
                 sub,
                 {
-                    "sentences": jobs["cues"],
+                    "sentences": cues,
                     "format": "srt",
                     "output_path": str(srt_path),
                 },
@@ -910,6 +964,7 @@ def run_produce(
     skip_export: bool = False,
     strict_audio: bool = False,
     keep_scratch: bool = False,
+    prune_exports: int = 0,
     idea: str | None = None,
     review: str = "bible",
     tts: bool = False,
@@ -1026,6 +1081,7 @@ def run_produce(
             skip_export=skip_export,
             strict_audio=strict_audio,
             keep_scratch=keep_scratch,
+            prune_exports=prune_exports,
             review=review,
             tts=tts,
             sample_hero=sample_hero,
@@ -1398,6 +1454,10 @@ def run_produce(
             )
             save_progress(root, progress)
 
+        # 先清临时件再打包：assemble 的 renders/*.joined.mp4 是整片长度的中间文件，
+        # 原来 cleanup 排在 export 之后，导致每个交付包都多背一份中间视频。
+        cleanup_temps(root, keep_scratch=keep_scratch)
+
         # export
         export_zip = ""
         if skip_export:
@@ -1410,13 +1470,17 @@ def run_produce(
             if blocked is not None:
                 return blocked
             export_dir = root / "exports"
-            result = _call(
-                bag["export_bundle"],
-                {"project_dir": str(root), "output_dir": str(export_dir)},
-                runner,
-            )
+            export_inputs: dict[str, Any] = {
+                "project_dir": str(root),
+                "output_dir": str(export_dir),
+            }
+            if prune_exports > 0:
+                export_inputs["keep_exports"] = int(prune_exports)
+            result = _call(bag["export_bundle"], export_inputs, runner)
             data = result.data if isinstance(result.data, dict) else {}
             export_zip = str(data.get("output") or "")
+            if data.get("pruned"):
+                progress["pruned_exports"] = list(data.get("pruned") or [])
             if not result.success or not (export_zip and Path(export_zip).is_file()):
                 err = result.error or "zip 未写出"
                 _mark(progress, "export", "fail", error=err)
@@ -1428,7 +1492,6 @@ def run_produce(
         else:
             export_zip = str(((progress.get("steps") or {}).get("export") or {}).get("artifact") or "")
 
-        cleanup_temps(root, keep_scratch=keep_scratch)
         bgm_id = ""
         for ev in _events(soundtrack):
             if str(ev.get("kind") or "") == "bgm":

@@ -15,7 +15,11 @@ import math
 import re
 from typing import Any
 
-from montage.engine.shot_language import fill_shot_language as apply_shot_language, language_for_shot
+from montage.engine.shot_language import (
+    fill_shot_language as apply_shot_language,
+    language_for_shot,
+    shot_size_for_index,
+)
 from montage.providers.capabilities import (
     policy_for_loop,
     policy_max,
@@ -82,11 +86,16 @@ def _character_registry(script: dict[str, Any]) -> list[dict[str, Any]]:
     for char in script.get("characters") or []:
         if not isinstance(char, dict) or not char.get("id"):
             continue
-        registry.append({
+        row: dict[str, Any] = {
             "id": char["id"],
             "appearance": str(char.get("appearance") or ""),
             "outfit_anchor": str(char.get("outfit") or ""),
-        })
+        }
+        forms = char.get("forms")
+        if isinstance(forms, list) and forms:
+            # 逐字镜像；分镜阶段禁止改写。
+            row["forms"] = [dict(f) for f in forms if isinstance(f, dict)]
+        registry.append(row)
     return registry
 
 
@@ -143,26 +152,156 @@ def _group_units(units: list[dict[str, Any]], n_shots: int) -> list[list[dict[st
     return filled or [units]
 
 
-def _shot_durations(total: float, n: int, step: float | None) -> list[float]:
+def _policy_bounds(policy: dict[str, Any] | None, step: float | None) -> tuple[float, float]:
+    """取政策允许的单镜时长上下限（range 用 min/max；其余不限制）。"""
+    if isinstance(policy, dict) and str(policy.get("kind") or "") == "range":
+        try:
+            lo = float(policy.get("min"))
+            hi = float(policy.get("max"))
+            if hi > lo:
+                return lo, hi
+        except (TypeError, ValueError):
+            pass
+    return 1.0, float("inf")
+
+
+def _normalize_weights(weights: list[float] | None, n: int) -> list[float]:
+    """权重归一化到 sum=1；缺失/非法一律等权。"""
+    raw = [max(float(w), 0.0) for w in (weights or [])][:n]
+    if len(raw) < n or sum(raw) <= 0:
+        return [1.0 / n] * n
+    total = sum(raw)
+    return [w / total for w in raw]
+
+
+def _fix_residual(
+    slots: list[float],
+    total: float,
+    lo: float,
+    hi: float,
+    step: float,
+) -> list[float]:
+    """把 snap 后的时长之和修复回 total（逐 step 增删，保证不越界）。"""
+    out = list(slots)
+    diff = round(total - sum(out), 3)
+    guard = 0
+    while abs(diff) >= step - 1e-9 and guard < 1000:
+        order = sorted(range(len(out)), key=lambda i: out[i], reverse=True)
+        moved = False
+        if diff > 0:
+            for i in order:
+                if out[i] + step <= hi + 1e-9:
+                    out[i] = round(out[i] + step, 3)
+                    diff = round(diff - step, 3)
+                    moved = True
+                    break
+        else:
+            for i in reversed(order):
+                if out[i] - step >= lo - 1e-9:
+                    out[i] = round(out[i] - step, 3)
+                    diff = round(diff + step, 3)
+                    moved = True
+                    break
+        if not moved:
+            break
+        guard += 1
+    if abs(diff) > 1e-9:
+        # total 本身不在网格上（显式 duration_seconds 非整格）：补到最长镜，
+        # 保证 sum == scene duration；离格由校验器出 finding。
+        idx = max(range(len(out)), key=lambda i: out[i])
+        out[idx] = round(out[idx] + diff, 3)
+    return out
+
+
+def _add_diversity(
+    slots: list[float],
+    weights: list[float],
+    lo: float,
+    hi: float,
+    step: float,
+) -> list[float]:
+    """一场内若 snap 后仍只有一种长度，且区间允许，对最长/最短镜 ±step。"""
+    if len(slots) < 2 or step is None or step <= 0:
+        return slots
+    if len({round(x, 3) for x in slots}) > 1:
+        return slots
+    hi_idx = max(range(len(slots)), key=lambda i: (weights[i], -i))
+    lo_idx = min(range(len(slots)), key=lambda i: (weights[i], i))
+    if hi_idx == lo_idx:
+        lo_idx = len(slots) - 1
+    if slots[hi_idx] + step > hi + 1e-9 or slots[lo_idx] - step < lo - 1e-9:
+        return slots
+    out = list(slots)
+    out[hi_idx] = round(out[hi_idx] + step, 3)
+    out[lo_idx] = round(out[lo_idx] - step, 3)
+    return out
+
+
+def _shot_durations(
+    total: float,
+    n: int,
+    step: float | None,
+    *,
+    weights: list[float] | None = None,
+    policy: dict[str, Any] | None = None,
+) -> list[float]:
+    """按权重分配场景时长并贴政策网格，保证 sum == total。
+
+    旧行为（policy=None / enum / none）：均分 round-robin。
+    range 政策（Agnes/Kling/ark，4–12 step1）：显式权重优先 → snap →
+    残差修复 → 多样性微调，避免全片只有 6/8 两种镜长。
+    """
     n = max(1, n)
     if n == 1:
         return [round(total, 3)]
-    if step is None or step <= 0:
-        base = total / n
-        slots = [base] * (n - 1)
-        slots.append(total - sum(slots))
+    kind = str((policy or {}).get("kind") or "") if isinstance(policy, dict) else ""
+    if step is None or step <= 0 or kind != "range":
+        if step is None or step <= 0:
+            base = total / n
+            slots = [base] * (n - 1)
+            slots.append(total - sum(slots))
+            return [round(x, 3) for x in slots]
+        slots = [step] * n
+        remaining = total - step * n
+        i = 0
+        while remaining >= step - 1e-6:
+            slots[i % n] += step
+            remaining -= step
+            i += 1
+        slots[-1] = round(slots[-1] + remaining, 3)
+        drift = round(total - sum(slots), 3)
+        slots[-1] = round(slots[-1] + drift, 3)
         return [round(x, 3) for x in slots]
-    slots = [step] * n
-    remaining = total - step * n
-    i = 0
-    while remaining >= step - 1e-6:
-        slots[i % n] += step
-        remaining -= step
-        i += 1
-    slots[-1] = round(slots[-1] + remaining, 3)
-    drift = round(total - sum(slots), 3)
-    slots[-1] = round(slots[-1] + drift, 3)
-    return [round(x, 3) for x in slots]
+
+    lo, hi = _policy_bounds(policy, step)
+    norm = _normalize_weights(weights, n)
+    snapped = [snap_duration_seconds(total * w, policy) for w in norm]
+    snapped = [min(max(x, lo), hi) for x in snapped]
+    snapped = _fix_residual(snapped, total, lo, hi, step)
+    snapped = _add_diversity(snapped, norm, lo, hi, step)
+    return [round(x, 3) for x in snapped]
+
+
+# 景别 → 时长权重（close 短、wide 长）；与 shot_language.shot_size_for_index 对齐。
+_SHOT_SIZE_WEIGHT = {
+    "extreme_wide": 1.35, "wide": 1.25, "establishing": 1.30,
+    "medium_wide": 1.10, "medium": 1.00, "medium_close": 0.95,
+    "close": 0.90, "close_up": 0.90, "extreme_close_up": 0.85,
+    "insert": 0.85, "over_shoulder": 0.95,
+}
+_ROLE_WEIGHT = {"hook": 1.05, "escalation": 1.05, "reveal": 1.00, "landing": 1.10}
+
+
+def _shot_weights(groups: list[list[dict[str, Any]]], role: str) -> list[float]:
+    """权重 = (0.5 + 0.1×对白字数) × 景别权重 × 叙事角色权重（全为已有字段）。"""
+    role_w = _ROLE_WEIGHT.get(str(role or ""), 1.0)
+    out: list[float] = []
+    for gi, group in enumerate(groups):
+        chars = sum(len(str(u.get("text") or "")) for u in group)
+        size = shot_size_for_index(gi, len(groups))
+        weight = (0.5 + 0.1 * chars) * _SHOT_SIZE_WEIGHT.get(size, 1.0) * role_w
+        out.append(max(weight, 0.1))
+    return out
 
 
 def _n_shots(duration: float, n_units: int, policy: dict[str, Any] | None) -> int:
@@ -266,8 +405,14 @@ def convert_script_to_scene_plan(
             })
         n_shots = _n_shots(duration, len(units), duration_policy)
         groups = _group_units(units, n_shots)
-        durs = _shot_durations(duration, len(groups), policy_step(duration_policy))
         role = _narrative_role(idx, total)
+        durs = _shot_durations(
+            duration,
+            len(groups),
+            policy_step(duration_policy),
+            weights=_shot_weights(groups, role),
+            policy=duration_policy,
+        )
         lang_role = role if fill_shot_language else ""
         lang_pb = pb if fill_shot_language else None
         speakers: list[str] = []
@@ -346,7 +491,7 @@ def convert_script_to_scene_plan(
 
         start = round(cursor, 3)
         end = round(cursor + duration, 3)
-        scenes.append({
+        scene_out: dict[str, Any] = {
             "id": sid,
             "description": description,
             "narrative_role": role,
@@ -359,7 +504,12 @@ def convert_script_to_scene_plan(
             ),
             "emotion": emotion,
             "shots": shots,
-        })
+        }
+        # 场景级 environment（含 time）落进 scene_plan，供 overlay 按晨/夜选
+        # sensory_by_time，也让 scene_plan 自包含（不再只藏在 bible 里）。
+        if isinstance(sec_env, (dict, str)) and sec_env:
+            scene_out["environment"] = sec_env
+        scenes.append(scene_out)
         cursor = end
 
     scene_plan = {

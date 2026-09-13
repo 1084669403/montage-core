@@ -47,10 +47,15 @@ def suggest_transitions(scenes: list[dict[str, Any]], style: str = "cinematic") 
             "energy": energy,
             "suggested_transition": transition,
         }
-        if style == "cinematic" and energy == "high":
+        if style == "cinematic" and energy == "high" and transition != "cut":
             suggestion["negative_gap_seconds"] = 0.4
             suggestion["note"] = "高能切点：建议负空隙重叠制造张力"
-        elif transition != "cut":
+        elif transition == "cut":
+            # cut 与负空隙互斥：cut 就是零重叠硬切，再挂 negative_gap 会让
+            # 装配端误判成"需要转场"。高能但判定为 cut 时只提示，不给重叠。
+            if energy == "high":
+                suggestion["note"] = "高能硬切：不加重叠，靠剪辑节奏制造张力"
+        else:
             suggestion["note"] = "情绪/时间过渡"
         suggestions.append(suggestion)
     return suggestions

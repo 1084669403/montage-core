@@ -6,7 +6,12 @@ from montage.providers.capabilities import (
     video_caps,
 )
 from montage.tools.script_to_scene_plan import convert_script_to_scene_plan
-from montage.tools.script_validator import AGNES_GRID, JIMENG_GRID, check_dialogue_budget
+from montage.tools.script_validator import (
+    AGNES_GRID,
+    JIMENG_GRID,
+    check_dialogue_budget,
+    check_shot_durations,
+)
 
 
 def _script(*, duration=None, lines=None, narration="雨还在下。你看清楚没有。"):
@@ -103,7 +108,55 @@ def test_over_max_splits_sum_preserved():
     assert abs(sum(s["duration_seconds"] for s in shots) - 20) < 0.01
 
 
+def test_agnes_weighted_allocation_varies_shot_lengths():
+    """range 政策下按对白/景别权重分配，不再全片只有同一镜长。"""
+    lines = [
+        {"speaker_id": "a", "text": "你好，我是王生。"},
+        {"speaker_id": "a", "text": "这画中的女子，竟有几分眼熟。"},
+        {"speaker_id": "a", "text": "你却偏偏不肯看我。"},
+    ]
+    script = _script(duration=18, lines=lines)
+    plan = convert_script_to_scene_plan(script, duration_policy=policy_for_loop("agnes"))
+    shots = plan["scene_plan"]["scenes"][0]["shots"]
+    durs = [s["duration_seconds"] for s in shots]
+    assert len(shots) == 3
+    assert abs(sum(durs) - 18) < 0.01
+    assert len(set(durs)) >= 2  # 多样性：至少两种镜长
+    for d in durs:
+        assert 4 <= d <= 12
+        assert float(d).is_integer()  # Agnes 网格 step=1
+
+
 def test_none_loop_still_skips_jimeng_grid():
     script = {"sections": [{"id": "a", "narration": "好", "duration_seconds": 7}]}
     assert not any("网格" in f["message"] for f in check_dialogue_budget(script, video_loop="none"))
     assert any("网格" in f["message"] for f in check_dialogue_budget(script, video_loop="jimeng"))
+
+
+def test_check_shot_durations_flags_sum_and_grid():
+    plan = {"scenes": [{
+        "id": "sc01",
+        "duration_seconds": 10,
+        "shots": [
+            {"shot_id": "sc01_01", "duration_seconds": 5},
+            {"shot_id": "sc01_02", "duration_seconds": 3},  # sum 8≠10 且 3 不在 Agnes 网格
+        ],
+    }]}
+    findings = check_shot_durations(plan, video_loop="agnes")
+    messages = " ".join(f["message"] for f in findings)
+    assert "≠" in messages
+    assert "网格" in messages
+    assert all(f["severity"] == "warning" for f in findings)
+
+
+def test_check_shot_durations_clean_passes():
+    plan = {"scenes": [{
+        "id": "sc01",
+        "duration_seconds": 15,
+        "shots": [
+            {"shot_id": "sc01_01", "duration_seconds": 5},
+            {"shot_id": "sc01_02", "duration_seconds": 4},
+            {"shot_id": "sc01_03", "duration_seconds": 6},
+        ],
+    }]}
+    assert check_shot_durations(plan, video_loop="agnes") == []

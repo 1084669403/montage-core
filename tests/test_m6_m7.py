@@ -1,6 +1,7 @@
 """M6/M7 测试：素材源检索 / 导出包 / 管线扩展。"""
 
 import json
+import os
 import zipfile
 from pathlib import Path
 
@@ -94,6 +95,62 @@ def test_export_bundle_builds_zip(tmp_path):
         assert zf.read("CREDITS.txt").decode("utf-8").startswith("本片配乐")
 
 
+def test_export_bundle_default_never_prunes(tmp_path):
+    """keep 缺省 = 0：只增不删，旧包一个不动。"""
+    proj = init_project(tmp_path, "demo-keep", "保留", "cinematic")
+    (proj / "renders").mkdir(exist_ok=True)
+    (proj / "renders" / "final.mp4").write_bytes(b"m")
+    out = tmp_path / "exports"
+    out.mkdir()
+    stale = out / "demo-keep_20200101T000000.zip"
+    stale.write_bytes(b"old")
+    data = export_bundle.build_bundle(proj, out)
+    assert data["pruned"] == []
+    assert stale.exists()
+
+
+def test_export_bundle_prune_keeps_newest_n(tmp_path):
+    """keep=N：保留最新 N 个，其余删除；只认本工具的 <id>_<时间戳>.zip 命名。"""
+    proj = init_project(tmp_path, "demo-prune", "清理", "cinematic")
+    (proj / "renders").mkdir(exist_ok=True)
+    (proj / "renders" / "final.mp4").write_bytes(b"m")
+    out = tmp_path / "exports"
+    out.mkdir()
+    for i, stamp in enumerate(("20200101T000000", "20200102T000000", "20200103T000000")):
+        p = out / f"demo-prune_{stamp}.zip"
+        p.write_bytes(b"old")
+        os.utime(p, (1_600_000_000 + i, 1_600_000_000 + i))
+    unrelated = out / "manual-backup.zip"
+    unrelated.write_bytes(b"keep me")
+
+    data = export_bundle.build_bundle(proj, out, keep=2)
+    remaining = sorted(p.name for p in out.glob("demo-prune_*.zip"))
+    assert len(remaining) == 2
+    assert Path(data["output"]).name in remaining
+    assert len(data["pruned"]) == 2
+    # 最新的旧包保留（20200103），更旧的两个被清
+    assert "demo-prune_20200103T000000.zip" in remaining
+    assert unrelated.exists(), "非本工具命名的 zip 不得被清"
+
+
+def test_export_bundle_tool_keep_exports(tmp_path):
+    proj = init_project(tmp_path, "demo-tool", "工具", "cinematic")
+    (proj / "renders").mkdir(exist_ok=True)
+    (proj / "renders" / "final.mp4").write_bytes(b"m")
+    out = tmp_path / "e"
+    out.mkdir()
+    for i, stamp in enumerate(("20200101T000000", "20200102T000000")):
+        p = out / f"demo-tool_{stamp}.zip"
+        p.write_bytes(b"old")
+        os.utime(p, (1_600_000_000 + i, 1_600_000_000 + i))
+    result = export_bundle.ExportBundle().execute({
+        "project_dir": str(proj), "output_dir": str(out), "keep_exports": 1,
+    })
+    assert result.success
+    assert len(list(out.glob("*.zip"))) == 1
+    assert result.data["pruned"]
+
+
 def test_export_bundle_includes_cover_and_subtitles(tmp_path):
     proj = init_project(tmp_path, "demo-pack", "封面字幕", "cinematic")
     renders = proj / "renders"
@@ -136,6 +193,43 @@ def test_export_bundle_excludes_auto_edit_tmp_history(tmp_path):
     assert "history/" not in joined
     assert "__pycache__" not in joined
     assert ".env" not in joined
+
+
+def test_export_bundle_skips_generation_cache(tmp_path):
+    """`.cache` 是下载去重缓存，与 assets/images 同一份字节，入包等于把体积翻倍。"""
+    proj = init_project(tmp_path, "demo-cache", "缓存", "cinematic")
+    cache = proj / "assets" / ".cache"
+    cache.mkdir(parents=True)
+    (cache / "abc123.png").write_bytes(b"png-bytes")
+    (cache / "index.json").write_text("{}", encoding="utf-8")
+    (proj / "assets" / "images").mkdir(parents=True, exist_ok=True)
+    (proj / "assets" / "images" / "portrait.png").write_bytes(b"png-bytes")
+
+    data = export_bundle.build_bundle(proj, tmp_path / "exports")
+    with zipfile.ZipFile(data["output"]) as zf:
+        names = zf.namelist()
+        joined = "\n".join(names)
+    assert "assets/images/portrait.png" in names
+    assert ".cache" not in joined
+    assert all(".cache" not in m for m in data["manifest"]["media_files"])
+
+
+def test_export_bundle_skips_stitch_intermediates(tmp_path):
+    """assemble 的 renders/*.joined.mp4 是整片长度的临时文件，不该进交付包。"""
+    proj = init_project(tmp_path, "demo-joined", "中间件", "cinematic")
+    renders = proj / "renders"
+    renders.mkdir(exist_ok=True)
+    (renders / "final.mp4").write_bytes(b"film")
+    (renders / "final.joined.mp4").write_bytes(b"joined-film")
+    (renders / "final.concat.txt").write_text("file 'a.mp4'\n", encoding="utf-8")
+
+    data = export_bundle.build_bundle(proj, tmp_path / "exports")
+    with zipfile.ZipFile(data["output"]) as zf:
+        names = zf.namelist()
+    assert "renders/final.mp4" in names
+    assert "renders/final.joined.mp4" not in names
+    assert "renders/final.concat.txt" not in names
+    assert data["manifest"]["media_files"] == ["renders/final.mp4"]
 
 
 def test_export_bundle_tool(tmp_path):

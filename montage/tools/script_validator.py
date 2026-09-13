@@ -26,6 +26,8 @@ import re
 from typing import Any
 
 from montage.engine.bible import blocking_position, normalize_blocking
+from montage.engine.shot_budget import HERO_CAP, normalize_class, shot_duration
+from montage.tools._shot_constants import _MAX_FORMS
 from montage.engine.shot_language import (
     CANONICAL_BEATS,
     CLOSE_SIZES,
@@ -286,6 +288,79 @@ def check_character_refs(
     return findings
 
 
+def check_subject_forms(
+    scene_plan: dict[str, Any],
+    script: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    """每镜 subjects[].form_id 必须是该角色 forms[].id；同镜同角色多形态给 warning。
+
+    forms[] 优先读 character_registry（分镜镜像），回落 script/bible.characters。
+    """
+    findings: list[dict[str, str]] = []
+    sources = (
+        scene_plan.get("character_registry") or [],
+        (script or {}).get("characters") or [],
+    )
+
+    def _forms_of(cid: str) -> list[str]:
+        for source in sources:
+            for char in source:
+                if not isinstance(char, dict) or str(char.get("id") or "") != cid:
+                    continue
+                ids = [
+                    str(form.get("id")).strip()
+                    for form in char.get("forms") or []
+                    if isinstance(form, dict) and str(form.get("id") or "").strip()
+                ]
+                if ids:
+                    return ids
+        return []
+
+    for si, scene in enumerate(scene_plan.get("scenes") or []):
+        if not isinstance(scene, dict):
+            continue
+        for ji, shot in enumerate(scene.get("shots") or []):
+            if not isinstance(shot, dict):
+                continue
+            vd = shot.get("visual_details") if isinstance(shot.get("visual_details"), dict) else {}
+            label = str(shot.get("shot_id") or f"{scene.get('id') or si}_{ji + 1}")
+            # scene_plan 的 subjects 在 visual_details 下；bible 镜在 shot 顶层。
+            subjects = vd.get("subjects") or shot.get("subjects") or []
+            declared: dict[str, list[str]] = {}
+            for sub in subjects:
+                if not isinstance(sub, dict):
+                    continue
+                cid = str(sub.get("id") or "").strip()
+                fid = str(sub.get("form_id") or "").strip()
+                if not cid or not fid:
+                    continue
+                valid = _forms_of(cid)
+                if fid not in valid:
+                    findings.append({
+                        "severity": "critical",
+                        "stage": "scene_plan",
+                        "field": f"scenes[{si}].shots[{ji}].subjects[].form_id",
+                        "message": f"{label} 的角色 {cid} 声明未知形态 {fid}",
+                        "proposed_fix": f"改用已声明形态：{valid or f'{cid} 无 forms[]'}",
+                    })
+                declared.setdefault(cid, [])
+                if fid not in declared[cid]:
+                    declared[cid].append(fid)
+            for cid, fids in declared.items():
+                if len(fids) > 1:
+                    findings.append({
+                        "severity": "warning",
+                        "stage": "scene_plan",
+                        "field": f"scenes[{si}].shots[{ji}].visual_details.subjects",
+                        "message": (
+                            f"{label} 同镜 {cid} 声明 {len(fids)} 个形态"
+                            f"（{', '.join(fids)}），会多占参考图名额"
+                        ),
+                        "proposed_fix": "同镜只保留一个形态，或拆镜",
+                    })
+    return findings
+
+
 def check_completeness(
     script: dict[str, Any],
     script_style: dict[str, Any] | None = None,
@@ -461,6 +536,79 @@ def check_shot_completeness(
                 "message": f"{shot_label} 时长 {duration:.0f}s 不在 5/10s 网格",
                 "proposed_fix": "调整为 5 或 10 或其整数倍",
             })
+    return findings
+
+
+def _scene_duration(scene: dict[str, Any]) -> float:
+    try:
+        dur = float(scene.get("duration_seconds") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    if dur > 0:
+        return dur
+    try:
+        start = float(scene.get("start_seconds") or 0)
+        end = float(scene.get("end_seconds") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(end - start, 0.0)
+
+
+def check_shot_durations(
+    scene_plan: dict[str, Any],
+    video_loop: str = "none",
+) -> list[dict[str, str]]:
+    """逐镜时长断言：sum(shots) == 场景时长；有政策网格时每个值必须落格。
+
+    复用 ``_policy_grid`` / ``AGNES_GRID``（此前是死代码）。不满足出 finding，
+    把问题从"生成期才炸"前移到校验期。
+    """
+    findings: list[dict[str, str]] = []
+    loop = normalize_video_loop(video_loop)
+    grid = _policy_grid(policy_for_loop(loop))
+    step = (grid[1] - grid[0]) if len(grid) > 1 else 1
+    for sidx, scene in enumerate(scene_plan.get("scenes") or []):
+        if not isinstance(scene, dict):
+            continue
+        sid = scene.get("id") or f"scene_{sidx}"
+        shots = [s for s in (scene.get("shots") or []) if isinstance(s, dict)]
+        if not shots:
+            continue
+        durs: list[tuple[str, float]] = []
+        for j, shot in enumerate(shots):
+            label = str(shot.get("shot_id") or f"{sid}_{j + 1:02d}")
+            try:
+                value = float(shot.get("duration_seconds") or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            durs.append((label, value))
+        total = round(sum(value for _, value in durs), 3)
+        scene_dur = round(_scene_duration(scene), 3)
+        if scene_dur > 0 and abs(total - scene_dur) > 0.05:
+            findings.append({
+                "severity": "warning",
+                "stage": "scene_plan",
+                "field": f"scenes[{sidx}].shots[].duration_seconds",
+                "message": f"{sid} 各镜时长之和 {total:g}s ≠ 场景时长 {scene_dur:g}s",
+                "proposed_fix": "按场景时长重算各镜（script_to_scene_plan 的权重分配应自动满足）",
+            })
+        if not grid:
+            continue
+        lo, hi = grid[0], grid[-1]
+        for label, value in durs:
+            if value <= 0:
+                continue
+            if int(value) != value or int(value) not in grid:
+                findings.append({
+                    "severity": "warning",
+                    "stage": "scene_plan",
+                    "field": f"scenes[{sidx}].shots[].duration_seconds",
+                    "message": (
+                        f"{label} 时长 {value:g}s 不在 {loop} 政策网格 "
+                        f"{lo}–{hi}s（step {step}）内"
+                    ),
+                    "proposed_fix": f"调整为 {lo}–{hi}s 的整秒值",
+                })
     return findings
 
 
@@ -687,12 +835,96 @@ def action_lacks_contact(action: dict[str, Any] | None) -> bool:
     return False
 
 
+def _check_character_forms(
+    char: dict[str, Any],
+    idx: int,
+    *,
+    video_loop: str = "",
+) -> list[dict[str, str]]:
+    """角色 forms[] 校验：id 非空/唯一、default 至多一个、数量上限、appearance 可回落。"""
+    findings: list[dict[str, str]] = []
+    forms = char.get("forms")
+    if not isinstance(forms, list) or not forms:
+        return findings
+    cid = str(char.get("id") or f"char_{idx}")
+    char_appearance = str(char.get("appearance") or "").strip()
+    seen: set[str] = set()
+    explicit = 0
+    defaults = 0
+    for fi, form in enumerate(forms):
+        if not isinstance(form, dict):
+            findings.append({
+                "severity": "critical",
+                "stage": "bible",
+                "field": f"characters[{idx}].forms[{fi}]",
+                "message": f"{cid} 的 forms[{fi}] 不是对象",
+                "proposed_fix": "删掉或写成 {id, appearance, ...}",
+            })
+            continue
+        fid = str(form.get("id") or "").strip()
+        if not fid:
+            findings.append({
+                "severity": "critical",
+                "stage": "bible",
+                "field": f"characters[{idx}].forms[{fi}].id",
+                "message": f"{cid} 的 forms[{fi}] 缺少非空 id",
+                "proposed_fix": "补形态 id（如 human / ghost）",
+            })
+            continue
+        explicit += 1
+        if fid in seen:
+            findings.append({
+                "severity": "critical",
+                "stage": "bible",
+                "field": f"characters[{idx}].forms[{fi}].id",
+                "message": f"{cid} 的形态 id {fid} 重复",
+                "proposed_fix": "角色内形态 id 必须唯一",
+            })
+        seen.add(fid)
+        if form.get("default") is True:
+            defaults += 1
+        if not char_appearance and not str(form.get("appearance") or "").strip():
+            findings.append({
+                "severity": "critical",
+                "stage": "bible",
+                "field": f"characters[{idx}].forms[{fi}].appearance",
+                "message": f"{cid}.{fid} 既无形态 appearance 也无角色 appearance 可回落",
+                "proposed_fix": "补形态 appearance，或补 characters[].appearance",
+            })
+    if explicit > _MAX_FORMS:
+        findings.append({
+            "severity": "critical",
+            "stage": "bible",
+            "field": f"characters[{idx}].forms",
+            "message": f"{cid} 形态数 {explicit} 超过上限 {_MAX_FORMS}",
+            "proposed_fix": "合并/删减形态，或分集处理",
+        })
+    if defaults > 1:
+        findings.append({
+            "severity": "critical",
+            "stage": "bible",
+            "field": f"characters[{idx}].forms",
+            "message": f"{cid} 有 {defaults} 个 default=true 形态",
+            "proposed_fix": "每角色至多一个 default=true",
+        })
+    if explicit and str(video_loop or "").strip().lower() == "kling":
+        findings.append({
+            "severity": "warning",
+            "stage": "bible",
+            "field": f"characters[{idx}].forms",
+            "message": f"{cid} 声明了 forms，但可灵环忽略 forms（按单形态出 look_sheet）",
+            "proposed_fix": "换 agnes 环，或去掉 forms",
+        })
+    return findings
+
+
 def check_bible(
     bible: dict[str, Any],
     *,
     format_card: dict[str, Any] | None = None,
     playbook: dict[str, Any] | None = None,
     script_style: dict[str, Any] | None = None,
+    video_loop: str = "",
 ) -> list[dict[str, str]]:
     """W1 圣经门禁。只由 purpose=bible 调用，不进 purpose=all。"""
     findings: list[dict[str, str]] = []
@@ -725,7 +957,15 @@ def check_bible(
         for idx, char in enumerate(chars):
             cid = str(char.get("id") or f"char_{idx}")
             appearance = str(char.get("appearance") or "").strip()
-            if not appearance:
+            raw_forms = char.get("forms") if isinstance(char.get("forms"), list) else []
+            form_appearances = [
+                str(f.get("appearance") or "").strip()
+                for f in raw_forms
+                if isinstance(f, dict) and str(f.get("id") or "").strip()
+            ]
+            # 角色可把外观完全下放到形态；只有「角色空且形态也补不上」才 critical。
+            covered_by_forms = bool(form_appearances) and all(form_appearances)
+            if not appearance and not covered_by_forms:
                 findings.append({
                     "severity": "critical",
                     "stage": "bible",
@@ -733,7 +973,7 @@ def check_bible(
                     "message": f"{cid} 缺少独特 appearance",
                     "proposed_fix": "写可见外貌锚点（发色/疤/眼镜），禁止套 playbook 默认脸",
                 })
-            elif default_face and _norm_face(appearance) == _norm_face(default_face):
+            elif appearance and default_face and _norm_face(appearance) == _norm_face(default_face):
                 findings.append({
                     "severity": "critical",
                     "stage": "bible",
@@ -741,6 +981,7 @@ def check_bible(
                     "message": f"{cid} 外貌等于 playbook 默认脸",
                     "proposed_fix": "改成该角色独有的锚点，写入 contrast_notes",
                 })
+            findings.extend(_check_character_forms(char, idx, video_loop=video_loop))
         if len(chars) >= 2:
             styles = [str(c.get("speech_style") or "").strip() for c in chars]
             if any(not s for s in styles) or len(set(styles)) < len(styles):
@@ -851,7 +1092,55 @@ def check_bible(
                 "message": f"多场环境是同一句空话（{sample}）",
                 "proposed_fix": "每场写不同地点/光线/陈设，不要复制「一个房间」",
             })
+    findings.extend(_bible_hero_findings(scenes))
+    # 每镜形态声明必须指向 characters[].forms[].id。
+    findings.extend(check_subject_forms(bible, bible))
     return findings
+
+
+def _bible_hero_findings(scenes: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """hero 时长占比前移预警：produce 的 pending hero 30% 门禁（over_hero）。
+
+    圣经期只拿得到 bible，没有 manifest，故按「全部 hero 都还没生成」算最坏值，
+    与 produce 早期的 ratio 一致。镜头缺 ``duration_seconds`` 时按所在场时长均分，
+    场景时长也没有则不计，避免用假分母误报。
+    """
+    hero_seconds = 0.0
+    total_seconds = 0.0
+    hero_labels: list[str] = []
+    for scene in scenes:
+        shots = [s for s in (scene.get("shots") or []) if isinstance(s, dict)]
+        if not shots:
+            continue
+        try:
+            scene_dur = max(0.0, float(scene.get("duration_seconds") or 0))
+        except (TypeError, ValueError):
+            scene_dur = 0.0
+        share = scene_dur / len(shots) if scene_dur > 0 else 0.0
+        for shot in shots:
+            dur = shot_duration(shot) or share
+            total_seconds += dur
+            if normalize_class(shot.get("shot_budget_class")) == "hero":
+                hero_seconds += dur
+                hero_labels.append(str(shot.get("shot_id") or scene.get("id") or "?"))
+    if total_seconds <= 0 or hero_seconds / total_seconds <= HERO_CAP:
+        return []
+    ratio = hero_seconds / total_seconds
+    listed = "、".join(hero_labels[:6]) or "（未命名）"
+    return [{
+        "severity": "warning",
+        "stage": "bible",
+        "field": "scenes[].shots[].shot_budget_class",
+        "message": (
+            f"hero 时长占比 {ratio:.0%}"
+            f"（{hero_seconds:.0f}/{total_seconds:.0f}s；{listed}）"
+            f"超过 {HERO_CAP:.0%}；produce 会在 pending hero 阶段停 over_hero"
+        ),
+        "proposed_fix": (
+            "标更少 hero、produce --trim-hero 降为 talk，"
+            "或 produce --all-video 全视频跳过门禁"
+        ),
+    }]
 
 
 def validate_bible(
@@ -860,12 +1149,14 @@ def validate_bible(
     format_card: dict[str, Any] | None = None,
     playbook: dict[str, Any] | None = None,
     script_style: dict[str, Any] | None = None,
+    video_loop: str = "",
 ) -> dict[str, Any]:
     findings = check_bible(
         bible,
         format_card=format_card,
         playbook=playbook,
         script_style=script_style,
+        video_loop=video_loop,
     )
     criticals = [f for f in findings if f["severity"] == "critical"]
     return {
@@ -902,6 +1193,7 @@ def validate_script(
             format_card=format_card,
             playbook=playbook,
             script_style=script_style,
+            video_loop=resolve_video_loop(video_loop, project_dir),
         )
     findings: list[dict[str, str]] = []
     video_loop = resolve_video_loop(video_loop, project_dir)
@@ -911,10 +1203,12 @@ def validate_script(
         findings.extend(check_filmability(scene_plan))
     if purpose in ("all", "character_refs") and scene_plan:
         findings.extend(check_character_refs(script, scene_plan))
+        findings.extend(check_subject_forms(scene_plan, script))
     if purpose in ("all", "completeness"):
         findings.extend(check_completeness(script, script_style=script_style))
     if purpose in ("all", "shot_completeness") and scene_plan:
         findings.extend(check_shot_completeness(scene_plan, video_loop=video_loop))
+        findings.extend(check_shot_durations(scene_plan, video_loop=video_loop))
     if purpose in ("all", "composition") and scene_plan:
         findings.extend(check_composition(scene_plan))
     if purpose in ("all", "beat_coverage"):

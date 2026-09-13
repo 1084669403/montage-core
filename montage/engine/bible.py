@@ -166,6 +166,9 @@ def _overlay_shot(
                 base["id"] = sid
             if sub.get("appearance_anchor"):
                 base["appearance_anchor"] = sub["appearance_anchor"]
+            # 每镜出场形态：bible 显式声明优先，未声明保留 plan 原值（缺省=默认形态）。
+            if sub.get("form_id"):
+                base["form_id"] = str(sub["form_id"])
             base["action"] = _merge_action(base.get("action"), sub.get("action"))
             if sub.get("position"):
                 base["position"] = str(sub["position"])
@@ -207,6 +210,15 @@ def _overlay_shot(
     loc = str(bshot.get("location_id") or "").strip()
     if loc:
         plan_shot["location_id"] = loc
+    # 作者可在 bible 里逐镜指定时长；未给则沿用 scene_plan 的权重分配结果。
+    bible_dur = bshot.get("duration_seconds")
+    if bible_dur is not None:
+        try:
+            dur_value = float(bible_dur)
+        except (TypeError, ValueError):
+            dur_value = 0.0
+        if dur_value > 0:
+            plan_shot["duration_seconds"] = dur_value
 
 
 def _env_location_text(raw: Any) -> str:
@@ -313,8 +325,46 @@ def align_location_ids(
                 plan_shot["location_id"] = shot_lid
 
 
+def _environment_time_keys(env: Any) -> list[str]:
+    """从环境对象提取 time/lighting 选择键（time 优先）。"""
+    keys: list[str] = []
+    if isinstance(env, dict):
+        for field in ("time", "lighting"):
+            val = str(env.get(field) or "").strip()
+            if val and val not in keys:
+                keys.append(val)
+    return keys
+
+
+def _sensory_for_time(loc: dict[str, Any], keys: list[str]) -> str:
+    """按 time/lighting 从 loc.sensory_by_time 选句；支持 dict 与 list 两种写法。"""
+    by_time = loc.get("sensory_by_time")
+    if not by_time or not keys:
+        return ""
+    if isinstance(by_time, dict):
+        for key in keys:
+            hit = str(by_time.get(key) or "").strip()
+            if hit:
+                return hit
+        return ""
+    if isinstance(by_time, list):
+        for key in keys:
+            for item in by_time:
+                if not isinstance(item, dict):
+                    continue
+                labels = (
+                    str(item.get("time") or "").strip(),
+                    str(item.get("lighting") or "").strip(),
+                )
+                if key in labels:
+                    hit = str(item.get("sensory") or "").strip()
+                    if hit:
+                        return hit
+    return ""
+
+
 def overlay_location_sensory(bible: dict[str, Any], scene_plan: dict[str, Any]) -> None:
-    """把 locations[].sensory 抄进每镜；环境句按景别裁切，不编造地标。"""
+    """把 locations[].sensory 抄进每镜；按 scene.environment.time 选句并按景别裁切。"""
     from lib.shot_prompt_builder import crop_location_sensory
 
     catalog: list[dict[str, Any]] = []
@@ -329,30 +379,42 @@ def overlay_location_sensory(bible: dict[str, Any], scene_plan: dict[str, Any]) 
         by_id[lid] = loc
     if catalog:
         scene_plan["locations"] = catalog
+    bible_scenes = {
+        str(s.get("id") or ""): s
+        for s in (bible.get("scenes") or [])
+        if isinstance(s, dict)
+    }
     for plan_scene in scene_plan.get("scenes") or []:
         if not isinstance(plan_scene, dict):
             continue
         scene_lid = str(plan_scene.get("location_id") or "").strip()
+        # scene_plan 自带的 environment.time 优先；旧产物没有则回落 bible 场景环境。
+        scene_env = plan_scene.get("environment")
+        if not _environment_time_keys(scene_env):
+            bscene = bible_scenes.get(str(plan_scene.get("id") or "")) or {}
+            scene_env = bscene.get("environment")
+        time_keys = _environment_time_keys(scene_env)
         for plan_shot in plan_scene.get("shots") or []:
             if not isinstance(plan_shot, dict):
                 continue
             lid = str(plan_shot.get("location_id") or scene_lid or "").strip()
             loc = by_id.get(lid) or {}
-            sensory = str(loc.get("sensory") or "").strip()
+            sensory = _sensory_for_time(loc, time_keys) or str(loc.get("sensory") or "").strip()
             if not sensory:
                 continue
-            plan_shot["location_sensory"] = sensory
             vd = plan_shot.get("visual_details")
             if not isinstance(vd, dict):
                 vd = {}
                 plan_shot["visual_details"] = vd
             sl = plan_shot.get("shot_language") if isinstance(plan_shot.get("shot_language"), dict) else {}
-            cropped = crop_location_sensory(sensory, str(sl.get("shot_size") or ""))
-            # 始终用 location.sensory 覆盖 vd.environment：它是该镜头的权威
-            # 机位环境描述。convert_script_to_scene_plan 会把 script.environment
-            # （全局/首场）拍扁进每镜，若不覆盖，室内镜会被全局室外环境污染。
-            if cropped:
-                vd["environment"] = cropped.rstrip("。")
+            # 以裁切结果为准，且 location_sensory 与 vd.environment 写同一值：
+            # 后者是 location 权威环境（覆盖 converter 塞进来的全局/首场环境），
+            # 前者是 _location_sensory_text 的第一优先来源。过去写"原始未裁句 +
+            # 裁切句"两份，导致裁切永远被绕过（crop_location_sensory 成死代码）。
+            cropped = crop_location_sensory(sensory, str(sl.get("shot_size") or "")).rstrip("。")
+            authoritative = cropped or sensory
+            plan_shot["location_sensory"] = authoritative
+            vd["environment"] = authoritative
 
 
 def overlay_visuals(

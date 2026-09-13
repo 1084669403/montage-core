@@ -73,7 +73,11 @@ def overlay_plan_rework(
     shots: list[dict[str, Any]],
     scene_plan: dict[str, Any] | None,
 ) -> None:
-    """scene_plan 上的返工字段盖过已 lift 的 shot_prompts（确认卡只写 scene_plan）。"""
+    """scene_plan 上的返工字段盖过已 lift 的 shot_prompts（确认卡只写 scene_plan）。
+
+    时长同样以 scene_plan 为准：shot_prompts 是 lift 时的快照，改 bible/scene_plan
+    后重抽若不覆盖，会拿旧时长静默重发（huapi sc01_01 踩过：改 9s 仍按 6s 请求）。
+    """
     nested = {
         str(s.get("shot_id") or ""): s
         for s in _nested_plan_shots(scene_plan)
@@ -86,6 +90,12 @@ def overlay_plan_rework(
         for key in _REWORK_KEYS:
             if key in src:
                 shot[key] = src[key]
+        try:
+            dur = float(src.get("duration_seconds") or 0)
+        except (TypeError, ValueError):
+            dur = 0.0
+        if dur > 0:
+            shot["duration_seconds"] = dur
 
 
 def lift_shot_prompts(shots: list[dict[str, Any]]) -> dict[str, Any]:
@@ -529,6 +539,8 @@ def _prompt_inputs(
         except (OSError, TypeError, ValueError):
             pass
 
+    agnes_plan = shot.get("_agnes_ref_plan") if isinstance(shot.get("_agnes_ref_plan"), dict) else {}
+    refs_in = list(agnes_plan.get("entries") or []) if api_id == "agnes_v25" else []
     return {
         "purpose": "shot",
         "shot": shot,
@@ -542,6 +554,9 @@ def _prompt_inputs(
         "jimeng_prompt": jimeng_v30,
         "provider_max_chars": max_chars if max_chars else None,
         "locations": (scene_plan or {}).get("locations"),
+        # 单一来源：Agnes 2.5 图例只认已过公网过滤+截断的最终有序表，
+        # 编号即 images[] 下标；非 Agnes 路线不传，避免造出第二个生产者。
+        "refs": refs_in or None,
         "master_pattern": master_pattern or None,
         "master_prompt": master_prompt or None,
     }

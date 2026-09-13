@@ -409,7 +409,7 @@ def test_apply_lut_full_strength_command(monkeypatch, tmp_path):
     assert len(captured) == 1
     cmd = " ".join(captured[0])
     assert "-vf" in cmd
-    assert "lut3d=filename=" in cmd
+    assert "lut3d=file=" in cmd
     assert "teal-orange" in cmd
     assert "interp=tetrahedral" in cmd
     assert "-crf" in cmd
@@ -461,7 +461,28 @@ def test_apply_lut_operation_dispatch(monkeypatch, tmp_path):
          "output_path": str(tmp_path / "graded.mp4"), "lut_strength": 0.5}
     )
     assert result.success
-    assert captured and "lut3d=filename=" in " ".join(captured[0])
+    assert captured and "lut3d=file=" in " ".join(captured[0])
+
+
+def test_lut3d_filter_uses_file_option(tmp_path):
+    """lut3d 的选项名是 file（vf_lut3d.c 自 ffmpeg 2.4 起），不是 filename。"""
+    lut = tmp_path / "l.cube"
+    lut.write_text("LUT_3D_SIZE 2\n0 0 0\n1 1 1\n", encoding="utf-8")
+    filt = fe.lut3d_filter(lut)
+    assert filt.startswith("lut3d=file=")
+    assert "filename=" not in filt
+    assert filt.endswith(":interp=tetrahedral")
+
+
+def test_filter_path_double_escapes_drive_and_space(tmp_path):
+    """filtergraph 与滤镜选项各吃一层转义，字面冒号/空格需写成两层。"""
+    target = tmp_path / "a b.cube"
+    posix = target.resolve().as_posix()
+    escaped = fe.filter_path(target)
+    assert escaped == posix.replace(":", "\\" * 2 + ":").replace(" ", "\\" * 2 + " ")
+    assert "a\\\\ b.cube" in escaped
+    if ":" in posix:  # Windows 盘符：单层转义不足以解析
+        assert escaped.count("\\") == 2 * (posix.count(":") + posix.count(" "))
 
 
 def test_apply_lut_resolves_catalog_id(monkeypatch, tmp_path):
@@ -502,4 +523,5 @@ def test_real_ffmpeg_apply_lut_smoke(tmp_path):
     out = tmp_path / "graded.mp4"
     fe.apply_lut(src, _repo_lut(), out, strength=0.8)
     info = fe.probe(out)
-    assert (info.get("format") or {}).get("duration", 0) > 0.5
+    # ffprobe JSON 的 duration 是字符串，必须显式转 float 再比较
+    assert float((info.get("format") or {}).get("duration", 0)) > 0.5

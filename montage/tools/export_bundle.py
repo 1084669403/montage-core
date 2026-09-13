@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,16 +32,57 @@ _EXPORT_GLOBS = (
 )
 
 _EXCLUDE_PARTS = ("__pycache__", "tmp_autoedit", "auto_edit", "history")
+# 中间产物：assemble 把整片中间文件写成 renders/*.joined.mp4，而 cleanup_temps 排在
+# export **之后**，不显式排除就会把一份整片长度的中间视频打进交付包（本片约 40MB）。
+_EXCLUDE_SUFFIXES = (".joined.mp4", ".concat.txt")
+# 本工具写出的包名固定为 <project_id>_<UTC 时间戳>.zip；只清理这种命名，
+# 不碰用户在 exports/ 里手放的其它 zip。
+_BUNDLE_STAMP_RE = re.compile(r"_\d{8}T\d{6}\.zip$")
 
 
-def _excluded(path: Path) -> bool:
-    if path.name.startswith(".env"):
+def _prune_exports(output_dir: Path, project_id: str, keep: int) -> list[str]:
+    """保留最新 ``keep`` 个本工具导出的包，删除更旧的；keep<=0 一律不删（默认安全）。"""
+    if keep <= 0:
+        return []
+    candidates = [
+        p for p in output_dir.glob(f"{project_id}_*.zip")
+        if _BUNDLE_STAMP_RE.search(p.name)
+    ]
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    removed: list[str] = []
+    for stale in candidates[keep:]:
+        try:
+            stale.unlink()
+        except OSError:
+            continue
+        removed.append(str(stale))
+    return removed
+
+
+def _excluded(rel: Path) -> bool:
+    """``rel`` 是相对项目根的路径。
+
+    隐藏目录/文件一律不入包：``.cache`` 是下载去重缓存，内容与 ``assets/images``
+    逐字节重复（画皮项目里占包体 1/3），``.env`` 是密钥。
+    """
+    if rel.name.startswith(".env") or any(part.startswith(".") for part in rel.parts):
         return True
-    return any(part in _EXCLUDE_PARTS for part in path.parts)
+    if rel.name.endswith(_EXCLUDE_SUFFIXES):
+        return True
+    return any(part in _EXCLUDE_PARTS for part in rel.parts)
 
 
-def build_bundle(project_dir: str | Path, output_dir: str | Path, *, include_media: bool = True) -> dict[str, Any]:
-    """打包项目为 zip；返回 {output, manifest, entries}。"""
+def build_bundle(
+    project_dir: str | Path,
+    output_dir: str | Path,
+    *,
+    include_media: bool = True,
+    keep: int = 0,
+) -> dict[str, Any]:
+    """打包项目为 zip；返回 {output, manifest, entries, ...}。
+
+    ``keep`` > 0 时保留最新 ``keep`` 个导出包、删除更旧的；默认 0 = 只增不删。
+    """
     project_dir = Path(project_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -58,9 +100,11 @@ def build_bundle(project_dir: str | Path, output_dir: str | Path, *, include_med
             if not base.exists():
                 continue
             for f in sorted(base.glob(pattern)):
-                if f.is_dir() or _excluded(f):
+                if f.is_dir():
                     continue
                 rel = f.relative_to(project_dir).as_posix()
+                if _excluded(Path(rel)):
+                    continue
                 zf.write(f, rel)
                 entries.append(rel)
                 if sub == "renders" and f.suffix in (".mp4", ".webm"):
@@ -80,7 +124,7 @@ def build_bundle(project_dir: str | Path, output_dir: str | Path, *, include_med
         assets_dir = project_dir / "assets"
         if assets_dir.exists():
             for f in sorted(assets_dir.rglob("*")):
-                if f.is_file() and not _excluded(f):
+                if f.is_file() and not _excluded(f.relative_to(project_dir)):
                     rel = f.relative_to(project_dir).as_posix()
                     media_files.append(rel)
 
@@ -111,11 +155,14 @@ def build_bundle(project_dir: str | Path, output_dir: str | Path, *, include_med
         }
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
 
+    # 保留策略：默认不删；显式 keep>0 才清理旧包（produce --prune-exports N）。
+    pruned = _prune_exports(output_dir, project_id, int(keep or 0))
     return {
         "output": str(bundle),
         "manifest": manifest,
         "entries": len(entries),
         "size_bytes": bundle.stat().st_size,
+        "pruned": pruned,
     }
 
 
@@ -133,6 +180,11 @@ class ExportBundle(BaseTool):
         "properties": {
             "project_dir": {"type": "string", "description": "项目目录（含 renders/artifacts/assets）"},
             "output_dir": {"type": "string", "description": "导出目录（默认项目同级 exports/）"},
+            "keep_exports": {
+                "type": "integer",
+                "default": 0,
+                "description": "保留最新 N 个导出包，删除更旧的；默认 0 = 只增不删（安全）",
+            },
         },
     }
 
@@ -148,7 +200,10 @@ class ExportBundle(BaseTool):
             return ToolResult(success=False, error=f"项目目录无效（缺 project.json）: {project_dir}")
         output_dir = Path(inputs.get("output_dir") or project_dir.parent / "exports")
         try:
-            data = build_bundle(project_dir, output_dir)
+            data = build_bundle(
+                project_dir, output_dir,
+                keep=int(inputs.get("keep_exports") or 0),
+            )
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, error=f"导出失败: {exc}")
         return ToolResult(success=True, data=data)

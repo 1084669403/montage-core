@@ -183,6 +183,20 @@ def _shot_picture(shot: dict[str, Any]) -> str:
     return "；".join(bits)
 
 
+def _shot_form_rows(shot: dict[str, Any]) -> list[str]:
+    """本镜显式声明的出场形态 "cid:form" 列表（缺省不列）。"""
+    vd = shot.get("visual_details") if isinstance(shot.get("visual_details"), dict) else {}
+    out: list[str] = []
+    for sub in vd.get("subjects") or []:
+        if not isinstance(sub, dict):
+            continue
+        cid = _text(sub.get("id"))
+        fid = _text(sub.get("form_id"))
+        if cid and fid:
+            out.append(f"{cid}:{fid}")
+    return out
+
+
 def _shot_dialogue_text(shot: dict[str, Any]) -> str:
     from lib.shot_prompt_builder import dialogue_line_text
 
@@ -237,6 +251,10 @@ def _cast_summary_rows(
         name = (
             str(job.get("character_id") or job.get("location_id") or job.get("prop_id") or "")
         )
+        fid = str(job.get("form_id") or "")
+        if fid:
+            form = job.get("form") if isinstance(job.get("form"), dict) else {}
+            name = f"{name}({_text(form.get('name')) or fid})"
         ref = _cast_ref_for_job(job, manifest)
         ready = _item_ready(project_dir, ref)
         if ready:
@@ -461,7 +479,9 @@ def build_review_card(
 ) -> dict[str, Any]:
     step = DIRECTOR_STEP.get(status, "setup")
     from montage.engine.policy import load_loop_policy
-    loop = str(load_loop_policy(project_dir).get("video_loop") or "").strip().lower() if project_dir else ""
+    loop_policy = load_loop_policy(project_dir) if project_dir else {}
+    loop = str(loop_policy.get("video_loop") or "").strip().lower()
+    cast_ref_kind = str(loop_policy.get("cast_ref_kind") or "portrait")
     heading = director_labels(loop).get(status, status)
     proposal = proposal or {}
     findings = [f for f in (findings or []) if isinstance(f, dict)]
@@ -474,7 +494,11 @@ def build_review_card(
         "output_profile": _profile_choices(),
         "playbook": _playbook_choices(),
         "shot_split_mode": SPLIT_MODE_CHOICES,
+        "frames_mode": ["preview", "reference_first", "keyframe"],
     }
+    from montage.engine.policy import normalize_frames_mode
+
+    frames_mode = normalize_frames_mode(proposal.get("frames_mode"))
 
     if status == "await_setup":
         summary = [
@@ -483,6 +507,11 @@ def build_review_card(
             {"label": "画幅", "value": profile or "（未设 proposal_packet.output_profile）"},
             {"label": "视觉风格", "value": _playbook_title(playbook_id)},
             {"label": "拆分镜模式", "value": _split_mode(playbook_id)},
+            {"label": "首帧模式", "value": frames_mode},
+            {
+                "label": "身份参考",
+                "value": cast_ref_kind + ("（可灵强制四视图）" if loop == "kling" else ""),
+            },
         ]
         env = bible.get("environment") if isinstance(bible.get("environment"), dict) else {}
         fields = [
@@ -490,6 +519,13 @@ def build_review_card(
             _field("bible.synopsis", "梗概", _text(bible.get("synopsis"))),
             _field("bible.target_duration_seconds", "时长秒", duration, input_kind="number"),
             _field("proposal_packet.output_profile", "画幅", profile, input_kind="select"),
+            _field(
+                "proposal_packet.frames_mode",
+                "首帧模式",
+                frames_mode,
+                input_kind="select",
+                note="默认 preview（首帧仅审图，不入视频）；改 reference_first/keyframe 会改变每一镜输入",
+            ),
             _field(
                 "bible.playbook",
                 "视觉风格 / 拆分镜模式",
@@ -617,12 +653,48 @@ def build_review_card(
                 _text(prop.get("appearance")), input_kind="textarea", note="白底单主体，无人物、无手持",
             ))
     elif status == "await_cast":
+        from montage.tools._shot_refs import character_forms, effective_skip_turnaround
+
         rows, ok_n, fail_n = _cast_summary_rows(bible, manifest, project_dir, scene_plan)
         headline = "全部成功" if rows and fail_n == 0 else (f"{fail_n} 项失败" if fail_n else "尚无定妆作业")
         summary = [
             {"label": "清单", "value": "；".join(f"{r['label']} {r['value'].split(' · ')[0]}" for r in rows) or "（空）"},
             {"label": "结果", "value": f"{headline}（{ok_n} 过 / {fail_n} 失败）"},
         ]
+        form_bits: list[str] = []
+        est_total = 0
+        for char in (bible.get("characters") or []):
+            if not isinstance(char, dict):
+                continue
+            cid = _text(char.get("id"))
+            if not cid:
+                continue
+            explicit = [
+                f for f in (char.get("forms") or [])
+                if isinstance(f, dict) and str(f.get("id") or "").strip()
+            ]
+            if not explicit:
+                continue
+            if loop == "kling":
+                est = 1  # 可灵忽略 forms，单形态一张拼板
+            else:
+                est = sum(
+                    (1 + (0 if effective_skip_turnaround(char, f) else 1)) for f in character_forms(char)
+                )
+            est_total += est
+            form_bits.append(f"{cid} {len(explicit)} 形态 / 预计 {est} 张")
+        if form_bits:
+            summary.append({
+                "label": "形态",
+                "value": "；".join(form_bits) + f"（合计预计 {est_total} 张）",
+            })
+        summary.append({
+            "label": "身份参考",
+            "value": (
+                "turnaround（可灵强制四视图）" if loop == "kling"
+                else f"{cast_ref_kind}（每形态只发一张；turnaround 由 form/character/packet 显式开启）"
+            ),
+        })
         fields = []
         for row in rows:
             fields.append(_field(
@@ -663,9 +735,18 @@ def build_review_card(
     elif status == "await_frames":
         from montage.tools.shot_runner import first_frame_item
 
+        bindings: dict[str, Any] = {}
+        if project_dir:
+            from montage.engine.artifacts import ArtifactStore as _BindStore
+
+            doc = _BindStore(project_dir).read("image_bindings")
+            if isinstance(doc, dict) and isinstance(doc.get("shots"), dict):
+                bindings = doc["shots"]
+
         rows: list[dict[str, Any]] = []
         ok_n = 0
         fail_ids: list[str] = []
+        bound_n = 0
         for shot in _plan_shots(scene_plan):
             sid = _text(shot.get("shot_id"))
             ref = first_frame_item(shot, manifest, project_dir)
@@ -674,14 +755,30 @@ def build_review_card(
                 ok_n += 1
             elif sid:
                 fail_ids.append(sid)
+            binds = bindings.get(sid) if isinstance(bindings.get(sid), dict) else {}
+            if binds:
+                bound_n += 1
+            forms = "/".join(
+                f"{_text(f.get('character_id'))}"
+                + (f":{_text(f.get('form_id'))}" if _text(f.get("form_id")) else "")
+                for f in (binds.get("character_forms") or [])
+                if isinstance(f, dict)
+            )
             rows.append({
                 "sid": sid,
                 "title": _text(shot.get("title")) or sid or "（无标题）",
                 "klass": _text(shot.get("shot_budget_class")) or "talk",
                 "ready": ready,
                 "path": _text((ref or {}).get("path")),
+                "bind": " · ".join(x for x in (
+                    forms or "无形态",
+                    f"{len(binds.get('refs') or [])} 参考" if binds else "",
+                    _text(binds.get("location_sensory")),
+                ) if x),
             })
         summary = [{"label": "首帧", "value": f"{ok_n}/{len(rows)} 成功" if rows else "尚无镜头"}]
+        if rows:
+            summary.append({"label": "绑定", "value": f"{bound_n}/{len(rows)} 镜"})
         if fail_ids:
             summary.append({"label": "失败镜号", "value": "、".join(fail_ids)})
         long_film = len(rows) > 12
@@ -694,7 +791,10 @@ def build_review_card(
                 f"{row['title']} 过/重抽",
                 "过" if row["ready"] else "失败",
                 input_kind="select",
-                note=f"重抽：--retry {row['sid']} --resume；图 {row['path'] or '（无）'}",
+                note=(
+                    f"重抽：--retry {row['sid']} --resume；图 {row['path'] or '（无）'}"
+                    f"；绑定 {row['bind'] or '（无）'}"
+                ),
             ))
         if long_film:
             summary.append({
@@ -846,6 +946,14 @@ def build_review_card(
             {"label": "各幕", "value": "；".join(scene_lines) or "（尚未 compile）"},
             {"label": "总时长 vs 目标", "value": f"{total}s / {target if target not in (None, '') else '（未设）'}s"},
         ]
+        form_lines = [
+            f"{_text(sh.get('shot_id'))} {'、'.join(_shot_form_rows(sh))}"
+            for sc in scenes
+            for sh in (sc.get("shots") or [])
+            if isinstance(sh, dict) and _shot_form_rows(sh)
+        ]
+        if form_lines:
+            summary.append({"label": "出场形态", "value": "；".join(form_lines)[:200]})
         fields = []
         for sc in scenes:
             scid = _text(sc.get("id"))

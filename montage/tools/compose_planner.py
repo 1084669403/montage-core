@@ -17,6 +17,7 @@ from montage.style_packs import STYLE_PACKS, get_style_pack
 from montage.toolbase import BaseTool, ToolResult, ToolRuntime, ToolStatus
 from montage.tools.edit_advisor import suggest_transitions
 from montage.tools.voice_director import shots_with_timeline
+from montage.tools._shot_refs import probe_seconds, probe_size
 from lib.shot_prompt_builder import dialogue_line_role, dialogue_line_text
 
 _STILL_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
@@ -24,6 +25,25 @@ _STILL_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"
 
 def is_still_image(path: str) -> bool:
     return Path(path).suffix.lower() in _STILL_EXTS
+
+
+def _probe_image_size(path: Path) -> tuple[int, int] | None:
+    """源图实测尺寸；失败 None（ken_burns 交给其默认，但不再由本层假设 1080p）。"""
+    return probe_size(path)
+
+
+def _profile_target_size(store: ArtifactStore | None) -> tuple[int, int] | None:
+    """proposal_packet.output_profile → 成片画布；未知则 None（不猜 1080p）。"""
+    if store is None:
+        return None
+    packet = store.read("proposal_packet") or {}
+    name = str(packet.get("output_profile") or "").strip()
+    if not name:
+        return None
+    from montage.compose.profiles import get_profile
+
+    profile = get_profile(name)
+    return (profile.width, profile.height) if profile else None
 
 
 def resolve_lut_file(lut_id: str) -> str:
@@ -40,9 +60,14 @@ def realize_ken_burns(
     *,
     out_dir: Path | str,
     ken_burns_fn: Callable[..., Any],
+    target_size: tuple[int, int] | None = None,
     findings: list[dict[str, str]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
-    """仅对静图 clip 跑 ken_burns，原地改 cuts[].clip_path。"""
+    """仅对静图 clip 跑 ken_burns，原地改 cuts[].clip_path。
+
+    ``target_size``：成片画布（按 output_profile 推导）。不给则用源图实测尺寸，
+    避免默认 1920x1080 把竖屏项目的静图镜拉成横屏。
+    """
     notes = findings if findings is not None else []
     dest_root = Path(out_dir)
     dest_root.mkdir(parents=True, exist_ok=True)
@@ -78,8 +103,12 @@ def realize_ken_burns(
                 pan = str(e.get("pan") or "center")
         dest = dest_root / f"{sid or src.stem}_kb.mp4"
         dur = float(shot.get("duration_seconds") or 5) or 5.0
+        size = target_size or _probe_image_size(src)
+        kwargs: dict[str, Any] = {"zoom": zoom, "pan": pan}
+        if size:
+            kwargs["width"], kwargs["height"] = int(size[0]), int(size[1])
         try:
-            ken_burns_fn(src, dest, dur, zoom=zoom, pan=pan)
+            ken_burns_fn(src, dest, dur, **kwargs)
         except TypeError:
             ken_burns_fn(src, dest, dur)
         except Exception as exc:  # noqa: BLE001
@@ -164,6 +193,95 @@ def _normalize_kind(raw: Any) -> str:
     return kind
 
 
+def _measured_durations(manifest: dict[str, Any] | None) -> dict[str, float]:
+    """asset_manifest.items[] 里 kind=video 的实测时长 → {shot_id: seconds}。
+
+    优先用 shot_runner 写回的 ``duration_seconds``；老产物没有该字段时回落到
+    直接 probe 磁盘上的 clip（本机既有项目就是这种情况），保证 compose_plan
+    的时间轴始终以"成片里真实存在的片段"为准。
+    """
+    out: dict[str, float] = {}
+    for item in (manifest or {}).get("items") or []:
+        if not isinstance(item, dict) or str(item.get("kind") or "") != "video":
+            continue
+        sid = str(item.get("shot_id") or "")
+        if not sid:
+            continue
+        try:
+            seconds = float(item.get("duration_seconds") or 0)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        if seconds <= 0 and item.get("path"):
+            seconds = probe_seconds(str(item["path"]))
+        if seconds > 0:
+            out[sid] = seconds  # 后写覆盖：取最新一次生成
+    return out
+
+
+def _scene_plan_with_measured(
+    scene_plan: dict[str, Any] | None,
+    measured: dict[str, float],
+) -> dict[str, Any] | None:
+    """把实测时长盖到 scene_plan，并**按实测重算每场的起止时间**。
+
+    ``shots_with_timeline`` 的规则是"每场以本人 ``start_seconds`` 为起点，场内
+    逐镜累加"。只改镜长不动 ``scene.start_seconds`` 会让下一场从旧起点开始
+    （如 sc01 三镜实回 6.59s → 场内累加到 19.78，而 sc02 仍从计划 18.0 开始，
+    字幕反而重叠）。所以这里同时按实测把场起点改成累计值。
+
+    残余误差：非 cut 转场会让相邻片段真实重叠 ``transition_duration``，本函数
+    未扣除（cut 无重叠、纯硬切成片精确对齐）。跨场字幕误差上限 = 各转场重叠之和。
+    """
+    if not measured or not isinstance(scene_plan, dict):
+        return scene_plan
+    scenes: list[Any] = []
+    cursor: float | None = None
+    for scene in scene_plan.get("scenes") or []:
+        if not isinstance(scene, dict):
+            scenes.append(scene)
+            continue
+        shots: list[Any] = []
+        total = 0.0
+        has_shots = False
+        for shot in scene.get("shots") or []:
+            if not isinstance(shot, dict):
+                shots.append(shot)
+                continue
+            has_shots = True
+            real = measured.get(str(shot.get("shot_id") or ""))
+            if real:
+                shots.append({**shot, "duration_seconds": real})
+                total += real
+            else:
+                shots.append(shot)
+                try:
+                    total += float(shot.get("duration_seconds") or 0)
+                except (TypeError, ValueError):
+                    pass
+        new_scene = {**scene, "shots": shots}
+        if has_shots:
+            if cursor is None:
+                cursor = float(scene.get("start_seconds") or 0)
+            new_scene["start_seconds"] = round(cursor, 3)
+            new_scene["end_seconds"] = round(cursor + total, 3)
+            cursor += total
+        scenes.append(new_scene)
+    return {**scene_plan, "scenes": scenes}
+
+
+def _planned_seconds(scene_plan: dict[str, Any] | None, shot_id: str) -> float:
+    for scene in (scene_plan or {}).get("scenes") or []:
+        if not isinstance(scene, dict):
+            continue
+        for shot in scene.get("shots") or []:
+            if isinstance(shot, dict) and str(shot.get("shot_id") or "") == shot_id:
+                try:
+                    return float(shot.get("duration_seconds") or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+    return 0.0
+
+
 def compile_compose_plan(plan: dict[str, Any]) -> dict[str, Any]:
     """compose_plan → edit_decisions（assemble 的唯一运行时输入）。"""
     shots = [s for s in (plan.get("shots") or []) if isinstance(s, dict)]
@@ -210,7 +328,8 @@ def build_compose_plan(
 ) -> dict[str, Any]:
     """纯函数：镜头骨架 + 顾问 + 风格包 → {compose_plan, findings}。"""
     findings: list[dict[str, str]] = []
-    timed = shots_with_timeline(scene_plan)
+    measured = _measured_durations(asset_manifest)
+    timed = shots_with_timeline(_scene_plan_with_measured(scene_plan, measured))
     if not timed and shot_prompts:
         timed = [s for s in (shot_prompts.get("shots") or []) if isinstance(s, dict)]
     if not timed:
@@ -219,6 +338,23 @@ def build_compose_plan(
             "field": "shots",
             "message": "没有镜头可编进 compose_plan",
             "proposed_fix": "先跑 script_to_scene_plan 或提供 shot_prompts",
+        })
+    drift = [
+        (sid, real, _planned_seconds(scene_plan, sid))
+        for sid, real in measured.items()
+    ]
+    drift = [(sid, real, planned) for sid, real, planned in drift if planned and abs(real - planned) > 0.25]
+    if drift:
+        real_total = sum(real for _sid, real, _p in drift)
+        plan_total = sum(planned for _sid, _r, planned in drift)
+        findings.append({
+            "severity": "warning",
+            "field": "timeline",
+            "message": (
+                f"{len(drift)} 个镜头实测时长≠计划（合计 {real_total:.2f}s vs 计划 {plan_total:.2f}s）；"
+                "已按实测重算时间轴，字幕/转场以此为准"
+            ),
+            "proposed_fix": "若要严格贴合计划时长，改剧本请求秒数后重生成该镜",
         })
 
     pb = playbook if isinstance(playbook, dict) else None
@@ -491,7 +627,8 @@ class ComposePlanner(BaseTool):
         out_dir = Path(project_dir) / "assets" / "kenburns" if project_dir else Path("assets/kenburns")
         findings: list[dict[str, str]] = list(extra_findings or [])
         decisions, plan, realized = realize_ken_burns(
-            plan, decisions, out_dir=out_dir, ken_burns_fn=fn, findings=findings,
+            plan, decisions, out_dir=out_dir, ken_burns_fn=fn,
+            target_size=_profile_target_size(store), findings=findings,
         )
         if store:
             store.write("edit_decisions", decisions)

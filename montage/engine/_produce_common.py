@@ -18,6 +18,12 @@ from montage.engine.artifacts import ArtifactStore
 from montage.engine.director import is_director_await
 from montage.engine.policy import load_loop_policy
 from montage.toolbase import BaseTool, ToolResult
+from montage.tools._shot_refs import (
+    character_forms,
+    dedupe_items_by_id,
+    form_id_of,
+    form_subject,
+)
 from montage.tools.compose_planner import clip_path_for_shot, is_still_image
 from montage.tools.shot_runner import clips_compose_ready, collect_cast_jobs, collect_shots
 from montage.tools.voice_director import shots_with_timeline
@@ -42,6 +48,7 @@ IDEA_STEP_IDS = (
 GEN_STEP_IDS = (
     "shot_dry_run",
     "shot_generate",
+    "shot_bind",
     "voice",
 )
 
@@ -341,7 +348,7 @@ def collect_shot_clips(
 
 
 def _normalize_manifest_paths(project_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
-    """把相对 clip 写成绝对路径，让后续工具不依赖 cwd。"""
+    """把相对 clip 写成绝对路径 + 按 id 去重（旧项目自愈），让后续工具不依赖 cwd。"""
     out = dict(manifest)
     items = []
     for item in manifest.get("items") or []:
@@ -353,7 +360,7 @@ def _normalize_manifest_paths(project_dir: Path, manifest: dict[str, Any]) -> di
         if found is not None:
             row["path"] = str(found)
         items.append(row)
-    out["items"] = items
+    out["items"] = dedupe_items_by_id(items)
     return out
 
 
@@ -449,6 +456,10 @@ def _known_retry_ids(project_dir: Path) -> set[str]:
             if cid:
                 known.add(cid)
                 known.add(f"portrait/{cid}")
+                fid = str(sub.get("form_id") or "").strip()
+                if fid:
+                    known.add(form_subject("portrait", cid, fid))
+                    known.add(form_subject("turnaround", cid, fid))
     for src in (store.read("script") or {}, store.read("series_bible") or {}):
         if not isinstance(src, dict):
             continue
@@ -460,6 +471,11 @@ def _known_retry_ids(project_dir: Path) -> set[str]:
                 known.add(cid)
                 known.add(f"portrait/{cid}")
                 known.add(f"turnaround/{cid}")
+                for form in character_forms(ch):
+                    fid = form_id_of(form)
+                    if fid:
+                        known.add(form_subject("portrait", cid, fid))
+                        known.add(form_subject("turnaround", cid, fid))
         for loc in src.get("locations") or []:
             if not isinstance(loc, dict):
                 continue

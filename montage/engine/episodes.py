@@ -17,6 +17,14 @@ from montage.engine.artifacts import ArtifactStore
 from montage.engine.bible import compile_bible, write_compiled
 from montage.engine.policy import load_loop_policy
 from montage.providers.capabilities import policy_for_loop
+from montage.tools._shot_refs import (
+    _portrait_refs_by_form,
+    _prop_index,
+    _turnaround_refs_by_form,
+    _upsert_item,
+    _upsert_ref,
+    form_ref_id,
+)
 
 EPISODE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -257,16 +265,22 @@ def _still_retry_covers(
     portrait_id: str = "",
     prop_id: str = "",
     turnaround_id: str = "",
+    form_id: str = "",
 ) -> bool:
     if not retry_ids:
         return False
+    fid = str(form_id or "").strip()
     if portrait_id and (portrait_id in retry_ids or f"portrait/{portrait_id}" in retry_ids):
+        return True
+    if portrait_id and fid and f"portrait/{portrait_id}:{fid}" in retry_ids:
         return True
     if prop_id and (prop_id in retry_ids or f"prop/{prop_id}" in retry_ids):
         return True
     if turnaround_id and (
         turnaround_id in retry_ids or f"turnaround/{turnaround_id}" in retry_ids
     ):
+        return True
+    if turnaround_id and fid and f"turnaround/{turnaround_id}:{fid}" in retry_ids:
         return True
     return False
 
@@ -327,55 +341,28 @@ def _still_indexes(
     return portraits, props, turnarounds
 
 
-def _upsert_ref(
-    refs: list[dict[str, Any]],
-    new_ref: dict[str, Any],
-    *,
-    kind: str,
-    id_key: str,
-    id_val: str,
-) -> None:
-    for idx, ref in enumerate(refs):
-        if not isinstance(ref, dict):
-            continue
-        if str(ref.get("kind") or "") == kind and str(ref.get(id_key) or "") == id_val:
-            refs[idx] = new_ref
-            return
-    refs.append(new_ref)
-
-
-def _upsert_item(items: list[dict[str, Any]], row: dict[str, Any]) -> None:
-    rid = str(row.get("id") or "")
-    if rid:
-        for idx, item in enumerate(items):
-            if isinstance(item, dict) and str(item.get("id") or "") == rid:
-                items[idx] = row
-                return
-    items.append(row)
-
-
 def _find_sibling_still(
     series: Path,
     current_eid: str,
     *,
     kind: str,
-    id_key: str,
     asset_id: str,
+    form_id: str = "",
 ) -> tuple[Path, dict[str, Any]] | None:
-    """episodes.json 顺序、跳过本集，第一条文件或 http url ready 的同 id 静图。"""
+    """episodes.json 顺序、跳过本集，第一条文件或 http url ready 的同 (id, form) 静图。"""
     for row in load_episodes_index(series):
         eid = str(row.get("episode_id") or "").strip()
         if not eid or eid == current_eid or not EPISODE_ID_RE.fullmatch(eid):
             continue
         ep_dir = series / "episodes" / eid
-        portraits, props, turnarounds = _still_indexes(ArtifactStore(ep_dir).read("asset_manifest"))
+        manifest = ArtifactStore(ep_dir).read("asset_manifest")
         if kind == "portrait":
-            hit = portraits.get(asset_id)
+            hit = _portrait_refs_by_form(manifest).get((asset_id, form_id))
         elif kind == "turnaround":
-            hit = turnarounds.get(asset_id)
+            hit = _turnaround_refs_by_form(manifest).get((asset_id, form_id))
         else:
-            hit = props.get(asset_id)
-        if hit is not None and str(hit.get(id_key) or "") == asset_id and _item_ready_here(ep_dir, hit):
+            hit = _prop_index(manifest).get(asset_id)
+        if hit is not None and _item_ready_here(ep_dir, hit):
             return ep_dir, hit
     return None
 
@@ -384,14 +371,16 @@ def copy_sibling_still_refs(
     project_dir: str | Path,
     *,
     portrait_ids: list[str] | None = None,
+    portrait_forms: list[tuple[str, str]] | None = None,
     prop_ids: list[str] | None = None,
     retry_ids: set[str] | frozenset[str] | None = None,
     manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """把兄弟集已 ready 的 portrait/prop 拷进本集 assets/ 或抄 url。扁平项目 no-op。
+    """把兄弟集已 ready 的 portrait/turnaround/prop 拷进本集 assets/ 或抄 url。扁平项目 no-op。
 
     有本地文件则 copy2（禁止 symlink、禁止 ../../ 相对路径）；仅 http url 则抄进
     本集 manifest、不下载。retry 点名的 id 不复用。同时更新传入的 manifest。
+    portrait_forms 给出 (character_id, form_id) 时按形态拷贝，避免多形态互相覆盖。
     """
     out = manifest if isinstance(manifest, dict) else {"items": [], "reference_assets": []}
     out.setdefault("items", [])
@@ -410,61 +399,89 @@ def copy_sibling_still_refs(
     if not isinstance(items, list):
         items = []
         out["items"] = items
-    current_portraits, current_props, current_turnarounds = _still_indexes(out)
+    current_portraits = _portrait_refs_by_form(out)
+    current_turnarounds = _turnaround_refs_by_form(out)
+    current_props = _prop_index(out)
     copied = False
-    still_jobs: list[tuple[str, str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    still_jobs: list[tuple[str, str, str]] = []  # (kind, asset_id, form_id)
+    seen: set[tuple[str, str, str]] = set()
+    form_pairs: list[tuple[str, str]] = []
     for cid in portrait_ids or []:
         token = str(cid or "").strip()
-        if not token or not EPISODE_ID_RE.fullmatch(token) or ("portrait", token) in seen:
+        if token and EPISODE_ID_RE.fullmatch(token):
+            form_pairs.append((token, ""))
+    for pair in portrait_forms or []:
+        try:
+            cid_raw, fid_raw = pair[0], pair[1]
+        except (TypeError, IndexError):
             continue
-        seen.add(("portrait", token))
-        still_jobs.append(("portrait", "character_id", token))
-        if ("turnaround", token) not in seen:
-            seen.add(("turnaround", token))
-            still_jobs.append(("turnaround", "character_id", token))
+        cid = str(cid_raw or "").strip()
+        fid = str(fid_raw or "").strip()
+        # form id 会进文件名/ref id，必须落在安全字符集里；否则跳过该形态。
+        if not cid or not EPISODE_ID_RE.fullmatch(cid):
+            continue
+        if not fid or not EPISODE_ID_RE.fullmatch(fid):
+            continue
+        form_pairs.append((cid, fid))
+    for cid, fid in form_pairs:
+        if ("portrait", cid, fid) not in seen:
+            seen.add(("portrait", cid, fid))
+            still_jobs.append(("portrait", cid, fid))
+        if ("turnaround", cid, fid) not in seen:
+            seen.add(("turnaround", cid, fid))
+            still_jobs.append(("turnaround", cid, fid))
     for pid in prop_ids or []:
         token = str(pid or "").strip()
-        if not token or not EPISODE_ID_RE.fullmatch(token) or ("prop", token) in seen:
+        if not token or not EPISODE_ID_RE.fullmatch(token) or ("prop", token, "") in seen:
             continue
-        seen.add(("prop", token))
-        still_jobs.append(("prop", "prop_id", token))
+        seen.add(("prop", token, ""))
+        still_jobs.append(("prop", token, ""))
 
     assets_root = root / "assets"
     img_dir = assets_root / "images"
-    for kind, id_key, asset_id in still_jobs:
-        if kind == "portrait" and _still_retry_covers(retry, portrait_id=asset_id):
+    for kind, asset_id, form_id in still_jobs:
+        if kind == "portrait" and _still_retry_covers(retry, portrait_id=asset_id, form_id=form_id):
             continue
-        if kind == "turnaround" and _still_retry_covers(retry, turnaround_id=asset_id):
+        if kind == "turnaround" and _still_retry_covers(retry, turnaround_id=asset_id, form_id=form_id):
             continue
         if kind == "prop" and _still_retry_covers(retry, prop_id=asset_id):
             continue
         if kind == "portrait":
-            current_hit = current_portraits.get(asset_id)
+            current_hit = current_portraits.get((asset_id, form_id))
         elif kind == "turnaround":
-            current_hit = current_turnarounds.get(asset_id)
+            current_hit = current_turnarounds.get((asset_id, form_id))
         else:
             current_hit = current_props.get(asset_id)
         if _item_ready_here(root, current_hit):
             continue
-        found = _find_sibling_still(series, current_eid, kind=kind, id_key=id_key, asset_id=asset_id)
+        found = _find_sibling_still(
+            series, current_eid, kind=kind, asset_id=asset_id, form_id=form_id,
+        )
         if found is None:
             continue
         sib_dir, sib_ref = found
         src = _resolve_media_file(sib_dir, str(sib_ref.get("path") or ""))
         provider = str(sib_ref.get("provider") or "")
         url = str(sib_ref.get("url") or "").strip()
+        ref_id = (
+            form_ref_id(kind, asset_id, form_id)
+            if kind in ("portrait", "turnaround")
+            else f"{kind}_{asset_id}"
+        )
+        id_key = "prop_id" if kind == "prop" else "character_id"
         new_ref: dict[str, Any] = {
-            "id": f"{kind}_{asset_id}",
+            "id": ref_id,
             "kind": kind,
             id_key: asset_id,
         }
+        if kind in ("portrait", "turnaround") and form_id:
+            new_ref["form_id"] = form_id
         if provider:
             new_ref["provider"] = provider
         row: dict[str, Any] = {"id": new_ref["id"], "kind": "image"}
         if src is not None:
             suffix = src.suffix if src.suffix else ".png"
-            dest = img_dir / f"{kind}_{asset_id}{suffix}"
+            dest = img_dir / f"{ref_id}{suffix}"
             try:
                 img_dir.mkdir(parents=True, exist_ok=True)
                 if dest.exists() or dest.is_symlink():
@@ -493,9 +510,9 @@ def copy_sibling_still_refs(
         _upsert_ref(refs, new_ref, kind=kind, id_key=id_key, id_val=asset_id)
         _upsert_item(items, row)
         if kind == "portrait":
-            current_portraits[asset_id] = new_ref
+            current_portraits[(asset_id, form_id)] = new_ref
         elif kind == "turnaround":
-            current_turnarounds[asset_id] = new_ref
+            current_turnarounds[(asset_id, form_id)] = new_ref
         else:
             current_props[asset_id] = new_ref
         copied = True

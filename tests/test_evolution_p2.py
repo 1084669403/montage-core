@@ -288,6 +288,42 @@ def test_proposal_schema_accepts_ark():
     )
 
 
+def test_proposal_schema_frames_mode_enum():
+    from jsonschema import ValidationError, validate
+
+    validate(
+        {"concept": "雨", "frames_mode": "keyframe"},
+        get_schema("proposal_packet"),
+    )
+    try:
+        validate({"concept": "雨", "frames_mode": "nope"}, get_schema("proposal_packet"))
+    except ValidationError:
+        pass
+    else:  # pragma: no cover - 失败路径
+        raise AssertionError("未知 frames_mode 应被 schema 拒绝")
+
+
+def test_frames_mode_defaults_to_preview(tmp_path):
+    from montage.engine.policy import load_loop_policy, normalize_frames_mode
+
+    assert normalize_frames_mode(None) == "preview"
+    assert normalize_frames_mode("") == "preview"
+    assert normalize_frames_mode("bogus") == "preview"
+    assert normalize_frames_mode("REFERENCE_FIRST") == "reference_first"
+    art = tmp_path / "artifacts"
+    art.mkdir()
+    (art / "proposal_packet.json").write_text(
+        json.dumps({"concept": "雨", "frames_mode": "keyframe"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    assert load_loop_policy(tmp_path)["frames_mode"] == "keyframe"
+    # 缺字段回落 preview
+    (art / "proposal_packet.json").write_text(
+        json.dumps({"concept": "雨"}, ensure_ascii=False), encoding="utf-8",
+    )
+    assert load_loop_policy(tmp_path)["frames_mode"] == "preview"
+
+
 def test_wired_surfaces_reachable():
     assert video_surface("seedance_25")["wired"] is True
     assert video_surface("kling_omni_30")["wired"] is True

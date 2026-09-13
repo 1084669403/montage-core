@@ -86,6 +86,38 @@ def test_shots_resume_stops_at_frames_without_video(tmp_path):
     assert "--idea" not in argv
 
 
+def test_frames_card_shows_bindings(tmp_path):
+    """await_frames 卡片附「形态/场景文字/参考数」绑定列；绑定产物落盘。"""
+    proj = init_project(tmp_path, "d2-bind", "圣经", "cinematic")
+    write_bible(proj, _director_bible())
+    tools, order, _bgm = _cast_tools(proj)
+    tools["shot_runner"] = ShotRunner(
+        image_execute=_fake_image,
+        video_execute=_fake_video,
+        image_estimate=lambda i: 0.04,
+        video_estimate=lambda i: 0.2,
+        quality_check=_pass_quality,
+        extract_last_frame=lambda *_a, **_k: None,
+    )
+    _walk_to_shots(proj, tools)
+    frames = _run(proj, tools, resume=True)
+    assert frames["success"], frames.get("error")
+    assert frames["progress"]["status"] == "await_frames"
+    bindings = json.loads(
+        (proj / "artifacts" / "image_bindings.json").read_text(encoding="utf-8")
+    )
+    assert bindings["shots"], "帧停点后应有逐镜绑定"
+    sid = next(iter(bindings["shots"]))
+    assert "refs" in bindings["shots"][sid]
+    card = json.loads(
+        (proj / "artifacts" / "review_card.json").read_text(encoding="utf-8")
+    )
+    notes = " ".join(str(f.get("note") or "") for f in card.get("fields") or [])
+    assert "绑定" in notes
+    labels = " ".join(str(s.get("label") or "") for s in card.get("summary") or [])
+    assert "绑定" in labels
+
+
 def test_failed_frames_block_video(tmp_path):
     proj = init_project(tmp_path, "d2-fail", "圣经", "cinematic")
     write_bible(proj, _director_bible())
@@ -229,3 +261,64 @@ def test_await_clips_resume_without_clips_stays(tmp_path):
     assert "soundtrack" not in order
     fields = [str(f.get("field") or "") for f in (result["progress"].get("findings") or [])]
     assert "sh01" in fields
+
+
+class _StageRecorder:
+    """记录 shot_runner 收到的 stage，返回成功的最小 payload（不打 HTTP）。"""
+
+    def __init__(self, *, prompt_shots=None):
+        self.stages: list[str] = []
+        self._prompt_shots = prompt_shots
+
+    def execute(self, inputs):
+        self.stages.append(str(inputs.get("stage") or ""))
+        data: dict = {"findings": [], "retryable_ids": []}
+        if self._prompt_shots:
+            data["shot_prompts"] = {"shots": self._prompt_shots}
+        return ToolResult(success=True, data=data)
+
+
+def _write_packet_loop(proj: Path, *, video_loop: str, frames_mode: str) -> None:
+    path = proj / "artifacts" / "proposal_packet.json"
+    packet = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    packet["video_loop"] = video_loop
+    packet["frames_mode"] = frames_mode
+    path.write_text(json.dumps(packet, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def test_agnes_preview_skips_frames(tmp_path):
+    """Agnes + preview：跳过 await_frames，直接构建最终提示词停 await_final_prompt。"""
+    proj = init_project(tmp_path, "d2-preview", "圣经", "cinematic")
+    write_bible(proj, _director_bible())
+    tools, _order, _bgm = _cast_tools(proj)
+    _walk_to_shots(proj, tools)
+    _write_packet_loop(proj, video_loop="agnes", frames_mode="preview")
+    recorder = _StageRecorder(prompt_shots=[{"shot_id": "sc01_01"}])
+    tools["shot_runner"] = recorder
+
+    result = _run(proj, tools, resume=True)
+    assert result["success"], result.get("error")
+    assert result["progress"]["status"] == "await_final_prompt"
+    assert recorder.stages == ["prompt_preview"]
+    card = json.loads((proj / "artifacts" / "review_card.json").read_text(encoding="utf-8"))
+    assert card["step"] == "final_prompt"
+    videos = proj / "assets" / "videos"
+    assert not videos.exists() or not any(videos.glob("*.mp4"))
+
+
+def test_agnes_reference_first_keeps_frames(tmp_path):
+    """Agnes + reference_first：不得跳过 frames（反向锁条件不被写宽）。"""
+    proj = init_project(tmp_path, "d2-reffirst", "圣经", "cinematic")
+    write_bible(proj, _director_bible())
+    tools, _order, _bgm = _cast_tools(proj)
+    _walk_to_shots(proj, tools)
+    _write_packet_loop(proj, video_loop="agnes", frames_mode="reference_first")
+    recorder = _StageRecorder()
+    tools["shot_runner"] = recorder
+
+    result = _run(proj, tools, resume=True)
+    assert recorder.stages[:1] == ["frames"]
+    assert "prompt_preview" not in recorder.stages
+    # reference_first 停在 await_frames（进入 frames 门），不越过到 await_final_prompt。
+    assert result["progress"]["status"] == "await_frames"
+    assert result["progress"]["status"] != "await_final_prompt"

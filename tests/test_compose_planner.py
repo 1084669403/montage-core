@@ -98,6 +98,58 @@ def test_cut_only_forces_cut():
     assert doc["allow_non_cut"] is False
 
 
+def test_measured_duration_overrides_timeline():
+    """asset_manifest 的实测时长盖过计划时长，字幕 cue 跟着整体后移。
+
+    对应真实事故：Agnes 请求 6s 实回 6.59s，compose_plan 仍按 6s 算 cue，
+    第 4 条字幕起累计早约 1.8s。
+    """
+    def shot(sid, text):
+        return {
+            "shot_id": sid,
+            "shot_kind": "video",
+            "duration_seconds": 6,
+            "audio_prompt": {"dialogue": [{"text": text, "speaker_id": "narrator"}]},
+        }
+
+    plan = {
+        "scenes": [
+            {
+                "id": "sc01",
+                "description": "x",
+                "start_seconds": 0,
+                "end_seconds": 12,
+                "shots": [shot("a", "第一句"), shot("b", "第二句")],
+            },
+            {
+                "id": "sc02",
+                "description": "y",
+                "start_seconds": 12,
+                "end_seconds": 18,
+                "shots": [shot("c", "第三句")],
+            },
+        ],
+    }
+    manifest = {"items": [
+        {"id": "a_video", "kind": "video", "path": "/nonexistent/a.mp4",
+         "shot_id": "a", "duration_seconds": 6.59},
+        # b 既没记实测、文件也不存在 → probe 得 0，退回计划 6.0
+        {"id": "b_video", "kind": "video", "path": "/nonexistent/b.mp4", "shot_id": "b"},
+        {"id": "c_video", "kind": "video", "path": "/nonexistent/c.mp4",
+         "shot_id": "c", "duration_seconds": 7.5},
+    ]}
+    built = build_compose_plan(plan, asset_manifest=manifest)
+    shots = built["compose_plan"]["shots"]
+    assert shots[0]["duration_seconds"] == 6.59
+    assert shots[1]["duration_seconds"] == 6.0
+    assert shots[0]["subtitle_cues"][0]["start_seconds"] == 0.0
+    assert shots[0]["subtitle_cues"][0]["end_seconds"] == 6.59
+    assert abs(shots[1]["subtitle_cues"][0]["start_seconds"] - 6.59) < 1e-6
+    # 场起点也要按实测顺延：sc01 实际 6.59+6.0=12.59，sc02 不能还从计划的 12.0 开始
+    assert abs(shots[2]["subtitle_cues"][0]["start_seconds"] - 12.59) < 1e-6
+    assert any("实测时长" in f["message"] for f in built["findings"])
+
+
 def test_graphic_kind_degrades_with_finding():
     plan = {
         "scenes": [{
@@ -197,6 +249,66 @@ def test_realize_rewrites_cuts_without_overwrite(tmp_path):
     lut = resolve_lut_file("luts/dark-moody")
     assert lut.endswith(".cube")
     assert Path(lut).exists()
+
+
+def test_realize_ken_burns_uses_target_size_not_1080p(tmp_path):
+    """target_size 优先：静图镜按成片画布出片，不默认 1920x1080。"""
+    from montage.tools.compose_planner import realize_ken_burns
+
+    img = tmp_path / "still.png"
+    img.write_bytes(b"png")
+    plan = {"shots": [{
+        "shot_id": "a", "clip_path": str(img), "duration_seconds": 5,
+        "effects": [{"operation": "ken_burns"}],
+    }]}
+    decisions = {"cuts": [{"shot_id": "a", "clip_path": str(img)}]}
+    seen: dict = {}
+
+    def fake_kb(src, dest, dur, **kw):
+        seen.update(kw)
+        Path(dest).write_bytes(b"v")
+        return dest
+
+    _, _, realized = realize_ken_burns(
+        plan, decisions, out_dir=tmp_path / "kb", ken_burns_fn=fake_kb,
+        target_size=(1080, 1920),
+    )
+    assert realized == ["a"]
+    assert (seen.get("width"), seen.get("height")) == (1080, 1920)
+
+
+def test_realize_uses_proposal_output_profile_size(tmp_path):
+    """realize 从 proposal_packet.output_profile 推成片画布，而非硬编码横屏。"""
+    proj = tmp_path / "p"
+    (proj / "artifacts").mkdir(parents=True)
+    img = tmp_path / "still.png"
+    img.write_bytes(b"png")
+    store = ArtifactStore(proj)
+    store.write("proposal_packet", {"output_profile": "douyin_vertical"})
+    store.write("compose_plan", {
+        "version": "1",
+        "render_runtime": "ffmpeg",
+        "shots": [{
+            "shot_id": "a", "clip_path": str(img), "duration_seconds": 4,
+            "effects": [{"operation": "ken_burns"}], "transition": "cut",
+        }],
+    })
+    store.write("edit_decisions", {
+        "cuts": [{"shot_id": "a", "clip_path": str(img), "transition": "cut"}],
+        "render_runtime": "ffmpeg",
+    })
+    seen: dict = {}
+
+    def fake_kb(src, dest, dur, **kw):
+        seen.update(kw)
+        Path(dest).write_bytes(b"v")
+        return dest
+
+    result = ComposePlanner(ken_burns_fn=fake_kb).execute({
+        "project_dir": str(proj), "realize": True,
+    })
+    assert result.success, result.error
+    assert (seen.get("width"), seen.get("height")) == (1080, 1920)
 
 
 def test_realize_skips_video_clips(tmp_path):

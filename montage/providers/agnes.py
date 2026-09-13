@@ -1,9 +1,10 @@
 """agnes — Agnes 多模态适配器（图 / 视频；无独立 TTS）。
 
 图片：POST {base}/images/generations
-  - 文生 agnes-image-2.1-flash（必填 size 档位 + ratio）
-  - 编辑/参考 agnes-image-2.0-flash；参考图放 extra_body.image
-  - response_format 只放 extra_body；要进视频必须拿公网 url
+  - 单模型 agnes-image-2.5-flash：文生 / 编辑 / 多图合成一个模型全覆盖
+  - 顶层只放 model/prompt/size/ratio/return_base64/extra_body；
+    response_format 只放 extra_body（禁顶层、禁 tags）；要进视频必须拿公网 url
+  - 参考图支持公共 URL 或 Data URI Base64（本地图经 pack_agnes_image 装箱）
 
 视频：POST {base}/videos，再 GET {origin}/agnesapi?video_id=
   - 默认 agnes-video-2.5-flash（中国站）：seconds 为字符串 "4"–"12"；mode 互斥；
@@ -32,17 +33,24 @@ from montage.toolbase import BaseTool, ToolResult, ToolRuntime, ToolStatus
 _DEFAULT_BASE = "https://apihub.agnes-ai.com/v1"
 _CN_BASE = "https://api.agnes-ai.cn/v1"
 
-_T2I_MODEL = "agnes-image-2.1-flash"
-_EDIT_MODEL = "agnes-image-2.0-flash"
+_T2I_MODEL = "agnes-image-2.5-flash"
 _VIDEO_MODEL = "agnes-video-2.5-flash"
 _VIDEO_MODEL_V20 = "agnes-video-v2.0"
 _VIDEO_MODEL_V25 = "agnes-video-2.5-flash"
 _MAX_REF_IMAGES = 5
+_MAX_REF_AUDIOS = 3  # Flash 文档：audios length must not exceed 3，超出 400
 _PROMPT_MAX = 3000
 
 _SIZE_TIERS = ["1K", "2K", "3K", "4K"]
 _RATIOS = ["1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9"]
 _V25_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
+
+# 公开只读集合，供 shot_runner 校验 AGNES_RATIO（禁止跨模块引 _RATIOS 私有名）。
+AGNES_IMAGE_RATIOS = frozenset(_RATIOS)
+AGNES_VIDEO_RATIOS = frozenset(_V25_RATIOS)
+# 2.0 已退役，此表仅服务 AGNES_VIDEO_MODEL=agnes-video-v2.0 回滚路径。
+# 2.5 Flash 不要复用：720P 实测 16:9=1280x704（上下黑边）、9:16=720x1280，
+# 见 capabilities.AGNES_V25_VIDEO_SIZES；compose/report 一律以 ffprobe 实测为准。
 _V20_WH = {
     "21:9": (1680, 720),
     "16:9": (1280, 720),
@@ -101,6 +109,47 @@ def _download(url: str, output_path: str) -> str:
     with urllib.request.urlopen(req, timeout=120) as resp:  # noqa: S310
         path.write_bytes(resp.read())
     return str(path)
+
+
+_AGNES_IMAGE_SUFFIXES = {
+    ".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png", ".webp": "webp",
+    ".bmp": "bmp", ".gif": "gif",
+}
+
+
+def pack_agnes_image(entries: list[str]) -> tuple[list[str], list[str]]:
+    """参考图装箱：https/http URL 原样直传，本地图读字节转 Data URI。
+
+    官方 extra_body.image 接受公共 URL 或 data:image/<fmt>;base64,...。
+    返回 (packed, errors)；errors 非空即硬失败——纯文生会丢人物一致性，
+    禁止静默降级（与 pack_seedream_image 同语义；官方未给单图字节上限，
+    不做压缩、不造假限制）。重复项去重保序，URL 排前由调用方保证。
+    """
+    packed: list[str] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for raw in entries or []:
+        item = str(raw or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        if item.startswith(("http://", "https://", "data:image/")):
+            packed.append(item)
+            continue
+        path = Path(item)
+        if not path.is_file():
+            errors.append(f"参考图本地文件不存在：{item}")
+            continue
+        suffix = path.suffix.lower()
+        fmt = _AGNES_IMAGE_SUFFIXES.get(suffix)
+        if not fmt:
+            errors.append(
+                f"参考图后缀 {suffix or '(无)'} 不受支持（支持 jpeg/png/webp/bmp/gif）：{item}"
+            )
+            continue
+        data = path.read_bytes()
+        packed.append(f"data:image/{fmt};base64," + base64.b64encode(data).decode("ascii"))
+    return packed, errors
 
 
 def _clip_prompt(prompt: str, *, fallback: bool = False) -> tuple[str, str]:
@@ -182,15 +231,29 @@ def parse_video_result(resp: Any) -> str | None:
     return None
 
 
-def _http_urls(values: Any) -> list[str]:
+def _http_urls_report(values: Any) -> tuple[list[str], list[str]]:
+    """拆出公网 http(s) URL 与被丢弃的原始值。
+
+    Agnes 只接受公网 URL；本地路径 / Data URI 静默丢弃会让参考图变少、
+    ``<Picture N>`` 编号错位，故调用方须把 dropped 转成 warning/finding。
+    """
     if isinstance(values, str):
         values = [values]
-    out: list[str] = []
+    urls: list[str] = []
+    dropped: list[str] = []
     for item in values or []:
         text = str(item or "").strip()
+        if not text:
+            continue
         if text.startswith(("http://", "https://")):
-            out.append(text)
-    return out
+            urls.append(text)
+        else:
+            dropped.append(text)
+    return urls, dropped
+
+
+def _http_urls(values: Any) -> list[str]:
+    return _http_urls_report(values)[0]
 
 
 def attach_reference_placeholders(
@@ -242,11 +305,12 @@ class AgnesImage(BaseTool):
     """文本/参考图 → 图片。操作：text_to_image / image_edit / image_reference。
 
     n 是空壳（多候选请逐次调用）。图片不传 negative_prompt。
-    RPM：免费档 1K=20 / 2K=10 / 3K=1 / 4K=1。size 必填（默认 2K）。
+    免费期：输出与参考图均计 $0（estimate_cost 报 0，预算门禁安全旁路）。
+    size 用档位（默认 2K）；2.0 时代的精确尺寸/resolution 已随旧模型废弃。
     """
 
     name = "agnes_image"
-    version = "0.2.0"
+    version = "0.3.0"
     capability = "image_generation"
     provider = "agnes"
     runtime = ToolRuntime.API
@@ -264,7 +328,15 @@ class AgnesImage(BaseTool):
             "reference_urls": {"type": "array", "items": {"type": "string"}},
             "size": {"type": "string", "enum": _SIZE_TIERS, "default": "2K"},
             "ratio": {"type": "string", "enum": _RATIOS},
-            "resolution": {"type": "string", "description": "2.0 精确分辨率，如 1024x768"},
+            "return_base64": {
+                "type": "boolean",
+                "description": "文生图以 Base64 返回（顶层 return_base64）",
+            },
+            "response_format": {
+                "type": "string",
+                "enum": ["url", "b64_json"],
+                "description": "编辑/合成输出格式（进 extra_body.response_format）",
+            },
             "model": {"type": "string"},
             "output_path": {"type": "string"},
         },
@@ -276,8 +348,9 @@ class AgnesImage(BaseTool):
         ) else ToolStatus.NEEDS_CONFIG
 
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
-        size = inputs.get("size", "2K")
-        return {"1K": 0.01, "2K": 0.02, "3K": 0.03, "4K": 0.04}.get(size, 0.02)
+        # 2.5 免费期实价 $0；Token Plan 是订阅配额、非按次计价，配额走 agnes_usage，
+        # 不计入 usd。预算门禁对 0 成本安全旁路（runtime.py 只累计非 0 估算）。
+        return 0.0
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         try:
@@ -291,30 +364,48 @@ class AgnesImage(BaseTool):
             return ToolResult(success=False, error="'prompt' 必填")
 
         is_edit = operation in ("image_edit", "image_reference")
-        model = inputs.get("model") or (_EDIT_MODEL if is_edit else _T2I_MODEL)
+        model = inputs.get("model") or _T2I_MODEL
+        warnings: list[str] = []
+        # 顶层只放 model/prompt/size/ratio/return_base64/extra_body；
+        # response_format 只进 extra_body（官方禁顶层、图生图禁 tags）。
         payload: dict[str, Any] = {"model": model, "prompt": prompt}
-        extra: dict[str, Any] = {"response_format": "url"}
+        extra: dict[str, Any] = {}
         if is_edit:
             refs = inputs.get("reference_urls")
             if not refs:
                 return ToolResult(success=False, error=f"{operation} 需要 reference_urls")
-            extra["image"] = refs
-            if inputs.get("resolution"):
-                payload["size"] = inputs["resolution"]
-            else:
-                payload["size"] = inputs.get("size") or "1024x768"
+            packed, errors = pack_agnes_image(list(refs))
+            if errors:
+                return ToolResult(success=False, error="；".join(errors))
+            if not packed:
+                return ToolResult(success=False, error=f"{operation} 参考图装箱后为空")
+            extra["image"] = packed
+            response_format = str(inputs.get("response_format") or "url")
+            extra["response_format"] = response_format
+            if response_format != "url":
+                warnings.append(
+                    "response_format 非 url：输出可能无公网 URL，不能直接作为视频首帧/参考图"
+                )
         else:
-            payload["size"] = inputs.get("size") or "2K"
-            if inputs.get("ratio"):
-                payload["ratio"] = inputs["ratio"]
-            if inputs.get("resolution"):
-                payload["resolution"] = inputs["resolution"]
-        payload["extra_body"] = extra
+            if inputs.get("return_base64"):
+                payload["return_base64"] = True
+                warnings.append(
+                    "return_base64：输出无公网 URL，不能直接作为视频首帧/参考图"
+                )
+            else:
+                extra["response_format"] = "url"
+        # size 档位三种操作统一；ratio 全操作透传（官方默认 1:1）
+        payload["size"] = inputs.get("size") or "2K"
+        if inputs.get("ratio"):
+            payload["ratio"] = inputs["ratio"]
+        if extra:
+            payload["extra_body"] = extra
 
         try:
             data = post_json(f"{base}/images/generations", payload, headers=_headers(), timeout=300)
         except HttpError as exc:
-            return ToolResult(success=False, error=str(exc))
+            # 透传状态码供上层 429 退避（字符串匹配不可靠）
+            return ToolResult(success=False, error=str(exc), meta={"http_status": exc.status})
 
         items = (data or {}).get("data") or []
         if not items:
@@ -330,8 +421,18 @@ class AgnesImage(BaseTool):
                 return ToolResult(success=False, error=f"下载图片失败: {exc}")
         return ToolResult(
             success=True,
-            data={"url": url, "local_path": local, "model": model, "operation": operation},
-            meta={"provider": "agnes", "model": model},
+            data={
+                "url": url,
+                "local_path": local,
+                "model": model,
+                "operation": operation,
+                "revised_prompt": first.get("revised_prompt"),
+            },
+            meta={
+                "provider": "agnes",
+                "model": model,
+                **({"warnings": warnings} if warnings else {}),
+            },
             cost_usd=self.estimate_cost(inputs),
         )
 
@@ -372,13 +473,8 @@ class AgnesVideo(BaseTool):
         return ToolStatus.AVAILABLE if any(os.environ.get(k) for k in self.env_keys) else ToolStatus.NEEDS_CONFIG
 
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
-        model = resolve_video_model(inputs.get("model"))
-        sec = float(inputs.get("seconds") or inputs.get("duration") or 5)
-        if _is_v25(model):
-            sec = max(4, min(12, int(round(sec))))
-            # 刊例 ¥0.15/s；Flash 现价促销 ¥0。预算门禁禁止报 0。
-            return round(sec * 0.021, 4)
-        return 0.2
+        # 2.5 免费期实价 $0（图/视频同策略）；配额走 agnes_usage，不计入 usd。
+        return 0.0
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         try:
@@ -394,23 +490,30 @@ class AgnesVideo(BaseTool):
             return ToolResult(success=False, error=err, data={"prompt_too_long": True})
         if not prompt:
             return ToolResult(success=False, error="'prompt' 必填")
-        payload = (
-            _payload_v25(inputs, model, prompt)
-            if _is_v25(model)
-            else _payload_v20(inputs, model, prompt)
-        )
+        warnings: list[str] = []
+        if _is_v25(model):
+            payload, warnings = _payload_v25(inputs, model, prompt)
+        else:
+            payload = _payload_v20(inputs, model, prompt)
         headers = _headers()
         try:
             created = post_json(f"{base}/videos", payload, headers=headers, timeout=600)
         except HttpError as exc:
-            return ToolResult(success=False, error=str(exc))
+            # 透传状态码供上层 429 退避（字符串匹配不可靠）
+            return ToolResult(success=False, error=str(exc), meta={"http_status": exc.status})
         if not isinstance(created, dict):
             return ToolResult(success=False, error=f"创建任务响应异常: {str(created)[:300]}")
         fail = video_error(created)
         if fail:
             return ToolResult(success=False, error=fail)
         url = parse_video_result(created)
-        video_id = str(created.get("video_id") or created.get("id") or created.get("task_id") or "")
+        created_id = str(created.get("video_id") or "")
+        if not created_id:
+            fallback_id = str(created.get("id") or created.get("task_id") or "")
+            if fallback_id:
+                warnings.append("创建响应缺 video_id，已回退 id/task_id 轮询（官方查询键为 video_id）")
+            created_id = fallback_id
+        video_id = created_id
         if not url:
             if not video_id:
                 return ToolResult(success=False, error=f"响应无 video_id: {str(created)[:300]}")
@@ -431,10 +534,13 @@ class AgnesVideo(BaseTool):
                 local = _download(url, str(out))
             except (OSError, urllib.error.URLError) as exc:
                 return ToolResult(success=False, error=f"下载视频失败: {exc}")
+        meta: dict[str, Any] = {"provider": "agnes", "model": model}
+        if warnings:
+            meta["warnings"] = warnings
         return ToolResult(
             success=True,
             data={"url": url, "local_path": local, "model": model, "id": video_id},
-            meta={"provider": "agnes", "model": model},
+            meta=meta,
             cost_usd=self.estimate_cost(inputs),
         )
 
@@ -480,16 +586,52 @@ def _payload_v20(inputs: dict[str, Any], model: str, prompt: str) -> dict[str, A
     return payload
 
 
-def _payload_v25(inputs: dict[str, Any], model: str, prompt: str) -> dict[str, Any]:
+def _payload_v25(
+    inputs: dict[str, Any], model: str, prompt: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """构造 2.5 Flash 载荷；返回 (payload, warnings)。纯函数无 findings 通道，
+    截断等降级说明经 warnings 由 AgnesVideo.execute 并入 ToolResult.meta。"""
+    warnings: list[str] = []
     seconds = float(inputs.get("seconds") or inputs.get("duration") or 5)
     seconds_i = max(4, min(12, int(round(seconds))))
     ratio = str(inputs.get("aspect_ratio") or inputs.get("ratio") or "16:9")
     if ratio not in _V25_RATIOS:
         ratio = "16:9"
-    first = str(inputs.get("first_frame") or inputs.get("image_url") or inputs.get("image") or "")
+    first = str(
+        inputs.get("first_frame")
+        or inputs.get("first_frame_url")
+        or inputs.get("image_url")
+        or inputs.get("image")
+        or ""
+    )
     last = str(inputs.get("last_frame") or inputs.get("last_frame_url") or "")
-    images = _http_urls(inputs.get("images") or inputs.get("image_urls"))[:_MAX_REF_IMAGES]
-    audios = _http_urls(inputs.get("audios"))
+    if first and not first.startswith("http"):
+        warnings.append("首帧非公网 http(s) URL，已忽略（Agnes 无法访问本地文件）")
+        first = ""
+    if last and not last.startswith("http"):
+        warnings.append("尾帧非公网 http(s) URL，已忽略（尾帧链须先上传拿 URL）")
+        last = ""
+    raw_images, dropped_images = _http_urls_report(
+        inputs.get("images") or inputs.get("image_urls")
+    )
+    if dropped_images:
+        warnings.append(
+            f"{len(dropped_images)} 张参考图非公网 http(s) URL，已丢弃"
+            f"（首项：{dropped_images[0][:60]}）"
+        )
+    if len(raw_images) > _MAX_REF_IMAGES:
+        warnings.append(
+            f"参考图超过上限 {_MAX_REF_IMAGES}，已截断保留前 {_MAX_REF_IMAGES} 张"
+        )
+    images = raw_images[:_MAX_REF_IMAGES]
+    raw_audios, dropped_audios = _http_urls_report(inputs.get("audios"))
+    if dropped_audios:
+        warnings.append(f"{len(dropped_audios)} 段音频参考非公网 http(s) URL，已丢弃")
+    if len(raw_audios) > _MAX_REF_AUDIOS:
+        warnings.append(
+            f"audio 参考超过上限 {_MAX_REF_AUDIOS}，已截断保留前 {_MAX_REF_AUDIOS} 段"
+        )
+    audios = raw_audios[:_MAX_REF_AUDIOS]
     # Flash 不支持 videos[]。有参考图/音频才走 reference，丢掉 first/last。
     if audios or images:
         mode = "reference"
@@ -505,10 +647,14 @@ def _payload_v25(inputs: dict[str, Any], model: str, prompt: str) -> dict[str, A
         "prompt": prompt,
         "mode": mode,
         "seconds": str(seconds_i),
+        # 720P 是 Flash 硬限；实测 16:9 输出 1280x704（非 1280x720），
+        # 不要据此推缩放/letterbox，实际像素以 ffprobe 为准。
         "size": "720P",
-        "aspect_ratio": ratio,
         "n": 1,
     }
+    if mode != "keyframe":
+        # keyframe 由首帧决定构图/画幅，别叠一个可能冲突的 aspect_ratio。
+        payload["aspect_ratio"] = ratio
     raw_seed = inputs.get("seed")
     if raw_seed not in (None, ""):
         try:
@@ -525,7 +671,7 @@ def _payload_v25(inputs: dict[str, Any], model: str, prompt: str) -> dict[str, A
             payload["images"] = images
         if audios:
             payload["audios"] = audios
-    return payload
+    return payload, warnings
 
 
 def _poll_video(

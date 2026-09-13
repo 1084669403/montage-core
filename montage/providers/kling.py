@@ -682,7 +682,7 @@ def _open_video_payload(api_id: str, inputs: dict[str, Any], prompt: str) -> tup
         surface = "feature"
         if duration > 10:
             raise ValueError("成片 11–15s 不能 feature")
-        prompt = f"shot 1, {duration}, {prompt};"
+        prompt = f"镜头 1, {duration}, {prompt};"
     elif video_url:
         surface = "base"
     audio = _resolve_audio(inputs, surface=surface)
@@ -818,16 +818,32 @@ def _image_omni_payload(inputs: dict[str, Any], prompt: str) -> dict[str, Any]:
 
 
 def _asset_field(resp: dict[str, Any] | None, key: str) -> str:
+    """从响应里定向取 `key`，兼容扁平与嵌套（dict/list）两种形状。
+
+    官方主体/音色查询把 id 放在 `data.task_result.elements[0].element_id`
+    （或 `voices[0].voice_id`）—— 数组元素内；旧 mock / 部分接口则是扁平的
+    `data.element_id`。此处定向递归（命中即返回），两者皆可。
+    """
     if not isinstance(resp, dict):
         return ""
-    data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
-    blob = resp.get("task_result") if isinstance(resp.get("task_result"), dict) else {}
-    nested = data.get("task_result") if isinstance(data.get("task_result"), dict) else {}
-    for src in (data, blob, nested, resp):
-        val = src.get(key)
-        if val is not None and str(val).strip() != "":
-            return str(val)
-    return ""
+
+    def _find(node: Any) -> str:
+        if isinstance(node, dict):
+            val = node.get(key)
+            if val is not None and str(val).strip() != "":
+                return str(val)
+            for value in node.values():
+                found = _find(value)
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for item in node:
+                found = _find(item)
+                if found:
+                    return found
+        return ""
+
+    return _find(resp)
 
 
 def kling_create_element(

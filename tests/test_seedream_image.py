@@ -332,10 +332,33 @@ def test_inputs_image_providers_wins():
     assert resolve_allowed_providers(pol, {"image_providers": ["ark"]}, capability="image_generation") == ["ark"]
 
 
-def test_huapi_packet_has_image_providers():
-    pol = load_loop_policy("projects/huapi_liaozhai")
-    assert pol.get("image_providers") == ["ark"]
-    assert pol.get("video_loop") == "kling"
+def test_loop_policy_reads_image_providers_and_video_loop(tmp_path):
+    """image_providers/video_loop 从 proposal_packet 读出。
+
+    hermetic：``projects/`` 是 gitignore 的本地产物，不能当测试夹具。旧写法直接
+    断言 ``projects/huapi_liaozhai`` 是 ark+kling，本机把该项目改走 Agnes 后必挂。
+    """
+    arts = tmp_path / "artifacts"
+    arts.mkdir()
+    (arts / "proposal_packet.json").write_text(
+        json.dumps({
+            "image_providers": ["ark"],
+            "video_loop": "seedance",
+            "budget_ceiling_usd": 30,
+        }),
+        encoding="utf-8",
+    )
+    pol = load_loop_policy(str(tmp_path))
+    assert pol["image_providers"] == ["ark"]
+    assert pol["video_loop"] == "seedance"
+    assert pol["allowed_providers"] == ["ark"]  # seedance 归一到 ark
+    assert pol["budget_ceiling_usd"] == 30.0
+
+
+def test_loop_policy_missing_packet_returns_defaults(tmp_path):
+    pol = load_loop_policy(str(tmp_path))
+    assert pol.get("video_loop") is None
+    assert pol.get("image_providers") is None
 
 
 # ---- prompt_probe 五段式 ----

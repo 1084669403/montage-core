@@ -166,6 +166,9 @@ def _bag(proj: Path, *, events=None, fail_at=None, overlay_fail=False):
         order.append("export")
         if fail_at == "export":
             return ToolResult(success=False, error="export boom")
+        # cleanup_temps 必须排在 export 之前，否则 assemble 的整片中间件会被打进交付包。
+        if (Path(inputs["project_dir"]) / "renders" / "final.joined.mp4").exists():
+            order.append("export_saw_leftover")
         dest = Path(inputs["output_dir"])
         dest.mkdir(parents=True, exist_ok=True)
         zpath = dest / "film.zip"
@@ -208,6 +211,7 @@ def test_order_soundtrack_before_compose(tmp_path):
     assert result["progress"]["next"]["argv"] == []
     assert order[:3] == ["soundtrack", "compose_plan", "place_audio"]
     assert "assemble" in order and "export" in order
+    assert "export_saw_leftover" not in order
     assert tools["ffmpeg_compose"].calls[0]["music_path"] == str(bgm)
     assert tools["compose_planner"].calls[0].get("overwrite") is True
     assert not (proj / "scratch").exists()
@@ -215,6 +219,25 @@ def test_order_soundtrack_before_compose(tmp_path):
     assert (proj / "renders" / "final.mp4").is_file()
     assert (proj / "exports" / "film.zip").is_file()
     assert "成片" in (proj / "REVIEW.md").read_text(encoding="utf-8")
+
+
+def test_prune_exports_threads_keep_exports(tmp_path):
+    """produce --prune-exports N → export_bundle 收到 keep_exports=N。"""
+    proj = _seed_project(tmp_path)
+    tools, _order, _bgm = _bag(proj)
+    result = _run(proj, tools, prune_exports=3)
+    assert result["success"], result.get("error")
+    calls = tools["export_bundle"].calls
+    assert calls and calls[0].get("keep_exports") == 3
+
+
+def test_prune_exports_default_omits_keep_exports(tmp_path):
+    """默认不传 keep_exports：export_bundle 走「只增不删」。"""
+    proj = _seed_project(tmp_path)
+    tools, _order, _bgm = _bag(proj)
+    result = _run(proj, tools)
+    assert result["success"], result.get("error")
+    assert "keep_exports" not in tools["export_bundle"].calls[0]
 
 
 def test_season_concat_ignored_on_flat(tmp_path):
@@ -416,3 +439,21 @@ def test_corrupt_progress_fails(tmp_path):
     assert not result["success"]
     assert "损坏" in (result["error"] or "")
     assert order == []
+
+
+def test_normalize_manifest_paths_dedupes_items(tmp_path):
+    from montage.engine._produce_common import _normalize_manifest_paths
+
+    manifest = {
+        "items": [
+            {"id": "sh01_video", "path": "a.mp4"},
+            {"id": "sh01_video", "path": "b.mp4"},
+            {"id": "sh01_first", "path": "c.png"},
+        ]
+    }
+    out = _normalize_manifest_paths(tmp_path, manifest)
+    # 重复 id 合并为一条，取最后一次；顺序按首次出现。
+    assert [it["id"] for it in out["items"]] == ["sh01_video", "sh01_first"]
+    assert out["items"][0]["path"] == "b.mp4"
+    # 原 manifest 不被就地改动。
+    assert [it["path"] for it in manifest["items"]] == ["a.mp4", "b.mp4", "c.png"]
