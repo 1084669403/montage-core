@@ -15,11 +15,17 @@
 from __future__ import annotations
 
 import re
-import subprocess
 from pathlib import Path
 from typing import Any
 
-from montage.compose.ffmpeg_engine import ComposError, check_ffmpeg, probe
+from montage.compose.ffmpeg_engine import (
+    ComposError,
+    check_ffmpeg,
+    font_filter_path,
+    probe,
+    resolve_font_file,
+    run_ffmpeg,
+)
 
 _ASPECTS: dict[str, tuple[int, int]] = {
     "9:16": (1080, 1920),
@@ -57,6 +63,26 @@ def sanitize_drawtext(text: str) -> str:
         .replace("'", "\\'")
         .replace(",", "\\,")
     )
+
+
+def font_param(fontfile: str | None = None) -> str:
+    """drawtext 的 ``fontfile=...:`` 片段。
+
+    不给 fontfile 时解析资产库/系统字体；都没有则抛可读错误——否则 ffmpeg
+    会退到 fontconfig，在没配 config 的机器（尤其 Windows）上直接失败，
+    片头被静默跳过。
+
+    值不加引号、按 filtergraph 规则双重转义（与 lut3d 的 ``file=`` 一致）：
+    ``fontfile='C\\\\:/...'`` 这种"带引号 + 双转义"会被解析成字面 ``\\\\``，
+    ffmpeg 报 "No option name near '/Windows/Fonts/...'"。
+    """
+    resolved = resolve_font_file(fontfile)
+    if resolved is None:
+        raise ComposError(
+            "找不到可用字体：请跑 python assets/scripts/fetch_assets.py --fonts，"
+            "或显式传 fontfile="
+        )
+    return f"fontfile={font_filter_path(resolved)}:"
 
 
 def _even(value: Any, default: int) -> int:
@@ -127,10 +153,8 @@ def _ffmpeg() -> str:
 
 
 def _run(cmd: list[str], timeout: int = 1800) -> None:
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)  # noqa: S603
-    if proc.returncode != 0:
-        tail = proc.stderr[-800:] if proc.stderr else ""
-        raise ComposError(f"FFmpeg 失败(exit {proc.returncode}): {tail}")
+    """向后兼容入口：测试常 patch 本名断言命令；实现委托共享执行器。"""
+    run_ffmpeg(cmd, timeout=timeout)
 
 
 def _out_dir(output: Path) -> None:
@@ -342,7 +366,7 @@ def showcase_card(
     if title:
         safe = sanitize_drawtext(title)
         if safe:
-            font = f"fontfile='{fontfile}':" if fontfile else ""
+            font = font_param(fontfile)
             vf += (
                 f",drawtext={font}text='{safe}':x=(w-text_w)/2:y=h-text_h-{int(height*0.06)}:"
                 f"fontsize={int(height*0.035)}:fontcolor=white:borderw=2:bordercolor=black"
@@ -374,11 +398,11 @@ def detect_silence(
 ) -> list[tuple[float, float]]:
     """检测静音区间（silencedetect 分析），返回 [(start, end), ...]。"""
     ff = _ffmpeg()
-    proc = subprocess.run(  # noqa: S603
+    proc = run_ffmpeg(
         [ff, "-hide_banner", "-i", str(input_path),
          "-af", f"silencedetect=noise={threshold_db:.1f}dB:d={min_duration:.2f}",
          "-f", "null", "-"],
-        capture_output=True, text=True, timeout=600,
+        timeout=600, check=False,
     )
     starts: list[float] = []
     ends: list[float] = []
@@ -557,7 +581,7 @@ def title_card(
         raise ComposError("空标题，跳过片头")
     dur = max(0.1, float(duration or 2.0))
     lay = _media_layout(input_path)
-    font = f"fontfile='{fontfile}':" if fontfile else ""
+    font = font_param(fontfile)
     vf = (
         f"drawtext={font}text='{safe}':x=(w-text_w)/2:y=(h-text_h)/2:"
         f"fontsize={max(24, int(lay['height'] * 0.08))}:"
@@ -597,7 +621,7 @@ def lower_third(
     dur = max(0.1, float(duration or 4.0))
     end = start + dur
     lay = _media_layout(input_path)
-    font = f"fontfile='{fontfile}':" if fontfile else ""
+    font = font_param(fontfile)
     enable = f"between(t\\,{start:.3f}\\,{end:.3f})"
     vf = (
         f"drawtext={font}text='{safe}':x={max(24, int(lay['width'] * 0.04))}:"

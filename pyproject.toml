@@ -22,3 +22,6 @@ include = ["montage*", "lib*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "ffmpeg: 需要本机真实 ffmpeg 的冒烟测试（无 ffmpeg 时 skip）",
+]

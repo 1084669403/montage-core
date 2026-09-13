@@ -138,6 +138,38 @@ def test_showcase_card_escaping(monkeypatch, tmp_path):
     assert "a\\:b\\,c" in cmd  # 冒号/逗号转义
 
 
+# ---------------------------------------------------------------------------
+# drawtext 字体解析（fontconfig 兜底）
+# ---------------------------------------------------------------------------
+
+def test_resolve_font_file_prefers_explicit(tmp_path):
+    f = tmp_path / "m y.ttf"
+    f.write_bytes(b"x")
+    assert fe.resolve_font_file(f) == f
+
+
+def test_font_param_double_escapes_windows_colon():
+    """fontfile 值不加引号、双重转义：带引号+双转义会被解析成字面 \\\\。"""
+    found = fe.resolve_font_file()
+    if found is None:
+        pytest.skip("本机既无资产库字体也无系统字体")
+    frag = effects.font_param()
+    assert frag.startswith("fontfile=")
+    assert frag.endswith(":")
+    assert "'" not in frag and '"' not in frag
+    if ":" in found.as_posix():
+        assert "\\\\:" in frag
+
+
+def test_font_param_errors_when_no_font(monkeypatch):
+    monkeypatch.setattr(fe, "_SYSTEM_FONT_CANDIDATES", ())
+    if fe.resolve_font_file() is not None:
+        pytest.skip("资产库里有可用字体，无法构造缺字体场景")
+    with pytest.raises(fe.ComposError) as exc:
+        effects.font_param()
+    assert "字体" in str(exc.value)
+
+
 def _layout_probe(_path):
     return {
         "streams": [
@@ -213,13 +245,13 @@ def test_detect_silence_parses(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(effects, "_ffmpeg", lambda: "ffmpeg")
 
-    def fake_run(cmd, capture_output=True, text=True, timeout=600):
+    def fake_run(cmd, timeout=600, check=False, error_prefix="FFmpeg 失败"):
         import subprocess
         proc = subprocess.CompletedProcess(cmd, 0)
         proc.stderr = stderr
         return proc
 
-    monkeypatch.setattr(effects.subprocess, "run", fake_run)
+    monkeypatch.setattr(effects, "run_ffmpeg", fake_run)
     ranges = effects.detect_silence(tmp_path / "a.mp4")
     assert ranges == [(1.5, 3.2)]
 
@@ -295,12 +327,14 @@ def test_auto_reframe_bad_target(tmp_path):
 def test_acrossfade_chain_build():
     clips = [Path("a.mp4"), Path("b.mp4"), Path("c.mp4")]
     transitions = [{"transition": "crossfade", "transition_duration": 0.5},
-                   {"transition": "cut"}]
+                   {"transition": "fade_black", "transition_duration": 1.0}]
     fc, out = fe._acrossfade_chain(clips, transitions)
-    assert "aresample=48000:cl=stereo" in fc
+    assert "aformat=sample_rates=48000:channel_layouts=stereo" in fc
     assert "acrossfade=d=0.500" in fc
-    assert "acrossfade=d=0.050" in fc  # cut 近似
+    assert "acrossfade=d=1.000" in fc
     assert out == "[a2]"
+    # aresample 的 cl= 在 ffmpeg 9 报 Option not found，统一走 aformat
+    assert "cl=stereo" not in fc
 
 
 def test_stitch_with_transitions_audio(monkeypatch, tmp_path):
@@ -327,7 +361,9 @@ def test_stitch_with_transitions_no_audio(monkeypatch, tmp_path):
     monkeypatch.setattr(fe, "_run", lambda cmd, timeout=1800: captured.append(cmd))
     monkeypatch.setattr(fe, "probe", lambda p: {"format": {"duration": 5.0}})
     monkeypatch.setattr(fe, "_clip_has_audio", lambda p: False)
-    fe.stitch_with_transitions([a, b], [{"transition": "cut"}], tmp_path / "o.mp4")
+    fe.stitch_with_transitions(
+        [a, b], [{"transition": "crossfade", "transition_duration": 0.5}], tmp_path / "o.mp4"
+    )
     cmd = " ".join(captured[0])
     assert "acrossfade" not in cmd
     assert "-an" in cmd
@@ -357,7 +393,7 @@ def test_stitch_mixed_audio_pads_silent_track(monkeypatch, tmp_path):
     monkeypatch.setattr(fe, "_run", lambda cmd, timeout=1800: captured.append(cmd))
     monkeypatch.setattr(fe, "probe", lambda p: {"format": {"duration": 5.0}})
     fe.stitch_with_transitions(
-        [a, b], [{"transition": "cut"}], tmp_path / "o.mp4",
+        [a, b], [{"transition": "crossfade", "transition_duration": 0.5}], tmp_path / "o.mp4",
     )
     cmd = " ".join(captured[0])
     assert "acrossfade" in cmd

@@ -18,7 +18,21 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from montage.compose.ffmpeg_compat import (
+    capabilities_snapshot,
+    ffmpeg_version,
+    supports,
+)
 from montage.toolbase import BaseTool, ToolResult, ToolRuntime, ToolStatus
+
+
+class ComposError(RuntimeError):
+    """合成错误（可读信息）。"""
+
+
+# 超时口径（全仓唯一来源）：ffprobe 探测是本地的、秒级；渲染/滤镜链可能很久。
+FFPROBE_TIMEOUT = 60
+FFMPEG_TIMEOUT = 1800
 
 
 def check_ffmpeg() -> str | None:
@@ -27,6 +41,30 @@ def check_ffmpeg() -> str | None:
 
 def check_ffprobe() -> str | None:
     return shutil.which("ffprobe")
+
+
+def run_ffmpeg(
+    cmd: list[str],
+    timeout: int = FFMPEG_TIMEOUT,
+    *,
+    check: bool = True,
+    error_prefix: str = "FFmpeg 失败",
+) -> subprocess.CompletedProcess:
+    """共享执行器：所有 ffmpeg/ffprobe 子进程都经此，避免"修一处漏一处"。
+
+    ``check=True`` 失败抛 ``ComposError``（附 stderr 尾部）；``check=False``
+    返回原始 ``CompletedProcess`` 供调用方自行解析（probe / silencedetect）。
+    """
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)  # noqa: S603
+    if check and proc.returncode != 0:
+        tail = proc.stderr[-800:] if proc.stderr else ""
+        raise ComposError(f"{error_prefix}(exit {proc.returncode}): {tail}")
+    return proc
+
+
+def _run(cmd: list[str], timeout: int = FFMPEG_TIMEOUT) -> None:
+    """向后兼容入口：测试常 patch 本名断言命令；实现委托 ``run_ffmpeg``。"""
+    run_ffmpeg(cmd, timeout=timeout)
 
 
 def probe(path: str | Path) -> dict[str, Any]:
@@ -41,7 +79,9 @@ def probe(path: str | Path) -> dict[str, Any]:
         "sample_rate,channels,channel_layout,r_frame_rate",
         str(path),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)  # noqa: S603
+    proc = run_ffmpeg(
+        cmd, timeout=FFPROBE_TIMEOUT, check=False, error_prefix="ffprobe 失败",
+    )
     if proc.returncode != 0:
         raise ComposError(f"ffprobe 失败: {proc.stderr[:300]}")
     try:
@@ -50,25 +90,65 @@ def probe(path: str | Path) -> dict[str, Any]:
         raise ComposError(f"ffprobe 输出无法解析: {proc.stdout[:200]}") from exc
 
 
-class ComposError(RuntimeError):
-    """合成错误（可读信息）。"""
-
-
-def _run(cmd: list[str], timeout: int = 1800) -> None:
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)  # noqa: S603
-    if proc.returncode != 0:
-        tail = proc.stderr[-800:] if proc.stderr else ""
-        raise ComposError(f"FFmpeg 失败(exit {proc.returncode}): {tail}")
-
-
 def concat_file_line(path: str | Path) -> str:
     """concat demuxer 一行：单引号包裹，内部 ' 写成 '\\''。"""
     posix = Path(path).resolve().as_posix().replace("'", r"'\''")
     return f"file '{posix}'"
 
 
-def concat_videos(clips: list[Path], output: Path, *, timeout: int = 1800) -> Path:
-    """按顺序拼接片段。输出统一 H.264 + AAC。"""
+def _stream_size(info: dict[str, Any]) -> tuple[int, int] | None:
+    for stream in info.get("streams") or []:
+        if stream.get("codec_type") != "video":
+            continue
+        try:
+            width = int(stream.get("width") or 0)
+            height = int(stream.get("height") or 0)
+        except (TypeError, ValueError):
+            continue
+        if width > 0 and height > 0:
+            return (width, height)
+    return None
+
+
+def probe_size(path: str | Path) -> tuple[int, int] | None:
+    """探测画面尺寸；失败返回 None（调用方自行兜底，禁止默认 1280x720）。"""
+    if not path or not Path(path).exists():
+        return None
+    try:
+        info = probe(Path(path))
+    except ComposError:
+        return None
+    return _stream_size(info)
+
+
+def _first_video_size(clips: list[Path]) -> tuple[int, int] | None:
+    """取第一个可探测片段的画面尺寸（偶数），作为重编码拼接的目标画布。
+
+    ``concat_videos`` 的回退重编码原来硬编码 ``1920x1080``：竖屏项目一旦走到
+    这条路径，整片会被 letterbox 成横屏。这里按实际片段推导；**全部探测失败
+    返回 None**（由调用方决定用 profile 推导的兜底尺寸还是直接报错），不再
+    静默回落横屏。
+    """
+    for clip in clips:
+        size = probe_size(clip)
+        if size:
+            width, height = size
+            return (width - width % 2, height - height % 2)
+    return None
+
+
+def concat_videos(
+    clips: list[Path],
+    output: Path,
+    *,
+    timeout: int = 1800,
+    fallback_size: tuple[int, int] | None = None,
+) -> Path:
+    """按顺序拼接片段。输出统一 H.264 + AAC。
+
+    ``fallback_size``：所有片段都探测不到尺寸时的兜底画布（应由调用方按
+    output_profile 推导）。不传则直接报错，避免静默 letterbox 竖屏项目。
+    """
     if len(clips) == 0:
         raise ComposError("concat 需要至少一个片段")
     ffmpeg = check_ffmpeg()
@@ -94,9 +174,16 @@ def concat_videos(clips: list[Path], output: Path, *, timeout: int = 1800) -> Pa
     try:
         _run(cmd_copy, timeout=timeout)
     except ComposError:
+        size = _first_video_size(clips) or fallback_size
+        if size is None:
+            raise ComposError(
+                "concat 回退重编码无法确定画布尺寸（所有片段探测失败），"
+                "请传 fallback_size（按 output_profile 推导）"
+            )
+        size_w, size_h = size
         cmd_reencode = [
             ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+            "-vf", f"scale={size_w}:{size_h}:force_original_aspect_ratio=decrease,pad={size_w}:{size_h}:(ow-iw)/2:(oh-ih)/2",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output),
         ]
@@ -181,6 +268,29 @@ def burn_subtitles(input_path: Path, srt_path: Path, output: Path) -> Path:
     return output
 
 
+def filter_path(path: Path) -> str:
+    """把磁盘路径转成 filtergraph 里安全的内联值。
+
+    filtergraph 解析器与滤镜选项各吃一层转义，所以字面量的冒号/空格需要写
+    成**双重**反斜杠（``\\\\:`` / ``\\\\ ``）才能在 ffmpeg 侧还原成一个字符。
+    Windows 盘符（``D:\\...``）不双重转义会报 "No option name near ..."。
+    统一用正斜杠，避免反斜杠在 filtergraph 里被当成转义符。
+    """
+    posix = path.resolve().as_posix()
+    return posix.replace("\\", "\\\\").replace(":", "\\\\:").replace(" ", "\\\\ ")
+
+
+def lut3d_filter(lut_path: Path, interp: str = "tetrahedral") -> str:
+    """构造 lut3d 滤镜片段。
+
+    选项名由 ``ffmpeg_compat.supports("lut3d_file")`` 决定：现代 ffmpeg 用
+    ``file``（vf_lut3d.c 自 2.4 起即如此），写 ``filename=`` 会得到
+    "Option not found"；极老版本才回落到 ``filename``。
+    """
+    option = "file" if supports("lut3d_file") else "filename"
+    return f"lut3d={option}={filter_path(lut_path)}:interp={interp}"
+
+
 def apply_lut(
     input_path: Path,
     lut_path: Path,
@@ -206,12 +316,11 @@ def apply_lut(
     if not lut_path.exists():
         raise ComposError(f"LUT 文件不存在: {lut_path}")
     output.parent.mkdir(parents=True, exist_ok=True)
-    # ffmpeg filter 内路径转义：Windows 盘符冒号 -> \: ，反斜杠 -> 正斜杠
-    lut_posix = lut_path.resolve().as_posix().replace(":", "\\:")
+    lut_filter = lut3d_filter(lut_path, interp)
     strength = max(0.0, min(1.0, float(strength)))
 
     if strength >= 1.0:
-        vf = f"lut3d=filename={lut_posix}:interp={interp}"
+        vf = lut_filter
         cmd = [
             ffmpeg, "-y", "-i", str(input_path),
             "-vf", vf,
@@ -221,7 +330,7 @@ def apply_lut(
         ]
     else:
         fc = (
-            f"[0:v]lut3d=filename={lut_posix}:interp={interp}[g];"
+            f"[0:v]{lut_filter}[g];"
             f"[g][0:v]blend=all_mode=normal:all_opacity={strength:.2f}[v]"
         )
         cmd = [
@@ -340,6 +449,9 @@ def _force_cut(cut: dict[str, Any]) -> dict[str, Any]:
 # 剪辑转场名 → ffmpeg xfade transition 值。
 # zoom_punch / blur 无直接对应，第一版以短叠化近似（需 zoompan 的冲击感属后续增强）。
 _XFADE_TRANSITIONS = {
+    # "cut" 仅作哨兵值保留：TRANSITION_NAMES 用它当公开白名单（StylePack /
+    # AutoEditor 消费），删键会改公开 API。ffmpeg 的 xfade **没有** cut
+    # transition，真实拼接由 stitch_with_transitions 拆成 concat 完成。
     "cut": "cut",
     "crossfade": "fade",
     "dissolve": "fade",
@@ -379,6 +491,17 @@ def _normalize_transition(cut: dict[str, Any]) -> tuple[str, float]:
     if tname == "cut" or tdur <= 0:
         return "cut", 0.0
     return tname, tdur
+
+
+def needs_transition_at(cut: dict[str, Any]) -> bool:
+    """该切点是否真的需要 xfade 转场。
+
+    ``cut`` 与零时长一律按硬切（False）；只有非 cut 且时长 >0 才需要转场。
+    装配端据此在 ``concat_videos`` 与 ``stitch_with_transitions`` 之间选择，
+    避免给 cut 切点误判转场。
+    """
+    tname, _tdur = _normalize_transition(cut)
+    return tname != "cut"
 
 
 def _clip_duration(path: Path) -> float:
@@ -424,22 +547,39 @@ def _clip_has_audio(path: Path) -> bool:
 def _acrossfade_chain(clips: list[Path], transitions: list[dict[str, Any]]) -> tuple[str, str]:
     """构造音频 acrossfade 链，返回 (filter_text, 输出标签)。
 
-    所有输入统一 aresample=48000 stereo 后 acrossfade 串联；
-    cut 转场用 d=0.05 近似硬切（acrossfade 要求 d>0）。
+    所有输入先统一采样率/声道再 acrossfade 串联。
+    本函数只服务 ``_xfade_stitch``，调用方已保证链上没有 cut 转场
+    （cut 由 ``stitch_with_transitions`` 拆成 concat，不用 acrossfade 近似）。
     """
-    parts = ["[0:a]aresample=48000:cl=stereo[ar0]"]
+    norm = _audio_norm_filter()
+    parts = [f"[0:a]{norm}[ar0]"]
     prev = "ar0"
     for i in range(1, len(clips)):
-        tname, tdur = _normalize_transition(transitions[i - 1] if i - 1 < len(transitions) else {})
-        dur = max(0.05, tdur) if tname != "cut" else 0.05
-        parts.append(
-            f"[{prev}][{i}:a]aresample=48000:cl=stereo,acrossfade=d={dur:.3f}[a{i}]"
-        )
+        _tname, tdur = _normalize_transition(transitions[i - 1] if i - 1 < len(transitions) else {})
+        dur = max(0.05, tdur)
+        # 每条输入必须先各自 norm，再接 acrossfade：aformat 只吃 1 路输入，
+        # 写成 ``[prev][i:a]{norm},acrossfade`` 会得到
+        # "More input link labels specified for filter 'aformat' than it has inputs"。
+        parts.append(f"[{i}:a]{norm}[ar{i}]")
+        parts.append(f"[{prev}][ar{i}]acrossfade=d={dur:.3f}[a{i}]")
         prev = f"a{i}"
     return ";".join(parts), f"[a{len(clips) - 1}]"
 
 
-def stitch_with_transitions(
+def _audio_norm_filter() -> str:
+    """统一到 48kHz 立体声。
+
+    经 ``ffmpeg_compat.supports("aformat")`` 选择：aformat 的
+    ``channel_layouts`` 最稳定；仅在探测不到时回落 aresample 的 ``ochl``。
+    此前写 ``aresample=48000:cl=stereo`` 会得到 "Error applying option 'cl'
+    to filter 'aresample': Option not found"。
+    """
+    if supports("aformat"):
+        return "aformat=sample_rates=48000:channel_layouts=stereo"
+    return "aresample=48000:ochl=stereo"
+
+
+def _xfade_stitch(
     clips: list[Path],
     transitions: list[dict[str, Any]],
     output: Path,
@@ -447,20 +587,12 @@ def stitch_with_transitions(
     keep_audio: bool = True,
     timeout: int = 1800,
 ) -> Path:
-    """按转场定义用 xfade 链拼接视频片段（音频 acrossfade 同步）。
+    """把一段**全部为非 cut 转场**的片段用一条 xfade 链拼起来。
 
-    - ``clips``: 按顺序的片段；``transitions``: 长度 = len(clips)-1，
-      ``transitions[j]`` 描述 clips[j] → clips[j+1] 的转场
-      （对应 edit_decisions.cuts[j+1] 的 transition 字段）。
-    - 转场名见 ``_XFADE_TRANSITIONS``；cut 为瞬时切换（无重叠），
-      非 cut 且时长 >0 时两片段重叠（负空隙），时长即转场时长。
-    - ``keep_audio=True``（默认）：所有片段有音轨时输出带音频
-      （acrossfade 链，转场处声音同步交叉淡化）；任一片段无音轨则降级为
-      无声视频轨（assemble 会接 mix_audio 叠加旁白/配乐）。
-    - 输出 H.264（crf 18）。
+    cut 转场不能交给 xfade：ffmpeg 没有 ``transition=cut``，会报
+    "const_values array too small for transition" / "Not yet implemented in
+    FFmpeg"。调用方需先把 cut 处拆开。
     """
-    if len(clips) < 2:
-        raise ComposError("stitch 需要至少 2 个片段")
     ffmpeg = check_ffmpeg()
     if not ffmpeg:
         raise ComposError("缺少 ffmpeg")
@@ -490,13 +622,13 @@ def stitch_with_transitions(
     for i in range(1, len(clips)):
         tname, tdur = _normalize_transition(transitions[i - 1] if i - 1 < len(transitions) else {})
         xf = _XFADE_TRANSITIONS.get(tname, "fade")
+        if xf == "cut" and not supports("xfade_cut"):
+            # 调用方已把 cut 拆成 concat；此处仅防御，绝不把 transition=cut
+            # 发给 ffmpeg（9.x 会直接失败）。
+            xf = "fade"
         cum_dur += durations[i - 1]
-        if tname == "cut":
-            offset = cum_dur  # 无重叠：硬切
-            dur = 0.05  # cut 瞬时切换，duration 仅为占位
-        else:
-            offset = cum_dur - tdur  # 负空隙：两片段重叠 tdur 秒
-            dur = tdur
+        offset = cum_dur - tdur  # 负空隙：两片段重叠 tdur 秒
+        dur = tdur
         fc.append(
             f"{prev_label}[{i}:v]xfade=transition={xf}:duration={dur:.3f}:offset={offset:.3f}[x{i}]"
         )
@@ -504,8 +636,6 @@ def stitch_with_transitions(
     filter_complex = ";".join(fc)
 
     audio_ok = keep_audio and all(_clip_has_audio(c) for c in clips)
-    if keep_audio and not audio_ok:
-        pass
 
     if audio_ok:
         afc, aout = _acrossfade_chain(clips, transitions)
@@ -529,6 +659,69 @@ def stitch_with_transitions(
     return output
 
 
+def stitch_with_transitions(
+    clips: list[Path],
+    transitions: list[dict[str, Any]],
+    output: Path,
+    *,
+    keep_audio: bool = True,
+    timeout: int = 1800,
+) -> Path:
+    """按转场定义拼接片段：非 cut 用 xfade，cut 用真硬切（concat）。
+
+    - ``clips``: 按顺序的片段；``transitions``: 长度 = len(clips)-1，
+      ``transitions[j]`` 描述 clips[j] → clips[j+1] 的转场
+      （对应 edit_decisions.cuts[j+1] 的 transition 字段）。
+    - 转场名见 ``_XFADE_TRANSITIONS``；非 cut 且时长 >0 时两片段重叠
+      （负空隙），时长即转场时长；cut 与时长 <=0 一律按硬切处理。
+    - 实现上先按 cut 把片段切成若干"连续转场段"，段内用 ``_xfade_stitch``
+      走 xfade 链，段间用 ``concat_videos`` 真硬拼。xfade 没有 ``cut``
+      这个 transition，早期版本对 cut 仍发 ``transition=cut`` 导致整片渲染
+      直接失败；也不能用 ``d=0.05`` 的淡入淡出近似——那既不是硬切，还会
+      让每一处 cut 都吃掉 0.05s 造成时间轴漂移。
+    - ``keep_audio=True``（默认）：所有片段有音轨时输出带音频
+      （段内 acrossfade 交叉淡化，段间 concat 硬接）；任一片段无音轨则
+      降级为无声视频轨（assemble 会接 mix_audio 叠加旁白/配乐）。
+    - 输出 H.264（crf 18）；纯硬切时 concat 会优先尝试流拷贝。
+    """
+    if len(clips) < 2:
+        raise ComposError("stitch 需要至少 2 个片段")
+    if not check_ffmpeg():
+        raise ComposError("缺少 ffmpeg")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    # 按 cut 切段：段内保留转场，段间硬切。
+    runs: list[tuple[list[Path], list[dict[str, Any]]]] = [([clips[0]], [])]
+    for i in range(1, len(clips)):
+        raw = transitions[i - 1] if i - 1 < len(transitions) else {}
+        tname, _tdur = _normalize_transition(raw)
+        if tname == "cut":
+            runs.append(([clips[i]], []))
+        else:
+            run_clips, run_trans = runs[-1]
+            runs[-1] = (run_clips + [clips[i]], run_trans + [raw])
+
+    if len(runs) == 1:
+        return _xfade_stitch(
+            runs[0][0], runs[0][1], output, keep_audio=keep_audio, timeout=timeout,
+        )
+
+    work = output.parent / f"{output.stem}.trans"
+    work.mkdir(parents=True, exist_ok=True)
+    parts: list[Path] = []
+    for idx, (run_clips, run_trans) in enumerate(runs):
+        if len(run_clips) == 1:
+            parts.append(run_clips[0])
+            continue
+        dest = work / f"run{idx:02d}.mp4"
+        _xfade_stitch(
+            run_clips, run_trans, dest, keep_audio=keep_audio, timeout=timeout,
+        )
+        parts.append(dest)
+    concat_videos(parts, output, timeout=timeout)
+    return output
+
+
 def ken_burns(
     image_path: Path,
     output: Path,
@@ -549,6 +742,9 @@ def ken_burns(
 
     - ``zoom``: in（推近 1.0→1.25）/ out（拉远 1.25→1.0）/ none。
     - ``pan``: center / left（右→左）/ right（左→右）/ up / down。
+    - ``width``/``height``：输出画布。默认 1920x1080 只是直调兜底；compose 管线
+      （``compose_planner.realize_ken_burns``）按 output_profile 或源图实测传入，
+      不假设横屏 1080p。
     - 输出 H.264（crf 18）yuv420p；``audio_path`` 可选叠加环境音/背景音。
     """
     ffmpeg = check_ffmpeg()
@@ -632,6 +828,63 @@ def resolve_lut_file(lut_id: str | Path | None) -> Path | None:
     except (OSError, TypeError, ValueError):
         pass
     return None
+
+
+_FONT_EXTS = (".ttf", ".otf", ".ttc")
+
+# 平台系统字体兜底：drawtext 不给 fontfile 时依赖 fontconfig，Windows 上
+# 常直接报 "Fontconfig error: Cannot load default config file" 而没有片头。
+_SYSTEM_FONT_CANDIDATES = (
+    "C:/Windows/Fonts/msyh.ttc",          # 微软雅黑（简体中文）
+    "C:/Windows/Fonts/msyhbd.ttc",
+    "C:/Windows/Fonts/simhei.ttf",        # 黑体
+    "C:/Windows/Fonts/simsun.ttc",        # 宋体
+    "C:/Windows/Fonts/Deng.ttf",          # 等线
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
+
+
+def resolve_font_file(fontfile: str | Path | None = None) -> Path | None:
+    """字体解析：显式路径 → 资产库 ``fonts`` → 平台系统字体 → None。
+
+    ``None`` 表示找不到任何可用字体，调用方应给出可读错误而不是让 ffmpeg
+    去撞 fontconfig（``assets/scripts/fetch_assets.py --fonts`` 可补齐资产库字体）。
+    """
+    raw = str(fontfile or "").strip()
+    if raw:
+        p = Path(raw)
+        if p.is_file():
+            return p
+    try:
+        from lib.asset_catalog import get_catalog
+
+        cat = get_catalog()
+        for hit in cat.by_category("fonts"):
+            if not hit.get("available"):
+                continue
+            cand = cat.root / str(hit.get("file") or "")
+            if cand.suffix.lower() in _FONT_EXTS and cand.is_file():
+                return cand
+    except (OSError, TypeError, ValueError):
+        pass
+    for cand in _SYSTEM_FONT_CANDIDATES:
+        p = Path(cand)
+        if p.is_file():
+            return p
+    return None
+
+
+def font_filter_path(fontfile: Path) -> str:
+    """drawtext ``fontfile=`` 的值：filtergraph 内需要双重转义（同 LUT）。
+
+    保留成独立名字是为了让 drawtext 的调用点自解释；实现与 ``filter_path`` 相同。
+    """
+    return filter_path(fontfile)
 
 
 def _media_duration(path: Path | None) -> float:
@@ -921,6 +1174,8 @@ class FFmpegCompose(BaseTool):
             "start_seconds": {"type": "number", "description": "lower_third 起始秒（片头结束后）"},
             "card_width": {"type": "integer", "default": 1080},
             "card_height": {"type": "integer", "default": 1920},
+            "width": {"type": "integer", "description": "ken_burns 输出宽（缺省 1920；compose 管线按 output_profile 或源图实测传）"},
+            "height": {"type": "integer", "description": "ken_burns 输出高（缺省 1080；compose 管线按 output_profile 或源图实测传）"},
             "fontfile": {"type": "string", "description": "showcase_card 标题字体文件路径（可选）"},
             "silence_threshold_db": {"type": "number", "default": -35.0},
             "silence_min_duration": {"type": "number", "default": 0.5},
@@ -1069,6 +1324,7 @@ class FFmpegCompose(BaseTool):
                 zoom=inputs.get("zoom", "in"),
                 pan=inputs.get("pan", "center"),
                 audio_path=Path(inputs["audio_path"]) if inputs.get("audio_path") else None,
+                **{k: int(inputs[k]) for k in ("width", "height") if inputs.get(k)},
             )
             return ToolResult(success=True, data={"output": str(out), "mode": "ken_burns", **probe(out)})
 
@@ -1285,11 +1541,9 @@ class FFmpegCompose(BaseTool):
         out_dir = Path(inputs.get("output_path") or "renders/final.mp4")
         out_dir.parent.mkdir(parents=True, exist_ok=True)
         joined = out_dir.with_suffix(".joined.mp4")
-        needs_transition = any(
-            ((c.get("transition_in") or c.get("transition") or "cut") != "cut")
-            or float(c.get("transition_duration") or c.get("negative_gap_seconds") or 0) > 0
-            for c in cuts
-        )
+        # cut 切点即便带着误写的 negative_gap 也只算硬切，避免整片走 xfade
+        # 后因 ffmpeg 没有 transition=cut 而直接失败。
+        needs_transition = any(needs_transition_at(c) for c in cuts)
         if needs_transition and len(clips) >= 2:
             # cuts[j] 的转场描述 cuts[j-1] → cuts[j]（stitch 内 transitions[j-1]=cuts[j]）
             stitch_with_transitions(clips, cuts, joined)
@@ -1323,16 +1577,51 @@ class FFmpegCompose(BaseTool):
                 duration = float(fmt.get("duration") or 0)
             except (TypeError, ValueError):
                 duration = 0.0
-        report = {
+        # 每镜实测尺寸：Agnes 720P 实为 1280x704、图片 2K 非 1920x1080，
+        # 落盘实际像素，下游不得按 1280x720/1920x1080 反推。
+        clip_rows: list[dict[str, Any]] = []
+        for cut, clip in zip(cuts, clips):
+            size = probe_size(clip)
+            clip_rows.append({
+                "shot_id": str(cut.get("shot_id") or cut.get("to_scene") or ""),
+                "scene_id": str(cut.get("scene_id") or ""),
+                "path": str(clip),
+                "width": size[0] if size else 0,
+                "height": size[1] if size else 0,
+            })
+        out_size = _stream_size(info) or (0, 0)
+        report: dict[str, Any] = {
             "output_path": str(final),
             "duration_seconds": duration,
             "encoding": "h264",
+            "width": out_size[0],
+            "height": out_size[1],
+            "clips": clip_rows,
+            "ffmpeg_version": ffmpeg_version(),
+            "ffmpeg_capabilities": capabilities_snapshot()["capabilities"],
         }
         proj = inputs.get("project_dir")
         if proj:
             from montage.engine.artifacts import ArtifactStore
 
-            ArtifactStore(proj).write("render_report", report)
+            store = ArtifactStore(proj)
+            # 每图实测尺寸：注册进 manifest 的定妆/首帧/场景/道具图。
+            image_rows: list[dict[str, Any]] = []
+            manifest = store.read("asset_manifest") or {}
+            for item in manifest.get("items") or []:
+                if not isinstance(item, dict) or str(item.get("kind") or "") != "image":
+                    continue
+                path = str(item.get("path") or "")
+                size = probe_size(path) if path else None
+                image_rows.append({
+                    "id": str(item.get("id") or ""),
+                    "shot_id": str(item.get("shot_id") or ""),
+                    "path": path,
+                    "width": size[0] if size else 0,
+                    "height": size[1] if size else 0,
+                })
+            report["images"] = image_rows
+            store.write("render_report", report)
         return ToolResult(
             success=True,
             data={

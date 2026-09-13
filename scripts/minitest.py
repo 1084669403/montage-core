@@ -28,6 +28,14 @@ sys.path.insert(0, str(ROOT))
 os.environ["MONTAGE_SKIP_DOTENV"] = "1"
 os.environ["MONTAGE_SKIP_PACING"] = "1"
 
+# 默认 runner 不再静默跳过真 ffmpeg 用例：本机有 ffmpeg 就开门。
+# 需要用 ``MONTAGE_REAL_FFMPEG=0`` 显式关闭（或 CI 无 ffmpeg 自然跳过）。
+if shutil.which("ffmpeg") and os.environ.get("MONTAGE_REAL_FFMPEG") is None:
+    os.environ["MONTAGE_REAL_FFMPEG"] = "1"
+
+# 被跳过的用例记录在此，main() 会打印而非静默计为通过。
+_SKIPPED: list[str] = []
+
 
 # ---------------------------------------------------------------------------
 # pytest 垫片
@@ -105,6 +113,29 @@ class _Skipped(Exception):
     """pytest.skip 垫片异常：测试跳过计为通过。"""
 
 
+class _Marker:
+    """未知 pytest marker 的恒等实现。
+
+    - ``@pytest.mark.ffmpeg`` → 直接返回原函数；
+    - ``@pytest.mark.ffmpeg(reason=...)`` → 返回恒等装饰器；
+    - ``@pytest.mark.parametrize(...)`` → 给函数打 ``_parametrized`` 标记，
+      ``_run_test`` 会跳过（minitest 无法枚举参数），而不是导入期崩溃。
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __call__(self, obj=None, *args, **kwargs):
+        if callable(obj) and not args and not kwargs:
+            return obj
+        if self.name == "parametrize":
+            def deco(fn):
+                fn._parametrized = True  # type: ignore[attr-defined]
+                return fn
+            return deco
+        return lambda f: f
+
+
 class _Mark:
     """pytest.mark 垫片：可直接装饰函数，也支持 .skipif（条件成立则跳过）。"""
 
@@ -112,6 +143,14 @@ class _Mark:
         if obj is None:
             return lambda f: f
         return obj
+
+    def __getattr__(self, name: str):
+        # minitest 不读 pyproject.toml 的 markers 注册；任何未知 marker
+        # （如 @pytest.mark.ffmpeg）都当恒等装饰器，避免导入期 AttributeError
+        # 让整个测试文件判失败（这才是"跑起来再跳过"）。
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return _Marker(name)
 
     @staticmethod
     def skipif(condition, reason: str = ""):
@@ -125,16 +164,55 @@ class _Mark:
         return deco
 
 
+class _ExcInfo:
+    """``pytest.raises(...) as exc`` 的垫片：支持读 ``exc.value``。"""
+
+    value: BaseException | None = None
+
+
+class _Approx:
+    """``pytest.approx`` 垫片（abs / rel 容差）。"""
+
+    def __init__(self, expected, abs=None, rel=None, nan_ok: bool = False):
+        self.expected = expected
+        self.abs = abs
+        self.rel = rel if rel is not None else 1e-6
+
+    def __eq__(self, other) -> bool:
+        try:
+            expected = float(self.expected)
+            actual = float(other)
+        except (TypeError, ValueError):
+            return NotImplemented
+        tol = self.abs if self.abs is not None else self.rel * max(abs(expected), 1.0)
+        if actual != actual and expected != expected:  # NaN
+            return True
+        return abs(actual - expected) <= tol
+
+    def __repr__(self) -> str:
+        return f"approx({self.expected!r})"
+
+
 class _PytestShim:
     """提供 pytest.raises / pytest.fixture / pytest.skip，让 pytest 风格测试直接可跑。"""
     mark = _Mark()
 
     @staticmethod
+    def approx(expected, abs=None, rel=None, nan_ok: bool = False) -> _Approx:
+        return _Approx(expected, abs=abs, rel=rel, nan_ok=nan_ok)
+
+    @staticmethod
+    def fail(reason: str = ""):
+        raise AssertionError(reason)
+
+    @staticmethod
     @contextlib.contextmanager
     def raises(exc_type, match: str | None = None):
+        info = _ExcInfo()
         try:
-            yield
+            yield info
         except exc_type as exc:  # noqa: PERF203
+            info.value = exc
             if match and not re.search(match, str(exc)):
                 raise AssertionError(
                     f"异常 {exc!r} 与正则 {match!r} 不匹配"
@@ -175,6 +253,9 @@ def _make_tmp_path(module_name: str, func_name: str) -> pathlib.Path:
 
 def _run_test(fn, module_name: str, fixtures: dict[str, object]) -> str | None:
     """运行单个测试函数，返回错误字符串（None=通过）。"""
+    if getattr(fn, "_parametrized", False):
+        _SKIPPED.append(f"{module_name}::{fn.__name__}: minitest 不支持 pytest.mark.parametrize")
+        return None
     mp = _MonkeyPatch()
     memo: dict[str, object] = {}
 
@@ -206,8 +287,9 @@ def _run_test(fn, module_name: str, fixtures: dict[str, object]) -> str | None:
             kwargs[pname] = resolve(pname)
         fn(**kwargs)
         return None
-    except _Skipped:
-        return None  # 跳过计为通过
+    except _Skipped as exc:
+        _SKIPPED.append(f"{module_name}::{fn.__name__}: {exc}")
+        return None  # 跳过不再静默计为通过，main() 会汇总打印
     except Exception as exc:  # noqa: BLE001
         return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     finally:
@@ -223,7 +305,9 @@ def discover_test_files(paths: list[str]) -> list[pathlib.Path]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    files = discover_test_files(list(argv or []))
+    if argv is None:
+        argv = sys.argv[1:]
+    files = discover_test_files(list(argv))
     passed = 0
     failed: list[tuple[str, str]] = []
     for file in files:
@@ -252,7 +336,10 @@ def main(argv: list[str] | None = None) -> int:
                     passed += 1
                 else:
                     failed.append((f"{file.name}::{name}", err))
-    print(f"\nminitest: {passed} passed, {len(failed)} failed, {len(files)} files")
+    print(f"\nminitest: {passed} passed, {len(_SKIPPED)} skipped, {len(failed)} failed, {len(files)} files")
+    if _SKIPPED:
+        for label in _SKIPPED:
+            print(f"  SKIP {label}")
     for label, err in failed:
         print(f"\n--- FAIL {label} ---")
         print(err)

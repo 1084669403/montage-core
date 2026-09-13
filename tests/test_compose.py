@@ -4,6 +4,7 @@
 （沙箱环境禁止子进程管道捕获，用户本机无此限制）。
 """
 
+import json
 import os
 
 import pytest
@@ -273,6 +274,47 @@ def test_assemble_writes_render_report(monkeypatch, tmp_path):
     assert result.data["render_report"]["output_path"]
 
 
+def test_assemble_render_report_records_measured_size(monkeypatch, tmp_path):
+    """render_report 落盘每镜/每图实测尺寸（不假设 1280x720/1920x1080）。"""
+    proj = tmp_path / "proj"
+    (proj / "artifacts").mkdir(parents=True)
+    clip = tmp_path / "c1.mp4"
+    clip.write_bytes(b"fake")
+    still = tmp_path / "p.png"
+    still.write_bytes(b"png")
+    (proj / "artifacts" / "asset_manifest.json").write_text(
+        json.dumps({"items": [{"id": "p1", "kind": "image", "path": str(still)}]}),
+        encoding="utf-8",
+    )
+
+    def fake_probe(p):
+        from pathlib import Path as _P
+
+        if _P(p).name == "p.png":
+            return {"streams": [{"codec_type": "video", "width": 2624, "height": 1472}]}
+        return {
+            "format": {"duration": "3.5"},
+            "streams": [{"codec_type": "video", "width": 1280, "height": 704}],
+        }
+
+    monkeypatch.setattr(fe, "concat_videos", lambda clips, out, **kw: out)
+    monkeypatch.setattr(fe, "mix_audio", lambda *a, **k: tmp_path / "final.mp4")
+    monkeypatch.setattr(fe, "probe", fake_probe)
+    (tmp_path / "final.mp4").write_bytes(b"out")
+    result = fe.FFmpegCompose().execute({
+        "operation": "assemble",
+        "project_dir": str(proj),
+        "edit_decisions": {"cuts": [{"clip_path": str(clip), "shot_id": "sc01_01"}]},
+        "output_path": str(tmp_path / "final.mp4"),
+    })
+    assert result.success
+    report = result.data["render_report"]
+    assert (report["width"], report["height"]) == (1280, 704)
+    assert report["clips"][0]["shot_id"] == "sc01_01"
+    assert (report["clips"][0]["width"], report["clips"][0]["height"]) == (1280, 704)
+    assert (report["images"][0]["width"], report["images"][0]["height"]) == (2624, 1472)
+
+
 def test_assemble_can_disable_ducking(monkeypatch, tmp_path):
     (tmp_path / "c1.mp4").write_bytes(b"fake")
     captured: dict = {}
@@ -327,6 +369,7 @@ def test_stitch_transitions_command(monkeypatch, tmp_path):
 
 
 def test_stitch_cut_no_overlap(monkeypatch, tmp_path):
+    """cut 走 concat 硬拼：xfade 没有 transition=cut，且不能用淡入淡出近似。"""
     a, b = tmp_path / "a.mp4", tmp_path / "b.mp4"
     for f in (a, b):
         f.write_bytes(b"fake")
@@ -334,9 +377,82 @@ def test_stitch_cut_no_overlap(monkeypatch, tmp_path):
     monkeypatch.setattr(fe, "_run", lambda cmd, timeout=1800: captured.append(cmd))
     monkeypatch.setattr(fe, "probe", lambda p: {"format": {"duration": 5.0}})
     fe.stitch_with_transitions([a, b], [{"transition": "cut"}], tmp_path / "out.mp4")
-    cmd = " ".join(captured[0])
-    assert "transition=cut" in cmd
-    assert "offset=5.000" in cmd  # 硬切无重叠
+    all_cmds = " ".join(c for cmd in captured for c in cmd)
+    assert "transition=cut" not in all_cmds
+    assert "xfade" not in all_cmds
+    # 走 concat demuxer
+    assert captured
+    assert "-f concat" in " ".join(captured[0])
+    listing = (tmp_path / "out.concat.txt").read_text(encoding="utf-8")
+    assert "a.mp4" in listing and "b.mp4" in listing
+
+
+def test_stitch_cut_with_stray_overlap_still_hard_cuts(monkeypatch, tmp_path):
+    """cut 上挂着 negative_gap_seconds 时仍按硬切，不再误判成转场。"""
+    a, b = tmp_path / "a.mp4", tmp_path / "b.mp4"
+    for f in (a, b):
+        f.write_bytes(b"fake")
+    captured: list[list[str]] = []
+    monkeypatch.setattr(fe, "_run", lambda cmd, timeout=1800: captured.append(cmd))
+    monkeypatch.setattr(fe, "probe", lambda p: {"format": {"duration": 5.0}})
+    fe.stitch_with_transitions(
+        [a, b], [{"transition": "cut", "negative_gap_seconds": 0.4}], tmp_path / "out.mp4"
+    )
+    all_cmds = " ".join(c for cmd in captured for c in cmd)
+    assert "xfade" not in all_cmds
+    assert "-f concat" in " ".join(captured[0])
+
+
+def test_stitch_mixed_cut_and_crossfade(monkeypatch, tmp_path):
+    """混合切点：段内 xfade、段间 concat，且绝不出现 transition=cut。"""
+    a, b, c = (tmp_path / f"{n}.mp4" for n in "abc")
+    for f in (a, b, c):
+        f.write_bytes(b"fake")
+    captured: list[list[str]] = []
+    monkeypatch.setattr(fe, "_run", lambda cmd, timeout=1800: captured.append(cmd))
+    monkeypatch.setattr(fe, "probe", lambda p: {"format": {"duration": 5.0}})
+    fe.stitch_with_transitions(
+        [a, b, c],
+        [{"transition": "cut"}, {"transition": "crossfade", "transition_duration": 0.5}],
+        tmp_path / "out.mp4",
+    )
+    joined = [" ".join(cmd) for cmd in captured]
+    assert not any("transition=cut" in j for j in joined)
+    xfades = [j for j in joined if "xfade" in j]
+    assert len(xfades) == 1
+    assert "xfade=transition=fade:duration=0.500:offset=4.500" in xfades[0]
+    assert any("-f concat" in j for j in joined)
+
+
+def test_needs_transition_at_rejects_cut_and_zero():
+    assert fe.needs_transition_at({"transition": "cut"}) is False
+    assert fe.needs_transition_at({"transition": "crossfade", "transition_duration": 0}) is False
+    assert fe.needs_transition_at({"transition": "cut", "negative_gap_seconds": 0.4}) is False
+    assert fe.needs_transition_at({"transition": "crossfade", "transition_duration": 0.5}) is True
+    assert fe.needs_transition_at({"transition": "fade_black", "negative_gap_seconds": 1.0}) is True
+
+
+def test_concat_reencode_fallback_keeps_clip_orientation(monkeypatch, tmp_path):
+    """回退重编码按片段实际尺寸建画布，不把竖屏硬拉成 1920x1080 横屏。"""
+    a, b = tmp_path / "a.mp4", tmp_path / "b.mp4"
+    for f in (a, b):
+        f.write_bytes(b"x")
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, timeout=1800):
+        captured.append(cmd)
+        if len(captured) == 1:  # 流拷贝失败 → 触发回退重编码
+            raise fe.ComposError("copy failed")
+
+    monkeypatch.setattr(fe, "_run", fake_run)
+    monkeypatch.setattr(fe, "probe", lambda p: {
+        "format": {"duration": 5.0},
+        "streams": [{"codec_type": "video", "width": 720, "height": 1280}],
+    })
+    fe.concat_videos([a, b], tmp_path / "o.mp4")
+    reencode = " ".join(captured[1])
+    assert "scale=720:1280" in reencode and "pad=720:1280" in reencode
+    assert "1920:1080" not in reencode
 
 
 def test_stitch_negative_gap_alias(monkeypatch, tmp_path):

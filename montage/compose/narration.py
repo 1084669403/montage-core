@@ -8,11 +8,16 @@
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 from typing import Any
 
-from montage.compose.ffmpeg_engine import ComposError, check_ffmpeg, concat_file_line, probe
+from montage.compose.ffmpeg_engine import (
+    ComposError,
+    check_ffmpeg,
+    concat_file_line,
+    probe,
+    run_ffmpeg,
+)
 
 _SILENCE_GAP_DEFAULT = 0.4
 
@@ -84,16 +89,15 @@ def assemble_narration(
         check_ffmpeg(), "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
         "-c", "copy", str(output),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)  # noqa: S603
-    if proc.returncode != 0:
+    try:
+        run_ffmpeg(cmd, timeout=1800)
+    except ComposError:
         # 参数不一致时回退重编码
         cmd = [
             check_ffmpeg(), "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
             "-c:a", "aac", "-b:a", "192k", str(output),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)  # noqa: S603
-    if proc.returncode != 0:
-        raise ComposError(f"配音装配失败: {proc.stderr[-500:]}")
+        run_ffmpeg(cmd, timeout=1800, error_prefix="配音装配失败")
     total = float((probe(output).get("format") or {}).get("duration", 0))
     return {"output": str(output), "timeline": timeline, "total_seconds": round(total, 3)}
 
@@ -104,6 +108,4 @@ def _run_silence(path: Path, seconds: float) -> None:
         check_ffmpeg(), "-y", "-f", "lavfi", "-i", f"anullsrc=r=24000:cl=stereo",
         "-t", f"{seconds:.2f}", "-c:a", "pcm_s16le", str(path),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)  # noqa: S603
-    if proc.returncode != 0:
-        raise ComposError(f"生成静音失败: {proc.stderr[-300:]}")
+    run_ffmpeg(cmd, timeout=120, error_prefix="生成静音失败")
