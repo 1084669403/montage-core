@@ -49,7 +49,9 @@ STYLE_PACKS: dict[str, dict[str, Any]] = {
         "id": "classic",
         "title": "古风",
         "pacing": {"min_hold": 3.5, "max_hold": 12.0, "transition_duration": 0.8},
-        "lut": "luts/warm-film",
+        # A4（2026-09-19 用户拍板）：去掉全局暖色 LUT——暖偏与本片
+        # "青灰底 + 蓝白魂光 + 暖金烛光"的色板冲突。需要时由用户显式指定。
+        "lut": "",
         "transitions": ["fade_black"],
         "bind_playbook": "chinese_elegance",
         "output_profile": "youtube_landscape",
@@ -79,6 +81,16 @@ STYLE_PACKS: dict[str, dict[str, Any]] = {
         "lut": "luts/cool-clean",
         "transitions": ["cut", "wipe"],
         "bind_playbook": "anime_shonen",
+        "output_profile": "youtube_landscape",
+    },
+    "anime_real": {
+        "id": "anime_real",
+        "title": "国漫真实风",
+        "pacing": {"min_hold": 3.0, "max_hold": 12.0, "transition_duration": 0.6},
+        # 用户 2026-09-19 指定：中国式动漫真实风；不要全局 LUT（暖偏与青灰冷调冲突）。
+        "lut": "",
+        "transitions": ["cut", "dissolve"],
+        "bind_playbook": "guochao_anime_real",
         "output_profile": "youtube_landscape",
     },
     "manga": {

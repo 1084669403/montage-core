@@ -16,6 +16,7 @@ from lib.shot_prompt_builder import (
     build_reference_image_prompt,
     build_shot_prompt_pair,
 )
+from montage.engine.prompt_contract import annotate_prompt_pair
 from montage.toolbase import BaseTool, ToolResult, ToolRuntime, ToolStatus
 
 _BOOL_KEYS = (
@@ -104,6 +105,71 @@ class VisualPromptBuilder(BaseTool):
             shot = inputs.get("shot")
             if not shot:
                 return ToolResult(success=False, error="purpose=shot 需要提供 shot")
+            # B2.5：在场清单里的道具/场景要用**中文名**渲染，不是 prop_xxx 这种 id。
+            # 角色名由 character_registry 提供；道具名从项目 script.props 读（只读、
+            # 缺项目或坏文件时静默回落 id —— 提示词质量降级但不报错）。
+            presence_names: dict[str, str] = {}
+            proj_dir = inputs.get("project_dir")
+            if proj_dir:
+                try:
+                    from montage.engine.artifacts import ArtifactStore
+
+                    store = ArtifactStore(proj_dir)
+                    script_doc = store.read("script") or {}
+                    bible_doc = store.read("series_bible") or {}
+                    for key in ("characters", "props", "locations"):
+                        for row in (script_doc.get(key) or []):
+                            if isinstance(row, dict) and row.get("id"):
+                                presence_names[str(row["id"])] = str(
+                                    row.get("name") or row["id"]
+                                )
+                        for row in (bible_doc.get(key) or []):
+                            if isinstance(row, dict) and row.get("id"):
+                                presence_names.setdefault(
+                                    str(row["id"]), str(row.get("name") or row["id"])
+                                )
+                    # 场景静物（灯笼/烛台这类布景道具）挂在 locations[].objects 上，
+                    # 名字也要能查，否则在场清单会写 prop_lantern 这种 id。
+                    for loc in (bible_doc.get("locations") or []):
+                        if not isinstance(loc, dict):
+                            continue
+                        for obj in loc.get("objects") or []:
+                            if isinstance(obj, dict) and obj.get("id"):
+                                presence_names.setdefault(
+                                    str(obj["id"]), str(obj.get("name") or obj["id"])
+                                )
+                except (OSError, ValueError, TypeError):
+                    presence_names = {}
+            if isinstance(inputs.get("presence_names"), dict):
+                presence_names.update(
+                    {str(k): str(v) for k, v in inputs["presence_names"].items()}
+                )
+            # 参考图图例要用中文名（"为turnaround_huan_niang…" 这种 id 会污染提示词）：
+            # 逐条把 name 补成角色/道具/地点的显示名。
+            raw_refs = inputs.get("refs")
+            if isinstance(raw_refs, list) and presence_names:
+                refs_named: list[Any] = []
+                for ref in raw_refs:
+                    if not isinstance(ref, dict):
+                        refs_named.append(ref)
+                        continue
+                    row = dict(ref)
+                    if not str(row.get("name") or "").strip():
+                        for key in ("character_id", "prop_id", "location_id", "id"):
+                            ident = str(row.get(key) or "").strip()
+                            if not ident:
+                                continue
+                            hit = presence_names.get(ident)
+                            if not hit and "_" in ident:
+                                # turnaround_huan_niang / prop_guqin → 去前缀再查
+                                hit = presence_names.get(ident.split("_", 1)[1])
+                            if hit:
+                                row["name"] = hit
+                                break
+                    refs_named.append(row)
+                kwargs_refs = refs_named
+            else:
+                kwargs_refs = inputs.get("refs")
             # 母带注入：显式 inputs 优先，否则从 style_context(playbook) 取
             master_pattern = inputs.get("master_pattern") or (
                 style_context.get("master_pattern") if isinstance(style_context, dict) else None
@@ -130,11 +196,17 @@ class VisualPromptBuilder(BaseTool):
                 "kling_prompt": bool(inputs.get("kling_prompt", False)),
                 "kling_cite": str(inputs.get("kling_cite") or "omni"),
                 "locations": inputs.get("locations"),
-                "refs": inputs.get("refs"),
+                "refs": kwargs_refs,
                 "master_prompt": str(master_prompt or "") or None,
                 "master_pattern": str(master_pattern or "") or None,
+                "presence_names": presence_names or None,
             }
             pair = build_shot_prompt_pair(**kwargs)
+            pair = annotate_prompt_pair(
+                shot,
+                pair,
+                registry=inputs.get("character_registry"),
+            )
             return ToolResult(
                 success=True,
                 data=pair,

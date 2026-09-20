@@ -309,7 +309,10 @@ def test_image_ref_legend_matches_sent_order():
     assert legend.startswith("【参考图角色】")
     assert "参考图1（<Picture 1>）为王生基础形象的定妆照" in legend
     assert "参考图2（<Picture 2>）为老宅的场景环境参考" in legend
-    assert "参考图3（<Picture 3>）为铜镜的道具参考" in legend
+    # 2026-09-19 用户拍板：道具参考也是四视图（同一件物品的四个角度），
+    # 图例必须显式说明"是同一件物品"，否则 I2V 会把四格当成多件道具。
+    assert "参考图3（<Picture 3>）为铜镜的**道具四视图**" in legend
+    assert "是同一件物品" in legend
     # url 项在前、path 兜底项在后；图例顺序与实发一致
     assert legend.index("王生") < legend.index("老宅") < legend.index("铜镜")
 

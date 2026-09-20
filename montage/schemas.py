@@ -162,6 +162,84 @@ AUDIO_PROMPT_SCHEMA: dict[str, Any] = {
                 "level": {"type": "string"},
             },
         },
+        "audio_ref": {
+            "type": "array",
+            "description": "音频参考（v8.2 P1-audio-ref）：喂 Agnes reference 模式 audios[]；"
+            "官方上限 3 段，节奏参考（BGM）优先于音色参考（人声）。条目可为公网 URL 或"
+            "本地路径/资产 id（URL 之外须仓库可解析）",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "资产 id（assets 音频表或 reference_assets）"},
+                    "url": {"type": "string", "description": "公网 http(s) URL，直传 audios"},
+                    "path": {"type": "string", "description": "本地路径（无上传器，先解 URL 才能发）"},
+                    "role": {
+                        "type": "string",
+                        "description": "rhythm=BGM 节奏参考 | timbre=人声音色参考；排序依据",
+                    },
+                },
+            },
+        },
+    },
+}
+
+# P0-8 特效条目（特效指导制定；prompt 层自由文本 / post 层受限枚举）。
+# 与 effects[] 的边界：effects = ken_burns 等结构化管线操作（compose_planner 生成），
+# vfx = 特效指导的观感特效（时间点事件；整镜常驻视觉状态写 visual_details）。
+VFX_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "layer": {
+            "type": "string",
+            "enum": ["prompt", "post"],
+            "description": "prompt=AI 生成画面内特效（写进提示词）；post=后期 ffmpeg 特效（impact_flash/zoom_punch/camera_shake）",
+        },
+        "kind": {
+            "type": "string",
+            "description": "prompt 层自由文本（剑气/粒子/能量…具体视觉语言）；post 层受限枚举 impact_flash|zoom_punch|camera_shake",
+        },
+        "onset": {
+            "type": "number",
+            "description": "镜内相对秒（0=镜头起点）；自审校验 onset ∈ [0, duration_seconds]；audio_prompt.sfx.onset 是 string 语义不同",
+        },
+        "duration": {"type": "number", "description": "特效持续秒数（post 层必填，如闪白 0.12）"},
+        "intensity": {"type": "number", "description": "强度 0-1（post 层生效；prompt 层作散文参考）"},
+        "note": {"type": "string", "description": "美术审风格用的一句话备注"},
+    },
+}
+
+# Phase 6/7 additive contracts.
+TRANSITION_CONTRACT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "decision": {
+            "type": "string",
+            "enum": [
+                "fade",
+                "xfade",
+                "match_cut",
+                "audio_bridge",
+                "shared_element",
+                "establishing_shot",
+                "user_accepted_hard_cut",
+            ],
+        },
+        "reason": {"type": "string", "description": "必须说明叙事/时空/视听理由"},
+        "accepted_by": {"type": "string"},
+        "evidence": {"type": "string"},
+    },
+}
+
+PROMPT_CONTRACT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "source": {"type": "string", "enum": ["derived", "explicit"]},
+        "required_characters": {"type": "array", "items": {"type": "string"}},
+        "required_outfits": {"type": "array", "items": {"type": "string"}},
+        "required_props": {"type": "array", "items": {"type": "string"}},
+        "required_locations": {"type": "array", "items": {"type": "string"}},
+        "forbidden_objects": {"type": "array", "items": {"type": "string"}},
+        "forbidden_text": {"type": "array", "items": {"type": "string"}},
     },
 }
 
@@ -174,8 +252,27 @@ NESTED_SHOT_SCHEMA: dict[str, Any] = {
         "shot_kind": {"type": "string", "enum": ["image", "video"]},
         "duration_seconds": {"type": "number"},
         "hero_moment": {"type": "boolean"},
+        "transition_contract": TRANSITION_CONTRACT_SCHEMA,
+        "prompt_contract": PROMPT_CONTRACT_SCHEMA,
+        "vfx": {
+            "type": "array",
+            "description": "P0-8 特效指导制定的观感特效（时间点事件；常驻视觉写 visual_details）；特效师制定、美术审风格",
+            "items": VFX_ITEM_SCHEMA,
+        },
         "visual_details": VISUAL_DETAILS_SCHEMA,
         "audio_prompt": AUDIO_PROMPT_SCHEMA,
+        "presence": {
+            "type": "object",
+            "description": (
+                "B2.5 逐镜在场清单：location{id,zone,time_of_day,light} / "
+                "characters[{id,zone,state,costume_state,enters,exits}] / "
+                "props[{id,holder,zone}] / empty_reason（空镜必填）"
+            ),
+        },
+        "continuity": {
+            "type": "object",
+            "description": "B2.5 承接表（编译器生成）：from_shot / must_keep / changed / missing",
+        },
         "reference_asset_ids": {"type": "array", "items": {"type": "string"}},
         "shot_language": {"type": "object"},
         "blocking": {
@@ -225,6 +322,20 @@ NESTED_SHOT_SCHEMA: dict[str, Any] = {
             "type": "string",
             "enum": ["edit", "extend", "splice", "regenerate", "feature"],
             "description": "P5/可灵：retry 时覆盖启发式；feature 仅 Omni 且 ≤10s；非法值回落 regenerate",
+        },
+        "agnes_mode": {
+            "type": "string",
+            "enum": ["text", "keyframe", "reference"],
+            "description": "per-shot 显式生成模式（v8.2 按需分配）；空=自动兜底。显式值最高优先，"
+            "运行时真源经 overlay_plan_rework 盖进 shot dict；keyframe 只认 first/last 各一帧",
+        },
+        "tail_frame_state": {
+            "type": "string",
+            "description": "尾帧状态意图（如 门开→门关 / 转场匹配）；非空触发 keyframe(first,last) 兜底",
+        },
+        "seed": {
+            "type": "integer",
+            "description": "显式种子锁定；仅导演显式声明才透传（重试不换种），自动路径仍 1000+attempt",
         },
         "revision_note": {"type": "string", "description": "P5：局部编辑一句修正"},
         "retake_segment": {
@@ -334,6 +445,25 @@ SCRIPT_SCHEMA: dict[str, Any] = {
                 "landing": {"type": "string"},
             },
         },
+        # 长片分章（v8.2 P0-0，可选）：四拍在章内起作用；短篇不声明走旧全局四拍。
+        # start_scene 是章首场景，从该场到下一章 start_scene 前的场都属于本章。
+        "chapters": {
+            "type": "array",
+            "description": "章节结构（长片主锚）：按日拆批次=章节粒度；章内四拍；"
+            "bgm_id 作章节默认曲（音乐锚降章节内辅助，显式 scene.bgm_id 仍最高优先）",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "章节 id，缺省 chNN 自动编号"},
+                    "title": {"type": "string", "description": "章标题"},
+                    "role": {"type": "string", "description": "章节作用一句话"},
+                    "hook": {"type": "string", "description": "章钩子"},
+                    "start_scene": {"type": "string", "description": "章首场景 id（归属锚）"},
+                    "bgm_id": {"type": "string", "description": "章节默认曲 id；无显式 scene.bgm_id 的场兜底"},
+                    "target_duration_seconds": {"type": "number", "description": "章节目标时长段（秒）"},
+                },
+            },
+        },
         "environment": ENVIRONMENT_SCHEMA,
         "props": {
             "type": "array",
@@ -379,6 +509,10 @@ SCENE_PLAN_SCHEMA: dict[str, Any] = {
                     "keyframe_blurb": {"type": "string"},
                     "type": {"type": "string"},
                     "narrative_role": {"type": "string"},
+                    "chapter_id": {
+                        "type": "string",
+                        "description": "所属章节 id（v8.2 P0-0；compile 从 bible.chapters 区间归属，四拍在章内重置）",
+                    },
                     "hero_moment": {"type": "boolean"},
                     "environment": ENVIRONMENT_SCHEMA,
                     "start_seconds": {"type": "number"},
@@ -416,6 +550,24 @@ SCENE_PLAN_SCHEMA: dict[str, Any] = {
                         "description": "嵌套镜头骨架（P2 转换器产出）；shot_prompts 仍在 assets 阶段写出",
                         "items": NESTED_SHOT_SCHEMA,
                     },
+                },
+            },
+        },
+        # 章节快照（v8.2 P0-0）：compile 从 bible.chapters 归属后落这里，供
+        # 按日拆批次（章节粒度）与审核读取；四拍在章内起作用。
+        "chapters": {
+            "type": "array",
+            "description": "compile 落的章节快照；来源 bible.chapters[]（显式）或长片自动等距分章",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "role": {"type": "string"},
+                    "hook": {"type": "string"},
+                    "start_scene": {"type": "string"},
+                    "bgm_id": {"type": "string"},
+                    "target_duration_seconds": {"type": "number"},
                 },
             },
         },
@@ -458,6 +610,11 @@ SHOT_PROMPTS_SCHEMA: dict[str, Any] = {
                     "shot_id": {"type": "string"},
                     "duration_seconds": {"type": "number"},
                     "hero_moment": {"type": "boolean"},
+                    "vfx": {
+                        "type": "array",
+                        "description": "P0-8 特效条目（lift 后路由侧仍可读）",
+                        "items": VFX_ITEM_SCHEMA,
+                    },
                     "cut": NESTED_SHOT_SCHEMA["properties"]["cut"],
                     "location_id": NESTED_SHOT_SCHEMA["properties"]["location_id"],
                     "visual_details": VISUAL_DETAILS_SCHEMA,
@@ -473,6 +630,9 @@ SHOT_PROMPTS_SCHEMA: dict[str, Any] = {
             "dialogue_audio_mode": NESTED_SHOT_SCHEMA["properties"]["dialogue_audio_mode"],
             "gen_strategy": NESTED_SHOT_SCHEMA["properties"]["gen_strategy"],
             "rework_mode": NESTED_SHOT_SCHEMA["properties"]["rework_mode"],
+            "agnes_mode": NESTED_SHOT_SCHEMA["properties"]["agnes_mode"],
+            "tail_frame_state": NESTED_SHOT_SCHEMA["properties"]["tail_frame_state"],
+            "seed": NESTED_SHOT_SCHEMA["properties"]["seed"],
             "revision_note": NESTED_SHOT_SCHEMA["properties"]["revision_note"],
             "retake_segment": NESTED_SHOT_SCHEMA["properties"]["retake_segment"],
                 },
@@ -506,10 +666,36 @@ COMPOSE_PLAN_SCHEMA: dict[str, Any] = {
                     "transition": {"type": "string"},
                     "transition_duration": {"type": "number"},
                     "negative_gap_seconds": {"type": "number"},
+                    "transition_contract": TRANSITION_CONTRACT_SCHEMA,
+                    "transition_reason": {"type": "string"},
+                    "prompt_contract": PROMPT_CONTRACT_SCHEMA,
+                    "presence": {
+                        "type": "object",
+                        "description": "B2.5 逐镜在场清单（人物/道具/场景方位，供提示词与承接表使用）",
+                    },
+                    "continuity": {
+                        "type": "object",
+                        "description": "B2.5 承接表：must_keep / changed / missing（编译器生成）",
+                    },
+                    "prompt_hash": {"type": "string"},
+                    "anchor_coverage": {"type": "object"},
+                    "reference_requirements": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    },
+                    "forbidden_text_hits": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                     "lut": {"type": "string"},
                     "subtitle_cues": {"type": "array", "items": {"type": "object"}},
                     "audio_events": {"type": "array", "items": {"type": "object"}},
                     "effects": {"type": "array", "items": {"type": "object"}},
+                    "vfx": {
+                        "type": "array",
+                        "description": "P0-8 特效条目（compose_planner 从 scene_plan shot.vfx 透传；compile_compose_plan 复制进 cuts）",
+                        "items": VFX_ITEM_SCHEMA,
+                    },
                     "render_kind": {
                         "type": "string",
                         "enum": [
@@ -549,6 +735,13 @@ EDIT_DECISIONS_SCHEMA: dict[str, Any] = {
                     "transition_out": {"type": "string", "description": "出转场"},
                     "transition_duration": {"type": "number", "description": "转场时长（秒）；>0 即负空隙重叠"},
                     "negative_gap_seconds": {"type": "number", "description": "负空隙（秒），转场重叠的等价表达"},
+                    "transition_contract": TRANSITION_CONTRACT_SCHEMA,
+                    "transition_reason": {"type": "string"},
+                    "vfx": {
+                        "type": "array",
+                        "description": "P0-8 后期特效（compose_planner 从 shot.vfx[] 的 post 层透传；assemble 拼接前逐 cut 应用）",
+                        "items": VFX_ITEM_SCHEMA,
+                    },
                 },
             },
         },
@@ -716,6 +909,16 @@ PROPOSAL_PACKET_SCHEMA: dict[str, Any] = {
                 "可灵环强制等价 turnaround"
             ),
         },
+        "quality_mode": {
+            "type": "string",
+            "enum": ["full", "strict", "degraded", "manual_only"],
+            "description": (
+                "P0-7/P0-4 quality policy: full requires VLM verification; "
+                "strict additionally blocks VLM critical; degraded allows a skipped "
+                "VLM but must remain explicitly unverified; manual_only is explicit "
+                "human verification."
+            ),
+        },
     },
 }
 
@@ -772,6 +975,14 @@ ASSET_MANIFEST_SCHEMA: dict[str, Any] = {
                     "url": {"type": "string"},
                     "provider": {"type": "string"},
                     "seed": {"type": "integer"},
+                    "canonical": {
+                        "type": "boolean",
+                        "description": "身份记忆库 canonical 锚（P0-identity-memory）：同角色/形态唯一真源，_ref_index 优先取",
+                    },
+                    "identity_key": {
+                        "type": "string",
+                        "description": "对应 artifacts/identity_memory.json 的键：cid 或 cid:form",
+                    },
                     "views": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -801,9 +1012,26 @@ FILM_HEALTH_SCHEMA: dict[str, Any] = {
     "properties": {
         "pass": {"type": "boolean"},
         "path": {"type": "string"},
+        "path_source": {
+            "type": "string",
+            "enum": ["explicit", "renders", "auto_edit"],
+            "description": "P0-7：成片来自显式路径 / renders/final.mp4 / auto_edit/final.mp4",
+        },
         "probe": {"type": "object"},
         "critical": {"type": "array", "items": {"type": "object"}},
         "warnings": {"type": "array", "items": {"type": "object"}},
+        "duration_check": {
+            "type": "object",
+            "description": "P0-7：时长偏差实值（delta/tolerance/longform），不只给一句「超过 x%」",
+        },
+        "audio_consistency": {
+            "type": "object",
+            "description": "P0-7：段间响度一致性（分块均值/中位/落差），测量失败只记 reason",
+        },
+        "continuity": {
+            "type": "object",
+            "description": "P0-7：镜连续性抽检（VLM，默认关；skipped=未执行，永不进 critical）",
+        },
         "artifact": {"type": "string"},
     },
 }
@@ -967,6 +1195,25 @@ SERIES_BIBLE_SCHEMA: dict[str, Any] = {
                 "bgm_id": {"type": "string"},
             },
         },
+        # 长片分章（v8.2 P0-0，可选）：与 structure（全局四拍描述）互补；
+        # 声明后四拍在章内重置，短篇不声明行为不变。
+        "chapters": {
+            "type": "array",
+            "description": "章节结构（长片主锚）：按日拆批次=章节粒度；章内四拍；"
+            "bgm_id 作章节默认曲（音乐锚降章节内辅助，显式 scene.bgm_id 仍最高优先）",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "章节 id，缺省 chNN 自动编号"},
+                    "title": {"type": "string", "description": "章标题"},
+                    "role": {"type": "string", "description": "章节作用一句话"},
+                    "hook": {"type": "string", "description": "章钩子"},
+                    "start_scene": {"type": "string", "description": "章首场景 id（归属锚）"},
+                    "bgm_id": {"type": "string", "description": "章节默认曲 id；无显式 scene.bgm_id 的场兜底"},
+                    "target_duration_seconds": {"type": "number", "description": "章节目标时长段（秒）"},
+                },
+            },
+        },
         "locations": {"type": "array", "items": LOCATION_SCHEMA},
         "structure": SCRIPT_SCHEMA["properties"]["structure"],
         "medium": {"type": "string"},
@@ -1012,6 +1259,19 @@ SERIES_BIBLE_SCHEMA: dict[str, Any] = {
                                 "location_id": NESTED_SHOT_SCHEMA["properties"]["location_id"],
                                 "subjects": VISUAL_DETAILS_SCHEMA["properties"]["subjects"],
                                 "objects": VISUAL_DETAILS_SCHEMA["properties"]["objects"],
+                                # V27：compile 侧 _overlay_shot 消费该字段（bible.py:193-203），
+                                # 此前 schema 未声明（隐式契约）。导演执法①"换景别/角度"
+                                # 的修复落点依赖它。嵌套镜头同款 dict 形状。
+                                "shot_language": {"type": "object"},
+                                "form_id": {"type": "string"},
+                                # P0-8：同款隐式契约显式化——_overlay_shot 消费
+                                # hero_moment（密度红线事实源）与 vfx（特效指导制定）。
+                                "hero_moment": {"type": "boolean"},
+                                "vfx": {
+                                    "type": "array",
+                                    "description": "P0-8 特效指导制定的观感特效；唯一事实源在此（D15），scene_plan 每次重编译从零再生",
+                                    "items": VFX_ITEM_SCHEMA,
+                                },
                             },
                         },
                     },
@@ -1134,6 +1394,265 @@ IMAGE_BINDINGS_SCHEMA: dict[str, Any] = {
     "required": ["shots", "cast"],
 }
 
+# 角色评审日志（V35）——宽松 schema，append-only .jsonl 不进 pipeline produces。
+# 每行一个对象；subject 枚举见 tools/review_logger.py REVIEW_LOG_SUBJECTS（V30）。
+REVIEW_LOG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": "review_log.jsonl 单行；角色评审 append-only（V35 三日志分工）",
+    "properties": {
+        "timestamp": {"type": "string"},
+        "role": {"type": "string"},
+        "subject": {"type": "string"},
+        "phase": {
+            "type": "string",
+            "enum": ["first_pass", "revise", "status_update"],
+            "description": "V47：first_pass=子 Agent 关卡（不占 4 轮额度）；缺省=revise",
+        },
+        "round": {"type": "integer", "description": "手填参考；summary 按时间戳自动算（V30）"},
+        "decision": {"type": "string"},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "finding_id": {"type": "string"},
+                    "severity": {"type": "string"},
+                    "field": {"type": "string"},
+                    "message": {"type": "string"},
+                    "proposed_fix": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "open", "in_progress", "fixed", "verified",
+                            "waived", "invalid",
+                        ],
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "metric": {
+                        "type": "string",
+                        "description": "P0-4 客观量规编号：m1/m2/m5/m6/drift（m3/m4 已删）",
+                    },
+                    "value": {"type": "number"},
+                    "threshold": {"type": "number"},
+                },
+            },
+        },
+        "dissent": {"type": "string"},
+        "scores": {"type": "object"},
+        "self_review_findings_fixed": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["timestamp", "role", "subject", "decision"],
+}
+
+SCENE_INDEX_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": "P0-2 场景语义聚合：情节单元索引（时间戳均由确定性切点推导，LLM 只回索引）",
+    "required": ["version", "shots", "units"],
+    "properties": {
+        "version": {"type": "string"},
+        "grouping": {
+            "type": "string",
+            "description": "deterministic=VLM 未参与；vlm=边界并集含 VLM 判定",
+        },
+        "source": {"type": "object"},
+        "params": {"type": "object"},
+        "shots": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["shot_id"],
+                "properties": {
+                    "shot_id": {"type": "string"},
+                    "index": {"type": "integer"},
+                    "start_seconds": {"type": "number"},
+                    "end_seconds": {"type": "number"},
+                    "unit_id": {"type": "string"},
+                    "characters": {"type": "array", "items": {"type": "string"}},
+                    "text": {"type": "string"},
+                },
+            },
+        },
+        "units": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["unit_id"],
+                "properties": {
+                    "unit_id": {"type": "string"},
+                    "index": {"type": "integer"},
+                    "narrative_role": {
+                        "type": "string",
+                        "enum": ["hook", "escalation", "reveal", "landing"],
+                        "description": "四拍按单元位置确定性指派（与 series_bible.structure 同词表）",
+                    },
+                    "start_seconds": {"type": "number"},
+                    "end_seconds": {"type": "number"},
+                    "shot_indices": {"type": "array", "items": {"type": "integer"}},
+                    "shot_ids": {"type": "array", "items": {"type": "string"}},
+                    "text": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "characters": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+        "unit_boundaries_seconds": {"type": "array", "items": {"type": "number"}},
+        "preferred_cuts": {"type": "array", "items": {"type": "object"}},
+        "similarities": {"type": "array", "items": {"type": "object"}},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+PLAN_HISTORY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": "P0-3 版本链索引：plan.json 的历代快照 + 字段级 diff（快照在 tmp_autoedit/plan_history/）",
+    "required": ["version", "current", "entries"],
+    "properties": {
+        "version": {"type": "string"},
+        "current": {"type": "integer", "description": "最新版本号（rev 从 1 起单调增）"},
+        "pruned": {"type": "integer", "description": "因超上限被裁掉的快照数"},
+        "max_versions": {
+            "type": ["integer", "null"],
+            "description": "项目级版本上限（null=不限；显式传入才改，否则沿用）",
+        },
+        "entries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["rev", "path"],
+                "properties": {
+                    "rev": {"type": "integer"},
+                    "path": {"type": "string"},
+                    "at": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "session_id": {"type": "string"},
+                    "plan_sha": {"type": "string", "description": "plan_core 的 sha256 前 16 位（内容等价判定）"},
+                    "overrides": {"type": "object"},
+                    "diff_from_prev": {
+                        "type": ["object", "null"],
+                        "description": "与上一版的字段级差异（首版为 null）",
+                        "properties": {
+                            "unchanged": {"type": "boolean"},
+                            "shots_added": {"type": "array", "items": {"type": "string"}},
+                            "shots_removed": {"type": "array", "items": {"type": "string"}},
+                            "shots_retimed": {"type": "array", "items": {"type": "string"}},
+                            "shots_resped": {"type": "array", "items": {"type": "string"}},
+                            "segments_action_changed": {"type": "object"},
+                            "params_changed": {"type": "object"},
+                            "edits_changed": {"type": "integer"},
+                            "duration_before": {"type": "number"},
+                            "duration_after": {"type": "number"},
+                            "duration_delta": {"type": "number"},
+                            "counts": {"type": "object"},
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
+
+BEAT_MAP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "P0-5 能量波产物（tmp_autoedit/beat_map.json）：拍网格 + 每 bar 能量 + Bar-DP 切点。"
+        "顶层 feasible=切点是否真被能量波接管（量规层据此标 m5/m6 circular）"
+    ),
+    "required": ["version", "feasible", "bpm", "bpm_source", "cuts", "warnings"],
+    "properties": {
+        "version": {"type": "string"},
+        "operation": {"type": "string"},
+        "feasible": {"type": "boolean"},
+        "bpm": {"type": "number", "description": "0=估不出拍（切点不由能量波接管）"},
+        "bpm_source": {"type": "string", "enum": ["", "explicit", "estimated"]},
+        "beats_per_bar": {"type": "integer"},
+        "min_hold": {"type": "number"},
+        "max_hold": {"type": "number"},
+        "energy_source": {"type": "string", "enum": ["", "ebur128", "pcm_rms"]},
+        "duration": {"type": "number"},
+        "grid": {
+            "type": ["object", "null"],
+            "description": "P0-4 beat_grid 形状（bpm/fps/offset_seconds/start_seconds/frames_per_beat/source）+ beats_per_bar",
+            "properties": {
+                "bpm": {"type": "number"},
+                "fps": {"type": "number"},
+                "offset_seconds": {"type": "number"},
+                "start_seconds": {"type": "number"},
+                "frames_per_beat": {"type": "number"},
+                "beats_per_bar": {"type": "integer"},
+                "source": {"type": "string"},
+            },
+        },
+        "bars": {
+            "type": "array",
+            "description": "每 bar 能量（start/end_seconds + mean_db + energy∈[0,1]）",
+            "items": {"type": "object"},
+        },
+        "cuts": {"type": "array", "items": {"type": "number"}, "description": "已接管源的切点（秒）"},
+        "cuts_source_index": {"type": ["integer", "null"]},
+        "cuts_by_source": {"type": ["object", "null"], "description": "逐源 replaced/kept_scene_cuts 与原因"},
+        "note": {"type": ["object", "null"]},
+        "sources": {"type": "array", "items": {"type": "object"}, "description": "逐源明细（path/cuts/bars/feasible/warnings）"},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "schema_errors": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+EDIT_METRICS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": "剪辑导演客观量规报告（P0-4）：DIRECT m1/m2/m5/m6 + 身份漂移；m3/m4 已删",
+    "required": ["version", "metrics", "pass"],
+    "properties": {
+        "version": {"type": "string"},
+        "fps": {"type": "number"},
+        "beat_tolerance_frames": {"type": "integer"},
+        "beat_grid_source": {
+            "type": "string",
+            "description": "拍网格来路：P0-5 能量波（energy_wave/estimated）或 soundtrack 事件",
+        },
+        "beat_grid_bpm": {"type": ["number", "null"]},
+        "beat_grid_bpm_source": {
+            "type": "string",
+            "description": "bpm 来路：explicit（曲库/人给）或 estimated（自相关估拍，需人工确认）",
+        },
+        "circular_metrics": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "自我满足的指标（P0-5 Bar-DP 生成的切点使 m5/m6 必然达标）：不作质量证据",
+        },
+        "circular_note": {"type": "string"},
+        "deleted_metrics": {"type": "array", "items": {"type": "string"}},
+        "pass": {"type": "boolean"},
+        "metrics": {
+            "type": "object",
+            "additionalProperties": {
+                "type": "object",
+                "properties": {
+                    "metric": {"type": "string"},
+                    "name": {"type": "string"},
+                    "value": {"type": "number"},
+                    "threshold": {"type": "number"},
+                    "unit": {"type": "string"},
+                    "direction": {"type": "string", "enum": ["higher", "lower"]},
+                    "source": {"type": "string"},
+                    "pass": {"type": "boolean"},
+                    "skipped": {"type": "boolean"},
+                    "circular": {
+                        "type": "boolean",
+                        "description": "true=值自我满足（切点由该网格/能量生成），只当回归哨兵",
+                    },
+                    "reason": {"type": "string"},
+                    "detail": {"type": "object"},
+                    "findings": {"type": "array", "items": {"type": "object"}},
+                },
+            },
+        },
+        "findings": {"type": "array", "items": {"type": "object"}},
+    },
+}
+
 SCHEMAS: dict[str, dict[str, Any]] = {
     "research_brief": RESEARCH_BRIEF_SCHEMA,
     "proposal_packet": PROPOSAL_PACKET_SCHEMA,
@@ -1156,6 +1675,11 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     "auto_edit_plan": AUTO_EDIT_PLAN_SCHEMA,
     "auto_edit_report": AUTO_EDIT_REPORT_SCHEMA,
     "image_bindings": IMAGE_BINDINGS_SCHEMA,
+    "review_log": REVIEW_LOG_SCHEMA,
+    "edit_metrics": EDIT_METRICS_SCHEMA,
+    "beat_map": BEAT_MAP_SCHEMA,
+    "scene_index": SCENE_INDEX_SCHEMA,
+    "plan_history": PLAN_HISTORY_SCHEMA,
 }
 
 

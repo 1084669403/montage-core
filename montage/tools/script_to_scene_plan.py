@@ -27,11 +27,12 @@ from montage.providers.capabilities import (
     snap_duration_seconds,
 )
 from montage.script_fields import flatten_environment, section_spoken_text
+from montage.engine.story_outline import chapter_beat_role, chapter_index_map
 from montage.toolbase import BaseTool, ToolResult, ToolRuntime, ToolStatus
 
 _DEFAULT_WPS = 5.0
 _GRID = 5.0
-_MAX_SHOTS = 4
+_MAX_SHOTS = 12
 _SENT_SPLIT = re.compile(r"(?<=[。！？!?\n])")
 
 
@@ -88,6 +89,9 @@ def _character_registry(script: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         row: dict[str, Any] = {
             "id": char["id"],
+            # 显示名（中文）随 registry 下发：提示词的【角色与外貌】【在场清单】
+            # 都用它，避免把 wen_ruchun 这种 id 写进生成提示词。
+            "name": str(char.get("name") or char["id"]),
             "appearance": str(char.get("appearance") or ""),
             "outfit_anchor": str(char.get("outfit") or ""),
         }
@@ -134,13 +138,23 @@ def _units(section: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
     return units, True
 
 
-def _group_units(units: list[dict[str, Any]], n_shots: int) -> list[list[dict[str, Any]]]:
+def _group_units(
+    units: list[dict[str, Any]],
+    n_shots: int,
+    *,
+    fill_empty: bool = True,
+) -> list[list[dict[str, Any]]]:
     n_shots = max(1, n_shots)
     if not units:
-        return [[{"kind": "empty", "text": "", "line": None}]]
+        empty = {"kind": "empty", "text": "", "line": None}
+        if not fill_empty:
+            return [{**empty} for _ in range(n_shots)]
+        return [[{**empty}]]
     groups: list[list[dict[str, Any]]] = [[] for _ in range(n_shots)]
     for i, unit in enumerate(units):
         groups[min(i * n_shots // len(units), n_shots - 1)].append(unit)
+    if not fill_empty:
+        return groups
     filled: list[list[dict[str, Any]]] = []
     last = list(units)
     for group in groups:
@@ -349,12 +363,18 @@ def convert_script_to_scene_plan(
     duration_policy: dict[str, Any] | None = None,
     fill_shot_language: bool = True,
     defer_camera_fill: bool = False,
+    scene_chapter: dict[str, str] | None = None,
+    chapter_plan: dict[str, Any] | None = None,
+    shot_skeletons: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """纯函数：script → {scene_plan, findings}。
 
     duration_policy=None 未传 → 保持 5/10 网格。显式 {kind:none} 才不 snap。
     fill_shot_language=False 时运镜回落 static（冻结用词）。
     defer_camera_fill=True 时只写景别，留给 overlay 后再 fill（compile 用）。
+    scene_chapter/{scene_id: 章内序, 章大小}（v8.2 P0-0）：提供时四拍在章内
+    重置（chapter_beat_role），未归属章的场回落全局四拍；都不传=旧全局四拍。
+    chapter_plan 是 compile 落 scene_plan.chapters 快照用的章列表。
     """
     findings: list[dict[str, str]] = []
     pb = playbook if isinstance(playbook, dict) else None
@@ -368,6 +388,15 @@ def convert_script_to_scene_plan(
     char_by_id = {c["id"]: c for c in chars}
     emotion = _emotion(script, pb)
     sections = script.get("sections") or []
+    scene_chapter = scene_chapter if isinstance(scene_chapter, dict) else {}
+    chapter_order, chapter_size = chapter_index_map(
+        [str(s.get("id") or "") for s in sections if isinstance(s, dict)],
+        scene_chapter,
+    )
+    chapters_out = (
+        [ch for ch in (chapter_plan or []) if isinstance(ch, dict)]
+        if isinstance(chapter_plan, list) else []
+    )
     if not sections:
         findings.append({
             "severity": "warning",
@@ -403,9 +432,25 @@ def convert_script_to_scene_plan(
                 "message": f"{sid} 无 lines[]，按 narration 标点降级切分",
                 "proposed_fix": "补 lines[{speaker_id, text}] 后再转换",
             })
-        n_shots = _n_shots(duration, len(units), duration_policy)
-        groups = _group_units(units, n_shots)
-        role = _narrative_role(idx, total)
+        skeletons = [
+            shot for shot in (shot_skeletons or {}).get(sid) or []
+            if isinstance(shot, dict)
+        ]
+        explicit_shots = bool(skeletons)
+        n_shots = len(skeletons) if explicit_shots else _n_shots(
+            duration, len(units), duration_policy,
+        )
+        # 显式 bible 镜头是导演骨架，优先于对白数量推导；此时允许部分镜头
+        # 只作动作/空镜，不把上一组台词重复填入后续镜头。
+        groups = _group_units(units, n_shots, fill_empty=not explicit_shots)
+        # 四拍作用域（v8.2 P0-0）：章内优先（scene_chapter 提供），未归属章
+        # 回落旧全局四拍——独立转换与短篇行为不变。
+        in_ch = chapter_order.get(sid, -1)
+        ch_size = chapter_size.get(sid, 0)
+        if in_ch >= 0 and ch_size > 0:
+            role = chapter_beat_role(in_ch, ch_size)
+        else:
+            role = _narrative_role(idx, total)
         durs = _shot_durations(
             duration,
             len(groups),
@@ -435,6 +480,11 @@ def convert_script_to_scene_plan(
             description = (section_env_text + "。" if section_env_text else "") + spoken_bits[0]
 
         for ji, group in enumerate(groups):
+            explicit_id = ""
+            if explicit_shots:
+                # 镜数与骨架一致时逐位取显式 ID；不匹配则回落到稳定编号。
+                if ji < len(skeletons):
+                    explicit_id = str(skeletons[ji].get("shot_id") or "").strip()
             shot_dur = durs[ji] if ji < len(durs) else durs[-1]
             dialogue: list[dict[str, Any]] = []
             for unit in group:
@@ -475,7 +525,7 @@ def convert_script_to_scene_plan(
             if objects:
                 vd["objects"] = objects
             shot: dict[str, Any] = {
-                "shot_id": f"{sid}_{ji + 1:02d}",
+                "shot_id": explicit_id or f"{sid}_{ji + 1:02d}",
                 "shot_kind": "video",
                 "duration_seconds": shot_dur,
                 "visual_details": vd,
@@ -485,6 +535,16 @@ def convert_script_to_scene_plan(
                 ),
                 "cut": "bridge",
             }
+            # bible 骨架里显式写的逐镜在场清单（presence）与方位信息透传进
+            # scene_plan；缺省时由 shot_presence.derive_presence 派生。
+            if explicit_shots and ji < len(skeletons):
+                skeleton = skeletons[ji]
+                for key in (
+                    "presence", "blocking", "location_id",
+                    "time_of_day", "empty_reason",
+                ):
+                    if skeleton.get(key) is not None:
+                        shot[key] = skeleton[key]
             if dialogue:
                 shot["audio_prompt"] = {"dialogue": dialogue}
             shots.append(shot)
@@ -509,6 +569,9 @@ def convert_script_to_scene_plan(
         # sensory_by_time，也让 scene_plan 自包含（不再只藏在 bible 里）。
         if isinstance(sec_env, (dict, str)) and sec_env:
             scene_out["environment"] = sec_env
+        ch_id = scene_chapter.get(sid, "")
+        if ch_id:
+            scene_out["chapter_id"] = ch_id
         scenes.append(scene_out)
         cursor = end
 
@@ -516,6 +579,39 @@ def convert_script_to_scene_plan(
         "scenes": scenes,
         "character_registry": _character_registry(script),
     }
+    # B2.5 逐镜在场清单 + 承接表：编译器在**叙事顺序**上逐镜比对上一镜在场
+    # 实体（人物/道具），把"上镜在场、未标退场、本镜缺失"的漏项写成 finding，
+    # 并把 presence/continuity 写进每个 shot，供提示词与门禁使用。
+    from lib.shot_presence import build_ledger
+
+    ordered_shots: list[dict[str, Any]] = []
+    for scene in scenes:
+        sid = ""
+        if isinstance(scene, dict):
+            sid = str(scene.get("id") or "").strip()
+        for shot in (scene.get("shots") if isinstance(scene, dict) else []) or []:
+            if isinstance(shot, dict):
+                shot.setdefault("scene_id", sid)
+                ordered_shots.append(shot)
+    registry = {
+        str(row.get("id")): row
+        for row in (scene_plan.get("character_registry") or [])
+        if isinstance(row, dict) and row.get("id")
+    }
+    ledger = build_ledger(
+        ordered_shots,
+        scenes_by_id={str(s.get("id")): s for s in scenes if isinstance(s, dict)},
+        registry=registry,
+    )
+    for shot in ordered_shots:
+        row = ledger["shots"].get(str(shot.get("shot_id"))) or {}
+        if row.get("presence"):
+            shot["presence"] = row["presence"]
+        if row.get("continuity"):
+            shot["continuity"] = row["continuity"]
+    findings.extend(ledger["findings"])
+    if chapters_out:
+        scene_plan["chapters"] = chapters_out
     if fill_shot_language and not defer_camera_fill:
         findings.extend(apply_shot_language(scene_plan, pb, enabled=True))
     return {"scene_plan": scene_plan, "findings": findings}

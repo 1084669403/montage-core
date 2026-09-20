@@ -549,6 +549,26 @@ def build_review_card(
             {"label": "主题", "value": _text(bible.get("theme")) or "（空）"},
             {"label": "段落摘要", "value": blurb[:80] or "（空）"},
         ]
+        # 吞吐摘要（v8.2 P0-1）：bible 有目标时长时给混合档位量级
+        # （tokenplan 500s/天 + 免费 1RPM ≈ 700-1000s/天），供导演在
+        # 剧本停点决策"单条跑 / 分章跨天"。
+        try:
+            target_f = float(bible.get("target_duration_seconds") or 0)
+        except (TypeError, ValueError):
+            target_f = 0.0
+        if target_f > 0:
+            from montage.tools.duration_advisor import estimate_throughput
+
+            tp = estimate_throughput(total_seconds=target_f)
+            days = tp.get("days_est")
+            days_txt = (
+                f"{days[0]}-{days[1]} 天" if isinstance(days, list)
+                else (f"{days} 天" if isinstance(days, int) else "—")
+            )
+            summary.append({
+                "label": "吞吐预估",
+                "value": f"目标 {target_f:.0f}s ≈ {days_txt}（700-1000s/天，分章跨天）",
+            })
         fields = []
         for char in chars:
             cid = _text(char.get("id"))
@@ -842,14 +862,14 @@ def build_review_card(
                     f"{title} 视频提示词",
                     vp,
                     input_kind="textarea",
-                    note="只读预览；改提示词请回 scene_plan / series_bible",
+                    note="只读预览；改提示词回 scene_plan 直改；改 series_bible 须先重编译再 --resume",
                 ))
                 fields.append(_field(
                     f"shot_prompts.shots[{sid}].first_frame_prompt" if sid else "shot_prompts",
                     f"{title} 首帧提示词",
                     fp,
                     input_kind="textarea",
-                    note="只读预览；改提示词请回 scene_plan / series_bible",
+                    note="只读预览；改提示词回 scene_plan 直改；改 series_bible 须先重编译再 --resume",
                 ))
             summary = [
                 {"label": "提示词", "value": f"{ok_n}/{len(prompt_shots)} 镜已构建"},
@@ -912,6 +932,9 @@ def build_review_card(
         summary = [{"label": "成片镜", "value": f"{ok_n} 成功 / {fail_n} 失败"}]
         if fail_lines:
             summary.append({"label": "失败镜", "value": "、".join(fail_lines)})
+        metrics_line = _metrics_summary_line(project_dir)
+        if metrics_line:
+            summary.append(metrics_line)
         choices["cast_action"] = CAST_ACTION_CHOICES
         if kling and fail_n:
             choices["rework_mode"] = REWORK_CHOICES
@@ -1085,6 +1108,41 @@ def render_review_md(card: dict[str, Any]) -> str:
     if findings:
         lines.extend(["", "## 失败 / 待补", ""])
         lines.extend(findings)
+    lifecycle = card.get("finding_lifecycle")
+    if isinstance(lifecycle, dict):
+        lines.extend(["", "## Finding 生命周期", ""])
+        lifecycle_summary = lifecycle.get("summary")
+        if isinstance(lifecycle_summary, dict):
+            counts = lifecycle_summary.get("status_counts")
+            counts_text = ""
+            if isinstance(counts, dict):
+                counts_text = "；".join(
+                    f"{status}={count}" for status, count in counts.items() if count
+                )
+            lines.append(
+                f"- **Findings**：{lifecycle_summary.get('finding_count', 0)} 个，"
+                f"出现 {lifecycle_summary.get('occurrence_count', 0)} 次；{counts_text}"
+            )
+            if lifecycle_summary.get("open_critical_count"):
+                lines.append(
+                    f"- **Open critical**：{lifecycle_summary.get('open_critical_count')} 个"
+                )
+            if lifecycle_summary.get("parse_error_count"):
+                lines.append(
+                    f"- **日志坏行**：{lifecycle_summary.get('parse_error_count')} 行（append-only，不重写）"
+                )
+        index = lifecycle.get("index")
+        if isinstance(index, list) and index:
+            for row in index:
+                if not isinstance(row, dict):
+                    continue
+                severity = f"/{row.get('severity')}" if row.get("severity") else ""
+                target = f" · {row.get('target')}" if row.get("target") else ""
+                occurrences = f" · 出现 {row.get('occurrence_count', 0)} 次" if row.get("occurrence_count") else ""
+                lines.append(
+                    f"- `{row.get('finding_id')}` `{row.get('status')}{severity}`"
+                    f"{target}{occurrences}"
+                )
     lines.extend([
         "",
         "## 不要改",
@@ -1096,6 +1154,43 @@ def render_review_md(card: dict[str, Any]) -> str:
         "",
     ])
     return "\n".join(lines)
+
+
+def _attach_finding_lifecycle(project_dir: Path, card: dict[str, Any]) -> dict[str, Any]:
+    """Attach a read-only lifecycle projection; never rewrite the review log."""
+    from montage.engine.review_findings import (
+        build_finding_id_index,
+        build_review_findings,
+        load_review_log,
+        review_findings_summary,
+    )
+
+    rows, errors = load_review_log(
+        project_dir / "artifacts" / "review_log.jsonl"
+    )
+    projection = build_review_findings(rows)
+    summary = review_findings_summary(
+        projection,
+        log_present=rows is not None,
+        parse_errors=errors,
+    )
+    card["finding_lifecycle"] = {
+        "summary": summary,
+        "parse_errors": errors,
+        "index": build_finding_id_index(projection),
+    }
+    summary_line = (
+        f"{summary.get('finding_count', 0)} findings / "
+        f"{summary.get('occurrence_count', 0)} occurrences"
+    )
+    status_counts = summary.get("status_counts") if isinstance(summary.get("status_counts"), dict) else {}
+    active_counts = "，".join(
+        f"{status}={count}" for status, count in status_counts.items() if count
+    )
+    if active_counts:
+        summary_line += f"（{active_counts}）"
+    card["summary"].append({"label": "Findings 生命周期", "value": summary_line})
+    return card
 
 
 def write_director_review(
@@ -1121,6 +1216,16 @@ def write_director_review(
         project_dir=str(root),
         retry_ids=retry_ids,
     )
+    card = _attach_finding_lifecycle(root, card)
+    card = _attach_quality_summary(root, card)
+    card = _attach_duration_summary(root, card)
+    card = _attach_transition_summary(root, card)
+    card = _attach_transition_contract_summary(root, card)
+    card = _attach_subtitle_summary(root, card)
+    card = _attach_srt_audit_summary(root, card)
+    card = _attach_cut_points_summary(root, card)
+    card = _attach_m5_parallel_audit(root, card)
+    card = _attach_m6_parallel_audit(root, card)
     art = root / "artifacts"
     art.mkdir(parents=True, exist_ok=True)
     (art / "REVIEW.md").write_text(render_review_md(card), encoding="utf-8")
@@ -1168,7 +1273,7 @@ def _kling_capability_findings(store: Any, status: str) -> list[dict[str, Any]]:
 
 _FORBIDDEN_PATH = (
     "clip_path", "pipeline_type", "human_approved", "review_card",
-    "produce_progress", "edit_decisions", "REVIEW.md",
+    "produce_progress", "edit_decisions", "edit_metrics", "REVIEW.md",
 )
 _SKIP_TRUE = {"skip", "跳过", "true", "1", "yes", "本角色跳过四视图"}
 _SKIP_FALSE = {"generate", "出四视图", "false", "0", "no", "出四视图（默认）"}
@@ -1177,6 +1282,372 @@ _INDEXED_RE = re.compile(
 )
 _SHOT_SIZE_IDS = {str(x["id"]) for x in SHOT_SIZE_CHOICES}
 _CAMERA_IDS = {str(x["id"]) for x in CAMERA_MOVE_CHOICES}
+
+
+def _metrics_summary_line(project_dir: str | Path | None) -> dict[str, str] | None:
+    """P0-4：assemble 前人审的客观量规摘要（读 ``artifacts/edit_metrics.json``）。
+
+    量规由 ``review_logger operation=metrics`` 产出；本函数只读不写——没产物就提示
+    先跑，避免 director 卡静默假装"已审过"。
+    """
+    if not project_dir:
+        return None
+    path = Path(project_dir) / "artifacts" / "edit_metrics.json"
+    if not path.is_file():
+        return {
+            "label": "客观量规",
+            "value": "未生成（assemble 前先跑 review_logger operation=metrics）",
+        }
+    from montage.engine.edit_metrics import metric_summary
+
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {
+            "label": "客观量规",
+            "value": "edit_metrics.json 损坏（重跑 review_logger operation=metrics）",
+        }
+    text = metric_summary(report)
+    circular = [str(m) for m in (report.get("circular_metrics") or [])]
+    if circular:
+        # P0-5：切点由能量波生成时 m5/m6 必然达标，别把「自己出的题」当放行证据。
+        # 提示写进 value 而不是另开 note 键——卡片的 summary 只渲染 label/value。
+        text = f"{text}（{'/'.join(circular)} 自我满足：切点由能量波/拍网格生成，不作放行证据）"
+    return {"label": "客观量规", "value": text, "circular_metrics": circular}
+
+
+def _quality_summary_line(project_dir: str | Path | None) -> dict[str, str] | None:
+    """Read-only VLM verification summary for stop-point cards."""
+    if not project_dir:
+        return None
+    from montage.engine.artifacts import ArtifactStore
+    from montage.engine.delivery_report import build_quality_gate, format_vlm_state
+
+    mode = "degraded"
+    try:
+        from montage.engine.policy import load_loop_policy
+
+        mode = str(load_loop_policy(project_dir).get("quality_mode") or "degraded")
+    except ValueError:
+        return {
+            "label": "质量验证",
+            "value": "quality_mode 配置无效 / VLM unverified",
+        }
+    try:
+        metrics = ArtifactStore(project_dir).read("edit_metrics")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        metrics = None
+    missing_metrics = not (isinstance(metrics, dict) and metrics)
+    # 即使 edit_metrics 缺失也走同一个门禁：质量状态（skipped / unverified /
+    # blocked 原因）由 build_quality_gate 统一裁决，缺件只是补充说明，不再提前
+    # return（否则停点卡只能显示"未生成"，看不到"为什么被 block"）。
+    quality = build_quality_gate(
+        edit_metrics=metrics if isinstance(metrics, dict) else None,
+        quality_mode=mode,
+    )
+    state = quality.get("vlm") if isinstance(quality.get("vlm"), dict) else {}
+    reason = str(state.get("reason") or "")
+    value = f"{mode} / VLM {format_vlm_state(state)}"
+    if reason and not state.get("verified") and not state.get("skipped"):
+        value += f"（{reason}）"
+    if missing_metrics and not reason and not state.get("verified"):
+        value += "（edit_metrics 未生成）"
+    if quality.get("blocked"):
+        reasons = "; ".join(str(x) for x in (quality.get("blocked_reasons") or []))
+        value += f" / BLOCKED：{reasons or 'quality policy'}"
+    return {"label": "质量验证", "value": value}
+
+
+def _attach_quality_summary(project_dir: Path, card: dict[str, Any]) -> dict[str, Any]:
+    line = _quality_summary_line(project_dir)
+    if line:
+        card["summary"].append(line)
+    return card
+
+
+def _duration_summary_line(project_dir: Path) -> dict[str, str] | None:
+    """Read-only final-duration reconciliation for stop-point cards."""
+    from montage.engine.delivery_report import (
+        build_duration_reconciliation,
+        format_duration_reconciliation,
+    )
+
+    reconciliation = _duration_projection(project_dir)
+    if reconciliation is None:
+        return None
+    return {
+        "label": "时长对账",
+        "value": format_duration_reconciliation(reconciliation),
+        "status": str(reconciliation.get("status") or ""),
+        "target_status": str(reconciliation.get("target_status") or ""),
+    }
+
+
+def _duration_projection(project_dir: Path) -> dict[str, Any] | None:
+    from montage.engine.delivery_report import build_duration_reconciliation
+
+    store = ArtifactStore(project_dir)
+    compose_plan = store.read("compose_plan")
+    if not isinstance(compose_plan, dict):
+        return None
+    return build_duration_reconciliation(
+        asset_manifest=store.read("asset_manifest"),
+        compose_plan=compose_plan,
+        film_health=store.read("film_health"),
+        process_progress=store.read("produce_progress"),
+        title_seconds=None,
+    )
+
+
+def _transition_summary_line(project_dir: Path) -> dict[str, str] | None:
+    """Read-only transition-junction facts for stop-point cards."""
+    from montage.engine.delivery_report import format_transition_junctions
+
+    reconciliation = _duration_projection(project_dir)
+    if reconciliation is None:
+        return None
+    return {
+        "label": "转场接缝",
+        "value": format_transition_junctions(reconciliation),
+        "anomaly_count": str(reconciliation.get("transition_anomaly_count") or 0),
+    }
+
+
+def _subtitle_summary_line(project_dir: Path) -> dict[str, str] | None:
+    """Read-only subtitle correction projection for stop-point cards."""
+    from montage.engine.delivery_report import format_subtitle_timeline
+    from montage.engine.subtitle_timeline import project_subtitle_timeline
+
+    store = ArtifactStore(project_dir)
+    compose_plan = store.read("compose_plan")
+    if not isinstance(compose_plan, dict):
+        return None
+    projection = project_subtitle_timeline(compose_plan)
+    return {
+        "label": "字幕时间轴",
+        "value": format_subtitle_timeline(projection),
+        "anomaly_count": str(projection.get("anomaly_count") or 0),
+    }
+
+
+def _srt_audit_summary_line(project_dir: Path) -> dict[str, str] | None:
+    """Read-only comparison between the existing SRT and projected cues."""
+    from montage.engine.subtitle_timeline import audit_srt_sync, format_srt_audit
+
+    projection = _duration_projection(project_dir)
+    if projection is None:
+        return None
+    store = ArtifactStore(project_dir)
+    compose_plan = store.read("compose_plan")
+    if not isinstance(compose_plan, dict):
+        return None
+    srt_path = Path(project_dir) / "renders" / "final.srt"
+    srt_text = srt_path.read_text(encoding="utf-8") if srt_path.is_file() else None
+    audit = audit_srt_sync(
+        compose_plan=compose_plan,
+        srt_text=srt_text,
+        title_offset_seconds=float(projection.get("title_seconds") or 0),
+        final_duration_seconds=projection.get("final_reported_seconds"),
+    )
+    return {
+        "label": "SRT 对账",
+        "value": format_srt_audit(audit),
+        "status": str(audit.get("status") or ""),
+        "recommended_action": str(audit.get("recommended_action") or ""),
+    }
+
+
+def _cut_points_summary_line(project_dir: Path) -> dict[str, str] | None:
+    """Read-only planned-vs-xfade beat alignment summary."""
+    from montage.engine.cut_points import (
+        format_cut_point_projection,
+        project_cut_points,
+    )
+
+    store = ArtifactStore(project_dir)
+    compose_plan = store.read("compose_plan")
+    if not isinstance(compose_plan, dict):
+        return None
+    soundtrack = store.read("soundtrack")
+    film_health = store.read("film_health") or {}
+    fps = (
+        (film_health.get("probe") or {}).get("fps")
+        if isinstance(film_health, dict) else None
+    )
+    projection = project_cut_points(
+        compose_plan,
+        soundtrack=soundtrack,
+        fps=float(fps or 30.0),
+    )
+    return {
+        "label": "切点吸拍",
+        "value": format_cut_point_projection(projection),
+    }
+
+
+def _m5_parallel_audit_line(project_dir: Path) -> dict[str, str] | None:
+    """Parallel m5 evidence; it does not rewrite the objective metric."""
+    from montage.engine.cut_points import (
+        build_m5_parallel_audit,
+        format_m5_parallel_audit,
+        build_m6_parallel_audit,
+        format_m6_parallel_audit,
+        project_cut_points,
+    )
+
+    store = ArtifactStore(project_dir)
+    edit_metrics = store.read("edit_metrics")
+    compose_plan = store.read("compose_plan")
+    if edit_metrics is None or not isinstance(compose_plan, dict):
+        return None
+    soundtrack = store.read("soundtrack")
+    film_health = store.read("film_health") or {}
+    fps = (
+        (film_health.get("probe") or {}).get("fps")
+        if isinstance(film_health, dict) else None
+    )
+    projection = project_cut_points(
+        compose_plan,
+        soundtrack=soundtrack,
+        fps=float(fps or 30.0),
+    )
+    audit = build_m5_parallel_audit(
+        edit_metrics=edit_metrics,
+        cut_points=projection,
+    )
+    if audit is None:
+        return None
+    return {
+        "label": "M5 并行审计",
+        "value": format_m5_parallel_audit(audit),
+    }
+
+
+def _m6_parallel_audit_line(project_dir: Path) -> dict[str, str] | None:
+    """Parallel m6 evidence; it does not rewrite the objective metric."""
+    from montage.engine.cut_points import (
+        build_m6_parallel_audit,
+        format_m6_parallel_audit,
+        project_cut_points,
+    )
+    from montage.engine.delivery_report import _beat_map_contour, _timeline_shots
+
+    store = ArtifactStore(project_dir)
+    edit_metrics = store.read("edit_metrics")
+    compose_plan = store.read("compose_plan")
+    if edit_metrics is None or not isinstance(compose_plan, dict):
+        return None
+    soundtrack = store.read("soundtrack")
+    film_health = store.read("film_health") or {}
+    fps = (
+        (film_health.get("probe") or {}).get("fps")
+        if isinstance(film_health, dict) else None
+    )
+    projection = project_cut_points(
+        compose_plan,
+        soundtrack=soundtrack,
+        fps=float(fps or 30.0),
+    )
+    audit = build_m6_parallel_audit(
+        edit_metrics=edit_metrics,
+        cut_points=projection,
+        shots=_timeline_shots(project_dir),
+        soundtrack=soundtrack,
+        contour=_beat_map_contour(project_dir),
+    )
+    if audit is None:
+        return None
+    return {
+        "label": "M6 并行审计",
+        "value": format_m6_parallel_audit(audit),
+    }
+
+
+def _attach_duration_summary(project_dir: Path, card: dict[str, Any]) -> dict[str, Any]:
+    line = _duration_summary_line(project_dir)
+    if line:
+        card["summary"].append(line)
+    return card
+
+
+def _attach_transition_summary(project_dir: Path, card: dict[str, Any]) -> dict[str, Any]:
+    line = _transition_summary_line(project_dir)
+    if line:
+        card["summary"].append(line)
+    return card
+
+
+def _transition_contract_summary_line(project_dir: Path) -> dict[str, str] | None:
+    """Read-only explicit-transition-contract facts for stop-point cards."""
+    from montage.engine.transition_contract import (
+        build_transition_contract_projection,
+        format_transition_contract_projection,
+    )
+
+    store = ArtifactStore(project_dir)
+    compose_plan = store.read("compose_plan")
+    if not isinstance(compose_plan, dict):
+        return None
+    projection = build_transition_contract_projection(
+        compose_plan=compose_plan,
+        scene_plan=store.read("scene_plan"),
+    )
+    summary = projection.get("summary") or {}
+    if not summary.get("cross_scene_boundaries"):
+        return None
+    return {
+        "label": "跨场转场契约",
+        "value": format_transition_contract_projection(projection),
+        "anomaly_count": str(
+            int(summary.get("missing_contract") or 0)
+            + int(summary.get("invalid_contract") or 0)
+            + int(summary.get("mismatched_transition") or 0)
+        ),
+    }
+
+
+def _attach_transition_contract_summary(
+    project_dir: Path, card: dict[str, Any]
+) -> dict[str, Any]:
+    line = _transition_contract_summary_line(project_dir)
+    if line:
+        card["summary"].append(line)
+    return card
+
+
+def _attach_subtitle_summary(project_dir: Path, card: dict[str, Any]) -> dict[str, Any]:
+    line = _subtitle_summary_line(project_dir)
+    if line:
+        card["summary"].append(line)
+    return card
+
+
+def _attach_srt_audit_summary(project_dir: Path, card: dict[str, Any]) -> dict[str, Any]:
+    line = _srt_audit_summary_line(project_dir)
+    if line:
+        card["summary"].append(line)
+    return card
+
+
+def _attach_cut_points_summary(project_dir: Path, card: dict[str, Any]) -> dict[str, Any]:
+    line = _cut_points_summary_line(project_dir)
+    if line:
+        card["summary"].append(line)
+    return card
+
+
+def _attach_m5_parallel_audit(project_dir: Path, card: dict[str, Any]) -> dict[str, Any]:
+    line = _m5_parallel_audit_line(project_dir)
+    if line:
+        card["summary"].append(line)
+    return card
+
+
+def _attach_m6_parallel_audit(project_dir: Path, card: dict[str, Any]) -> dict[str, Any]:
+    line = _m6_parallel_audit_line(project_dir)
+    if line:
+        card["summary"].append(line)
+    return card
 
 
 def _card_paths(card: dict[str, Any] | None) -> set[str]:

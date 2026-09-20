@@ -465,6 +465,90 @@ def _iter_shots(scene_plan: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     return collected
 
 
+def check_presence_and_continuity(
+    scene_plan: dict[str, Any],
+) -> list[dict[str, str]]:
+    """B2.5：逐镜在场清单（人物/道具/场景方位）与承接表门禁。
+
+    规则：
+    - 每镜必须有 presence.location.id；
+    - 每镜必须有 characters[]，或是空镜并给 empty_reason；
+    - props[].holder（若有）必须是本镜在场人物；
+    - 承接：上镜在场且未标退场、本镜却缺失的人物/道具 → warning（模型漏项）。
+    """
+    from lib.shot_presence import build_ledger
+
+    findings: list[dict[str, str]] = []
+    ordered: list[dict[str, Any]] = []
+    scenes_by_id: dict[str, dict[str, Any]] = {}
+    for scene in scene_plan.get("scenes") or []:
+        if not isinstance(scene, dict):
+            continue
+        sid = str(scene.get("id") or "").strip()
+        scenes_by_id[sid] = scene
+        for shot in scene.get("shots") or []:
+            if not isinstance(shot, dict):
+                continue
+            shot = dict(shot)
+            shot.setdefault("scene_id", sid)
+            ordered.append(shot)
+    if not ordered:
+        return findings
+    registry = {
+        str(row.get("id")): row
+        for row in (scene_plan.get("character_registry") or [])
+        if isinstance(row, dict) and row.get("id")
+    }
+    ledger = build_ledger(ordered, scenes_by_id=scenes_by_id, registry=registry)
+    for shot in ordered:
+        shot_id = str(shot.get("shot_id") or "")
+        row = ledger["shots"].get(shot_id) or {}
+        presence = row.get("presence") or {}
+        if not (presence.get("location") or {}).get("id"):
+            findings.append({
+                "severity": "warning",
+                "stage": "scene_plan",
+                "field": f"{shot_id}.presence.location",
+                "message": f"{shot_id} 在场清单缺场景（location.id）",
+                "proposed_fix": "补 bible 该镜 presence.location.id（对应 locations[].id）",
+            })
+        characters = presence.get("characters") or []
+        if not characters and not presence.get("empty_reason"):
+            findings.append({
+                "severity": "warning",
+                "stage": "scene_plan",
+                "field": f"{shot_id}.presence",
+                "message": f"{shot_id} 既无人物也未说明是空镜",
+                "proposed_fix": "补 presence.characters[]，或写 empty_reason",
+            })
+        on_stage = {str(c.get("id")) for c in characters}
+        for prop in presence.get("props") or []:
+            holder = str(prop.get("holder") or "").strip()
+            if holder and holder not in on_stage:
+                findings.append({
+                    "severity": "warning",
+                    "stage": "scene_plan",
+                    "field": f"{shot_id}.presence.props",
+                    "message": (
+                        f"{shot_id} 道具 {prop.get('id')} 的持有者 {holder} "
+                        "不在本镜人物清单里"
+                    ),
+                    "proposed_fix": "把持有者加进 characters[]，或改 props[].holder",
+                })
+        for gap in (row.get("continuity") or {}).get("missing") or []:
+            findings.append({
+                "severity": "warning",
+                "stage": "scene_plan",
+                "field": f"{shot_id}.continuity",
+                "message": (
+                    f"{shot_id} 承接缺失：{gap.get('kind')} {gap.get('id')}"
+                    f"（{gap.get('why')}）"
+                ),
+                "proposed_fix": "本镜补写该实体，或在上镜标 exits:true",
+            })
+    return findings
+
+
 def check_shot_completeness(
     scene_plan: dict[str, Any],
     video_loop: str = "none",
@@ -1041,13 +1125,24 @@ def check_bible(
                 })
             subjects = [s for s in (shot.get("subjects") or []) if isinstance(s, dict)]
             if not subjects:
-                findings.append({
-                    "severity": "critical",
-                    "stage": "bible",
-                    "field": f"scenes[{si}].shots[{ji}].subjects",
-                    "message": f"{label} 缺少 subjects[]",
-                    "proposed_fix": "列出谁在画面里，动作写成可见动词+接触点",
-                })
+                # B2.5：空镜是合法镜头——只要 presence 明确写了 empty_reason
+                # （结尾空镜、环境镜都属此类）。没有理由的空 subjects 仍是 critical。
+                presence = shot.get("presence") if isinstance(shot.get("presence"), dict) else {}
+                if str(presence.get("empty_reason") or "").strip():
+                    findings.append({
+                        "severity": "suggestion",
+                        "stage": "bible",
+                        "field": f"scenes[{si}].shots[{ji}].subjects",
+                        "message": f"{label} 空镜（已写 empty_reason），无 subjects",
+                    })
+                else:
+                    findings.append({
+                        "severity": "critical",
+                        "stage": "bible",
+                        "field": f"scenes[{si}].shots[{ji}].subjects",
+                        "message": f"{label} 缺少 subjects[]",
+                        "proposed_fix": "列出谁在画面里，动作写成可见动词+接触点；空镜请写 presence.empty_reason",
+                    })
                 continue
             for sub in subjects:
                 act = sub.get("action") if isinstance(sub.get("action"), dict) else None
@@ -1209,6 +1304,8 @@ def validate_script(
     if purpose in ("all", "shot_completeness") and scene_plan:
         findings.extend(check_shot_completeness(scene_plan, video_loop=video_loop))
         findings.extend(check_shot_durations(scene_plan, video_loop=video_loop))
+    if purpose in ("all", "shot_completeness", "presence") and scene_plan:
+        findings.extend(check_presence_and_continuity(scene_plan))
     if purpose in ("all", "composition") and scene_plan:
         findings.extend(check_composition(scene_plan))
     if purpose in ("all", "beat_coverage"):

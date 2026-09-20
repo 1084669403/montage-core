@@ -13,8 +13,11 @@ from montage.style_packs import (
 
 def test_six_packs_registered():
     ids = {p["id"] for p in list_style_packs()}
-    assert {"cinematic", "documentary", "beat", "classic", "fresh", "cyber", "anime", "manga", "spoken"} <= ids
-    assert len(STYLE_PACKS) == 9
+    assert {
+        "cinematic", "documentary", "beat", "classic", "fresh",
+        "cyber", "anime", "anime_real", "manga", "spoken",
+    } <= ids
+    assert len(STYLE_PACKS) == 10
 
 
 def test_get_style_pack_copy():
