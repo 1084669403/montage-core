@@ -98,16 +98,29 @@ def timestamps_to_ass(
     max_chars_per_line: int = _DEFAULT_MAX_CHARS,
     font: str = _DEFAULT_FONT,
     font_size: int = _DEFAULT_FONT_SIZE,
+    play_res_x: int = 1920,
+    play_res_y: int = 1080,
+    margin_v: int | None = None,
 ) -> str:
     """[{text, start_seconds, end_seconds}] → ASS 文本（样式字幕）。
 
     样式：白字 + 黑描边 + 底部安全区；字体默认思源黑体（见 assets/fonts）。
+
+    ``play_res_x`` / ``play_res_y``：**必须与成片分辨率一致**，否则 libass 按
+    非等比缩放字形（A5）。``margin_v``：字幕距画面底边的像素数；默认按
+    1080p 取 100。成片有上下补边（如 21:9 源放进 16:9）时，放下黑边内取
+    40–90，放画面内底部需 ≥ 黑边高 + 40。
     """
+    play_res_x = max(int(play_res_x or 1920), 1)
+    play_res_y = max(int(play_res_y or 1080), 1)
+    if margin_v is None:
+        margin_v = 100
+    margin_v = max(int(margin_v), 0)
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        f"PlayResX: 1920\n"
-        f"PlayResY: 1080\n"
+        f"PlayResX: {play_res_x}\n"
+        f"PlayResY: {play_res_y}\n"
         "ScaledBorderAndShadow: yes\n"
         "\n"
         "[V4+ Styles]\n"
@@ -116,7 +129,7 @@ def timestamps_to_ass(
         "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
         "MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Default,{font},{font_size},&H00FFFFFF,&H000000FF,&H00101010,"
-        f"&H80000000,0,0,0,0,100,100,0,0,1,3,2,2,80,80,100,1\n"
+        f"&H80000000,0,0,0,0,100,100,0,0,1,3,2,2,80,80,{margin_v},1\n"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -161,6 +174,12 @@ class SubtitleBuilder(BaseTool):
             "format": {"type": "string", "enum": ["srt", "ass"], "default": "srt"},
             "font": {"type": "string", "default": _DEFAULT_FONT},
             "font_size": {"type": "integer", "default": _DEFAULT_FONT_SIZE},
+            "play_res_x": {"type": "integer", "default": 1920, "description": "ASS PlayResX：须与成片宽度一致"},
+            "play_res_y": {"type": "integer", "default": 1080, "description": "ASS PlayResY：须与成片高度一致"},
+            "margin_v": {
+                "type": "integer",
+                "description": "字幕距底边像素（缺省 100）；成片有上下黑边时按黑边范围取",
+            },
             "max_chars_per_line": {"type": "integer", "default": _DEFAULT_MAX_CHARS},
             "output_path": {"type": "string", "description": "可选：写盘路径（.srt/.ass）"},
         },
@@ -181,6 +200,11 @@ class SubtitleBuilder(BaseTool):
         if fmt == "ass":
             kwargs["font"] = inputs.get("font", _DEFAULT_FONT)
             kwargs["font_size"] = int(inputs.get("font_size", _DEFAULT_FONT_SIZE))
+            kwargs["play_res_x"] = int(inputs.get("play_res_x") or 1920)
+            kwargs["play_res_y"] = int(inputs.get("play_res_y") or 1080)
+            margin_v = inputs.get("margin_v")
+            if margin_v is not None:
+                kwargs["margin_v"] = int(margin_v)
             text = timestamps_to_ass(sentences, **kwargs)
         else:
             text = timestamps_to_srt(sentences, **kwargs)

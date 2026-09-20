@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -33,6 +34,10 @@ class ComposError(RuntimeError):
 # 超时口径（全仓唯一来源）：ffprobe 探测是本地的、秒级；渲染/滤镜链可能很久。
 FFPROBE_TIMEOUT = 60
 FFMPEG_TIMEOUT = 1800
+
+# 容器时长与视频流时长的最大容忍差（秒）。超过即判定"容器被音频 padding 撑长"，
+# concat 流拷贝会按容器时长推进下一段、给视频轨留下空洞，必须走重编码路径。
+DURATION_DRIFT_TOLERANCE = 0.001
 
 
 def check_ffmpeg() -> str | None:
@@ -55,7 +60,13 @@ def run_ffmpeg(
     ``check=True`` 失败抛 ``ComposError``（附 stderr 尾部）；``check=False``
     返回原始 ``CompletedProcess`` 供调用方自行解析（probe / silencedetect）。
     """
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)  # noqa: S603
+    # encoding/errors 必须显式给：Windows 中文环境下 text=True 会用 GBK 解码
+    # ffmpeg 的 UTF-8 输出，在读取线程里抛 UnicodeDecodeError（实测烧字幕时出现，
+    # 表现为一段吓人的 traceback，虽然命令本身成功）。
+    proc = subprocess.run(  # noqa: S603
+        cmd, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=timeout,
+    )
     if check and proc.returncode != 0:
         tail = proc.stderr[-800:] if proc.stderr else ""
         raise ComposError(f"{error_prefix}(exit {proc.returncode}): {tail}")
@@ -137,17 +148,290 @@ def _first_video_size(clips: list[Path]) -> tuple[int, int] | None:
     return None
 
 
+def _parse_frame_rate(value: Any) -> float | None:
+    """``r_frame_rate``（"24/1" / "30000/1001"）→ float；解析不了返回 None。"""
+    if value is None or value == "":
+        return None
+    text = str(value)
+    try:
+        if "/" in text:
+            num, den = text.split("/", 1)
+            d = float(den)
+            return float(num) / d if d else None
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def probe_media_params(path: str | Path) -> dict[str, Any]:
+    """探测统一化所需的第一条视频/音频流参数；探测失败返回 {}。
+
+    用于判断「这些片段能不能走 concat 流拷贝」——尺寸/帧率/采样率/声道任一
+    不一致，流拷贝会按第一条流的参数硬拼，后面片段被播放器按错误时基解释
+    （实测：30fps/48kHz 的转场段与 24fps/32kHz 的普通镜混拼，音轨比视频长
+    33.7s，画面出现 4.96s 断档）。
+    """
+    if not path or not Path(path).exists():
+        return {}
+    try:
+        info = probe(Path(path))
+    except ComposError:
+        return {}
+    params: dict[str, Any] = {}
+    for stream in info.get("streams") or []:
+        if not isinstance(stream, dict):
+            continue
+        kind = stream.get("codec_type")
+        if kind == "video" and params.get("width") is None:
+            try:
+                width = int(stream.get("width") or 0)
+                height = int(stream.get("height") or 0)
+            except (TypeError, ValueError):
+                continue
+            if width > 0 and height > 0:
+                params["width"] = width - width % 2
+                params["height"] = height - height % 2
+                fps = _parse_frame_rate(stream.get("r_frame_rate"))
+                if fps:
+                    params["fps"] = round(fps, 3)
+                # 视频流自身时长：与容器时长不一致时，concat 流拷贝会按容器
+                # 时长推进下一段（见 clips_need_reencode 的漂移检查）。
+                try:
+                    vdur = float(stream.get("duration") or 0)
+                except (TypeError, ValueError):
+                    vdur = 0.0
+                if vdur > 0:
+                    params["video_duration"] = round(vdur, 6)
+        elif kind == "audio" and params.get("sample_rate") is None:
+            try:
+                params["sample_rate"] = int(stream.get("sample_rate") or 0) or None
+                params["channels"] = int(stream.get("channels") or 0) or None
+            except (TypeError, ValueError):
+                params["sample_rate"] = None
+    try:
+        cdur = float((info.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        cdur = 0.0
+    if cdur > 0:
+        params["container_duration"] = round(cdur, 6)
+    return params
+
+
+def clips_need_reencode(
+    clips: list[Path],
+    *,
+    target_size: tuple[int, int] | None = None,
+    fps: int | float | None = None,
+    sample_rate: int = 0,
+    channels: int = 0,
+) -> bool:
+    """片段参数不一致（或与目标画布/帧率/采样率不符）时**必须重编码**。
+
+    探测不到参数的片段一律判定需要重编码：流拷贝赌不起。
+    ``sample_rate`` / ``channels`` 传 0 表示只做片段间一致性检查、不强制归一。
+    """
+    probes = [probe_media_params(c) for c in clips]
+    if not probes:
+        return False
+    if any(not p.get("width") for p in probes):
+        return True
+    # 视频流探测不到帧率（0/0、缺 r_frame_rate）时也不赌流拷贝：混合帧率是
+    # 断档/补帧的直接来源，宁可重编码。
+    if any(not p.get("fps") for p in probes):
+        return True
+    ref = probes[0]
+    for params in probes:
+        if (params.get("width"), params.get("height")) != (ref.get("width"), ref.get("height")):
+            return True
+        if abs(float(params.get("fps") or 0) - float(ref.get("fps") or 0)) > 0.01:
+            return True
+        if bool(params.get("sample_rate")) != bool(ref.get("sample_rate")):
+            return True
+        if params.get("sample_rate") and params.get("sample_rate") != ref.get("sample_rate"):
+            return True
+        if params.get("channels") != ref.get("channels"):
+            return True
+        if target_size and (params.get("width"), params.get("height")) != tuple(target_size):
+            return True
+        if fps and abs(float(params.get("fps") or 0) - float(fps)) > 0.01:
+            return True
+    # 有音轨的片段必须统一到目标采样率/声道数，否则拼接后时长会被错误解释。
+    if ref.get("sample_rate"):
+        if sample_rate and int(ref.get("sample_rate") or 0) != int(sample_rate):
+            return True
+        if channels and int(ref.get("channels") or 0) != int(channels):
+            return True
+    # 容器时长 ≠ 视频流时长（AAC padding 等）时也不赌流拷贝：concat demuxer
+    # 按容器时长推进下一段的起点，视频轨就会留下空洞。实测《宦娘》成片唯一
+    # 一处 0.1s 断档（217.067s）就出在这条路径上——单镜片段容器 10.144s、
+    # 视频流 10.133s（差 0.0107s），而转场段两者一致，拼接后恰好缺 3 帧。
+    for params in probes:
+        video_dur = params.get("video_duration")
+        container_dur = params.get("container_duration")
+        if video_dur and container_dur:
+            if abs(float(container_dur) - float(video_dur)) > DURATION_DRIFT_TOLERANCE:
+                return True
+    return False
+
+
+def _normalize_vf(size: tuple[int, int], fps: int | float | None) -> str:
+    """scale+pad 到目标画布（保比例、补边），必要时统一帧率。"""
+    width, height = size
+    chain = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+    )
+    if fps:
+        chain += f",fps={fps}"
+    return chain
+
+
+def profile_canvas(
+    project_dir: str | Path | None,
+) -> tuple[tuple[int, int] | None, int | None]:
+    """项目 ``proposal_packet.output_profile`` → (目标画布, 目标帧率)。
+
+    未配置/未知档案返回 ``(None, None)``：调用方保持"按源片段推导"的旧行为，
+    不静默猜 1080p。``_assemble`` 用它把统一画布与帧率**一次性**传给拼接链，
+    避免拼接按源尺寸缩一次、finish 再按 profile 缩第二次（二次上采样）。
+    """
+    if not project_dir:
+        return None, None
+    try:
+        from montage.engine.artifacts import ArtifactStore
+
+        packet = ArtifactStore(Path(project_dir)).read("proposal_packet") or {}
+    except (OSError, ValueError, TypeError):
+        return None, None
+    name = str(packet.get("output_profile") or "").strip()
+    if not name:
+        return None, None
+    from montage.compose.profiles import get_profile
+
+    profile = get_profile(name)
+    if profile is None:
+        return None, None
+    return (profile.width, profile.height), profile.fps
+
+
+def detect_pts_gaps(
+    path: str | Path,
+    *,
+    min_ratio: float = 2.5,
+    timeout: int = 600,
+) -> dict[str, Any]:
+    """视频流 PTS 断档检测（播放器会表现为定格）。
+
+    返回 ``{checked, frames, last_pts, nominal_step, gaps, gap_seconds}``；
+    无 ffprobe / 帧太少时 ``checked=False``（调用方只应记 warning）。
+    """
+    target = Path(path)
+    report: dict[str, Any] = {
+        "checked": False, "frames": 0, "last_pts": 0.0,
+        "nominal_step": 0.0, "gaps": [], "gap_seconds": 0.0,
+    }
+    ffprobe = check_ffprobe()
+    if not ffprobe or not target.is_file():
+        return report
+    proc = run_ffmpeg(
+        [
+            ffprobe, "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "frame=pts_time,pkt_duration_time",
+            "-of", "csv=p=0", str(target),
+        ],
+        timeout=timeout, check=False,
+    )
+    pts: list[float] = []
+    for line in (proc.stdout or "").splitlines():
+        # csv=p=0 在第一行给 "0.000000,"（第二字段为空），其余行只有 pts：
+        # 取逗号前的第一个字段即可，缺字段/`N/A` 直接跳过。
+        token = line.split(",", 1)[0].strip()
+        if not token or token == "N/A":
+            continue
+        try:
+            pts.append(float(token))
+        except ValueError:
+            continue
+    if len(pts) < 3:
+        return report
+    steps = sorted(pts[i] - pts[i - 1] for i in range(1, len(pts)))
+    nominal = steps[len(steps) // 2]
+    gaps = [
+        {"start": round(pts[i - 1], 3), "duration": round(pts[i] - pts[i - 1], 3)}
+        for i in range(1, len(pts))
+        if nominal > 0 and (pts[i] - pts[i - 1]) > nominal * float(min_ratio)
+    ]
+    report.update({
+        "checked": True,
+        "frames": len(pts),
+        "last_pts": round(pts[-1], 3),
+        "nominal_step": round(nominal, 6),
+        "gaps": gaps,
+        "gap_seconds": round(sum(g["duration"] for g in gaps), 3),
+    })
+    return report
+
+
+_FREEZE_RE = re.compile(r"freeze_(?:start|duration):\s*([\d.]+)")
+
+
+def detect_freezes(
+    path: str | Path,
+    *,
+    noise_db: float = -60.0,
+    min_seconds: float = 1.0,
+    timeout: int = 1800,
+) -> dict[str, Any]:
+    """整片冻结帧检测（freezedetect）；返回 ``{checked, segments, total_seconds}``。"""
+    target = Path(path)
+    report: dict[str, Any] = {"checked": False, "segments": [], "total_seconds": 0.0}
+    ffmpeg = check_ffmpeg()
+    if not ffmpeg or not target.is_file():
+        return report
+    proc = run_ffmpeg(
+        [
+            ffmpeg, "-hide_banner", "-nostdin", "-i", str(target),
+            "-vf", f"freezedetect=n={noise_db}dB:d={min_seconds:.2f}",
+            "-an", "-f", "null", "-",
+        ],
+        timeout=timeout, check=False,
+    )
+    values = [float(v) for v in _FREEZE_RE.findall(proc.stderr or "")]
+    segments: list[dict[str, float]] = []
+    for i in range(0, len(values) - 1, 2):
+        segments.append({"start": round(values[i], 3), "duration": round(values[i + 1], 3)})
+    report.update({
+        "checked": True,
+        "segments": segments,
+        "total_seconds": round(sum(s["duration"] for s in segments), 3),
+    })
+    return report
+
+
 def concat_videos(
     clips: list[Path],
     output: Path,
     *,
     timeout: int = 1800,
     fallback_size: tuple[int, int] | None = None,
+    target_size: tuple[int, int] | None = None,
+    fps: int | float | None = None,
+    sample_rate: int = 48000,
+    channels: int = 2,
+    force_reencode: bool = False,
 ) -> Path:
     """按顺序拼接片段。输出统一 H.264 + AAC。
 
     ``fallback_size``：所有片段都探测不到尺寸时的兜底画布（应由调用方按
     output_profile 推导）。不传则直接报错，避免静默 letterbox 竖屏项目。
+
+    ``target_size`` / ``fps``：**项目级统一画布与帧率**。给了就要求每个片段
+    都落在该尺寸/帧率上；参数不一致时跳过流拷贝、强制重编码并 scale+pad
+    到目标。不传则沿用旧行为。
+
+    一致性由 ``clips_need_reencode`` 判定：混合 30fps/48kHz 与 24fps/32kHz 的
+    片段走 concat 流拷贝会按第一条流的参数硬拼，音轨与画面时基对不上
+    （实测音轨比视频长 33.7s、画面 4.96s 断档）。
     """
     if len(clips) == 0:
         raise ComposError("concat 需要至少一个片段")
@@ -166,29 +450,126 @@ def concat_videos(
     lines = [concat_file_line(p) for p in clips]
     list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    # 先尝试流拷贝（快），失败回退重编码（兼容不同参数）
-    cmd_copy = [
-        ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-        "-c", "copy", "-movflags", "+faststart", str(output),
-    ]
-    try:
-        _run(cmd_copy, timeout=timeout)
-    except ComposError:
-        size = _first_video_size(clips) or fallback_size
-        if size is None:
+    size = target_size or _first_video_size(clips) or fallback_size
+    # 项目级归一（给了目标画布/帧率）时才强制 48kHz 立体声；否则只要求
+    # 片段之间参数一致，避免把无关调用（片头 concat 等）拖进整片重编码。
+    strict_audio = bool(target_size or fps or force_reencode)
+    need_reencode = bool(force_reencode) or clips_need_reencode(
+        clips,
+        target_size=target_size,
+        fps=fps,
+        sample_rate=int(sample_rate) if strict_audio else 0,
+        channels=int(channels) if strict_audio else 0,
+    )
+
+    if size is None:
+        # 探测不到画布、调用方也没给目标尺寸：保持旧行为——先试流拷贝，
+        # 失败即报错（绝不静默 letterbox 成横屏）。真实链路由 _assemble 传
+        # output_profile 解析出的 target_size，不会走到这里。
+        try:
+            _run([
+                ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                "-c", "copy", "-movflags", "+faststart", str(output),
+            ], timeout=timeout)
+            return output
+        except ComposError:
             raise ComposError(
                 "concat 回退重编码无法确定画布尺寸（所有片段探测失败），"
-                "请传 fallback_size（按 output_profile 推导）"
+                "请传 target_size/fallback_size（按 output_profile 推导）"
             )
-        size_w, size_h = size
-        cmd_reencode = [
+
+    # 参数一致时才尝试流拷贝（快）；不一致必须重编码，否则后面片段会被
+    # 播放器按第一条流的时基解释，出现断档 / 音画不同长。
+    if not need_reencode:
+        cmd_copy = [
             ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-            "-vf", f"scale={size_w}:{size_h}:force_original_aspect_ratio=decrease,pad={size_w}:{size_h}:(ow-iw)/2:(oh-ih)/2",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output),
+            "-c", "copy", "-movflags", "+faststart", str(output),
         ]
-        _run(cmd_reencode, timeout=timeout)
+        try:
+            _run(cmd_copy, timeout=timeout)
+            return output
+        except ComposError:
+            need_reencode = True
+
+    # **逐片段**归一化后再拼：把 scale/pad/fps 套在 concat demuxer 的输出上，
+    # 混合帧率的片段会被 fps 滤镜补帧（实测 2s 素材出 2.5s 视频），所以必须
+    # 让每个片段先落到同一画布/帧率/采样率，再用流拷贝硬拼。
+    strict = strict_audio
+    work = output.parent / f"{output.stem}.norm"
+    work.mkdir(parents=True, exist_ok=True)
+    uniform: list[Path] = []
+    for idx, clip in enumerate(clips):
+        if not clips_need_reencode(
+            [clip],
+            target_size=size,
+            fps=fps,
+            sample_rate=int(sample_rate) if strict else 0,
+            channels=int(channels) if strict else 0,
+        ):
+            uniform.append(clip)
+            continue
+        dest = work / f"{idx:03d}.mp4"
+        _normalize_clip(
+            clip, dest,
+            size=size,
+            fps=fps,
+            sample_rate=sample_rate,
+            channels=channels,
+            with_audio=all(_clip_has_audio(c) for c in clips),
+            timeout=timeout,
+        )
+        uniform.append(dest)
+    norm_list = output.with_suffix(".norm.txt")
+    norm_list.write_text(
+        "\n".join(concat_file_line(p) for p in uniform) + "\n", encoding="utf-8",
+    )
+    try:
+        _run([
+            ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(norm_list),
+            "-c", "copy", "-movflags", "+faststart", str(output),
+        ], timeout=timeout)
+    except ComposError:
+        # 归一化后仍拷不动（容器/编码差异）：退回整片重编码，保证有产物。
+        _run([
+            ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(norm_list),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "192k", "-ar", str(int(sample_rate)),
+            "-ac", str(int(channels)), "-movflags", "+faststart", str(output),
+        ], timeout=timeout)
     return output
+
+
+def _normalize_clip(
+    src: Path,
+    dest: Path,
+    *,
+    size: tuple[int, int],
+    fps: int | float | None,
+    sample_rate: int,
+    channels: int,
+    with_audio: bool,
+    timeout: int = 1800,
+) -> Path:
+    """单片段归一到目标画布/帧率/采样率（concat 预处理）。"""
+    ffmpeg = check_ffmpeg()
+    if not ffmpeg:
+        raise ComposError("缺少 ffmpeg")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg, "-y", "-nostdin", "-i", str(src),
+        "-vf", _normalize_vf(size, fps),
+    ]
+    if with_audio and _clip_has_audio(src):
+        cmd += [
+            "-af", _audio_norm_filter(),
+            "-c:a", "aac", "-b:a", "192k",
+            "-ar", str(int(sample_rate)), "-ac", str(int(channels)),
+        ]
+    else:
+        cmd += ["-an"]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", str(dest)]
+    _run(cmd, timeout=timeout)
+    return dest
 
 
 def trim_clip(input_path: Path, output: Path, start: float, duration: float) -> Path:
@@ -254,18 +635,66 @@ def retake_segment(
             pass
 
 
-def burn_subtitles(input_path: Path, srt_path: Path, output: Path) -> Path:
+def burn_subtitles(
+    input_path: Path,
+    srt_path: Path,
+    output: Path,
+    *,
+    fontsdir: str | Path | None = None,
+    force_style: str = "",
+    crf: int = 20,
+) -> Path:
+    """烧录字幕（libass 按扩展名识别 SRT/ASS）。
+
+    ``fontsdir``：字体目录。ASS 样式里的 Fontname 只有在 libass 能找到该字体
+    时才生效；``assets/fonts`` 为空时会静默回退系统字体（Windows 上可能换字形
+    或出豆腐块），所以调用方应传 ``resolve_font_file()`` 所在目录。
+    """
     ffmpeg = check_ffmpeg()
     if not ffmpeg:
         raise ComposError("缺少 ffmpeg")
     output.parent.mkdir(parents=True, exist_ok=True)
+    vf = f"subtitles={filter_path(srt_path)}"
+    if fontsdir:
+        vf += f":fontsdir={filter_path(Path(fontsdir))}"
+    if force_style:
+        vf += f":force_style='{force_style}'"
     _run([
         ffmpeg, "-y", "-i", str(input_path),
-        "-vf", f"subtitles={srt_path.as_posix()}",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(int(crf)),
         "-c:a", "copy", str(output),
     ])
     return output
+
+
+def font_family_name(font_path: str | Path | None) -> str:
+    """读字体文件的家族名（供 ASS ``Fontname`` 使用）；读不到返回文件 stem。
+
+    fontTools 缺失时退回 stem——libass 在 Windows 上对 stem 匹配（如
+    ``msyh``）并不总是成功，所以这只是兜底而非首选。
+    """
+    if not font_path:
+        return ""
+    path = Path(font_path)
+    try:
+        from fontTools.ttLib import TTCollection, TTFont
+
+        if path.suffix.lower() == ".ttc":
+            fonts = TTCollection(str(path)).fonts
+            font = fonts[0] if fonts else None
+        else:
+            font = TTFont(str(path), fontNumber=0, lazy=True)
+        if font is None:
+            return path.stem
+        names = font["name"]
+        for name_id in (16, 1, 4):
+            record = names.getDebugName(name_id)
+            if record:
+                return record
+    except (OSError, ImportError, KeyError, TypeError, ValueError):
+        pass
+    return path.stem
 
 
 def filter_path(path: Path) -> str:
@@ -426,9 +855,48 @@ def extract_last_frame(src: Path, output: Path) -> Path:
         ffmpeg, "-y", "-ss", f"{ss:.3f}", "-i", str(src),
         "-frames:v", "1", "-q:v", "2", str(output),
     ]
-    _run(cmd_ss, timeout=60)
+    try:
+        _run(cmd_ss, timeout=60)
+    except ComposError:
+        pass
+    if _ok(output):
+        return output
+
+    # 低帧率素材（抽帧/录屏，帧间隔 > 0.05s）两次 seek 都会落在末帧之后的空档里，
+    # 得到「没有帧」。再退一步按「倒数 1 秒」取，保证任何 fps≥1 的片子都抽得出。
+    cmd_last_second = [
+        ffmpeg, "-y", "-sseof", "-1", "-i", str(src),
+        "-frames:v", "1", "-q:v", "2", str(output),
+    ]
+    try:
+        _run(cmd_last_second, timeout=60)
+    except ComposError:
+        pass
     if not _ok(output):
         raise ComposError("extract_last_frame 失败：输出没有视频流或为空")
+    return output
+
+
+def extract_frame_at(src: Path, at_seconds: float, output: Path) -> Path:
+    """抽指定时间点的一帧（VLM 分段抽帧用）。
+
+    seek 放在 ``-i`` 前（快速 seek）：审片抽检要的是「这一段时间大概长什么样」，
+    不需要帧级精确；成片动辄 1–2 小时，精确 seek 每点都要解码到该处，得不偿失。
+    """
+    ffmpeg = check_ffmpeg()
+    if not ffmpeg:
+        raise ComposError("缺少 ffmpeg")
+    if not src.exists():
+        raise ComposError(f"输入不存在: {src}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ss = max(float(at_seconds), 0.0)
+    cmd = [
+        ffmpeg, "-y", "-ss", f"{ss:.3f}", "-i", str(src),
+        "-frames:v", "1", "-q:v", "2", str(output),
+    ]
+    _run(cmd, timeout=60)
+    if not output.exists() or output.stat().st_size < 1:
+        raise ComposError(f"extract_frame_at 失败：t={ss:.3f}s 没有抽出帧")
     return output
 
 
@@ -502,6 +970,54 @@ def needs_transition_at(cut: dict[str, Any]) -> bool:
     """
     tname, _tdur = _normalize_transition(cut)
     return tname != "cut"
+
+
+def _to_frames(seconds: float, fps: float) -> int:
+    """秒 → 帧数（四舍五入）；``fps<=0`` 返回 0。"""
+    if fps <= 0:
+        return 0
+    return max(int(round(float(seconds) * float(fps))), 0)
+
+
+def xfade_offsets(
+    durations: list[float],
+    transitions: list[dict[str, Any]],
+    *,
+    fps: float = 30.0,
+    min_duration: float = 0.05,
+) -> list[dict[str, float]]:
+    """纯函数：算出 xfade 链每一步的 ``offset`` / ``duration``（秒，**帧对齐**）。
+
+    帧对齐是**防御性硬化**：offset 停在两帧之间时，xfade 在转场窗口末尾可能
+    少输出帧。注意——它不是《宦娘》成片 0.1s@217.07s 那处空洞的成因：用
+    半帧/整帧两种算式跑 3 段 24fps 真片段，实测都是 0 断档。该空洞已定位到
+    concat 路径（见 ``clips_need_reencode`` 的容器/视频流时长漂移检查）。
+    保留帧对齐是因为它让 offset 可复现、可断言，且没有任何额外成本。
+
+    返回长度 = ``len(durations) - 1``，与 ``transitions`` 一一对应。
+    """
+    rows: list[dict[str, float]] = []
+    if not durations:
+        return rows
+    rate = float(fps) if float(fps) > 0 else 30.0
+    chain_frames = _to_frames(durations[0], rate)
+    for i in range(1, len(durations)):
+        tname, tdur = _normalize_transition(
+            transitions[i - 1] if i - 1 < len(transitions) else {}
+        )
+        if tname == "cut":
+            # 调用方已按 cut 拆段；此处保持防御语义：cut 不吃重叠。
+            rows.append({"offset": chain_frames / rate, "duration": 0.0})
+            chain_frames += _to_frames(durations[i], rate)
+            continue
+        dur_frames = max(_to_frames(max(float(tdur), float(min_duration)), rate), 1)
+        offset_frames = max(chain_frames - dur_frames, 0)
+        rows.append({
+            "offset": offset_frames / rate,
+            "duration": dur_frames / rate,
+        })
+        chain_frames = offset_frames + _to_frames(durations[i], rate)
+    return rows
 
 
 def _clip_duration(path: Path) -> float:
@@ -586,12 +1102,17 @@ def _xfade_stitch(
     *,
     keep_audio: bool = True,
     timeout: int = 1800,
+    target_size: tuple[int, int] | None = None,
+    fps: int | float | None = None,
 ) -> Path:
     """把一段**全部为非 cut 转场**的片段用一条 xfade 链拼起来。
 
     cut 转场不能交给 xfade：ffmpeg 没有 ``transition=cut``，会报
     "const_values array too small for transition" / "Not yet implemented in
     FFmpeg"。调用方需先把 cut 处拆开。
+
+    ``target_size`` / ``fps``：**项目级统一画布与帧率**。不传则按首片段实测
+    尺寸、帧率写死 30 的老行为（会产生与普通镜不一致的转场段，见 A2）。
     """
     ffmpeg = check_ffmpeg()
     if not ffmpeg:
@@ -616,21 +1137,40 @@ def _xfade_stitch(
     for c in clips:
         inputs += ["-i", str(c)]
 
+    size = target_size or _first_video_size(clips)
+    # 帧对齐基准：xfade 的 offset/duration 都按整帧换算（见 xfade_offsets）。
+    rate = float(fps or 30) or 30.0
+    if size is None:
+        # 探测不到尺寸（占位素材 / 探测失败）：只统一帧率与时基，不猜画布。
+        # 真实链路由 _assemble 传 target_size（output_profile 解析）保证一致。
+        video_norm = f"fps={rate:g},settb=AVTB,setpts=PTS-STARTPTS"
+    else:
+        video_norm = f"{_normalize_vf(size, rate)},settb=AVTB,setpts=PTS-STARTPTS"
     fc: list[str] = []
-    prev_label = "[0:v]"
-    cum_dur = 0.0
-    for i in range(1, len(clips)):
-        tname, tdur = _normalize_transition(transitions[i - 1] if i - 1 < len(transitions) else {})
+    for i in range(len(clips)):
+        fc.append(f"[{i}:v]{video_norm}[vn{i}]")
+    prev_label = "[vn0]"
+    # 链长按「加上本段、再扣掉本段与上一段的交叠」推进。早前版本只累加原始
+    # 时长、每刀都只扣一次 tdur，offset 会随刀数线性超出真实链长，xfade 在
+    # 那段区间**不输出任何帧**（PTS 断档）；播放器只能定格上一帧，CFR 重编码
+    # 再把它补成定格画面——曾经让 10 连转场的高潮幕整整定住一分钟。
+    # offset 统一走 xfade_offsets 的整帧算式（可复现、可断言）。注意：成片
+    # 217.07s 那处 0.1s 空洞经实测**不是**这里造成的（半帧算式复现不出），
+    # 而是 concat 路径的容器/视频流时长漂移——修在 clips_need_reencode。
+    steps = xfade_offsets(durations, transitions, fps=rate)
+    for i, step in enumerate(steps, start=1):
+        tname, _tdur = _normalize_transition(
+            transitions[i - 1] if i - 1 < len(transitions) else {}
+        )
         xf = _XFADE_TRANSITIONS.get(tname, "fade")
         if xf == "cut" and not supports("xfade_cut"):
             # 调用方已把 cut 拆成 concat；此处仅防御，绝不把 transition=cut
             # 发给 ffmpeg（9.x 会直接失败）。
             xf = "fade"
-        cum_dur += durations[i - 1]
-        offset = cum_dur - tdur  # 负空隙：两片段重叠 tdur 秒
-        dur = tdur
+        dur = step["duration"] or 0.05
+        offset = step["offset"]  # 负空隙：两片段重叠 dur 秒
         fc.append(
-            f"{prev_label}[{i}:v]xfade=transition={xf}:duration={dur:.3f}:offset={offset:.3f}[x{i}]"
+            f"{prev_label}[vn{i}]xfade=transition={xf}:duration={dur:.6f}:offset={offset:.6f}[x{i}]"
         )
         prev_label = f"[x{i}]"
     filter_complex = ";".join(fc)
@@ -666,6 +1206,8 @@ def stitch_with_transitions(
     *,
     keep_audio: bool = True,
     timeout: int = 1800,
+    target_size: tuple[int, int] | None = None,
+    fps: int | float | None = None,
 ) -> Path:
     """按转场定义拼接片段：非 cut 用 xfade，cut 用真硬切（concat）。
 
@@ -704,6 +1246,7 @@ def stitch_with_transitions(
     if len(runs) == 1:
         return _xfade_stitch(
             runs[0][0], runs[0][1], output, keep_audio=keep_audio, timeout=timeout,
+            target_size=target_size, fps=fps,
         )
 
     work = output.parent / f"{output.stem}.trans"
@@ -716,9 +1259,12 @@ def stitch_with_transitions(
         dest = work / f"run{idx:02d}.mp4"
         _xfade_stitch(
             run_clips, run_trans, dest, keep_audio=keep_audio, timeout=timeout,
+            target_size=target_size, fps=fps,
         )
         parts.append(dest)
-    concat_videos(parts, output, timeout=timeout)
+    concat_videos(
+        parts, output, timeout=timeout, target_size=target_size, fps=fps,
+    )
     return output
 
 
@@ -835,6 +1381,8 @@ _FONT_EXTS = (".ttf", ".otf", ".ttc")
 # 平台系统字体兜底：drawtext 不给 fontfile 时依赖 fontconfig，Windows 上
 # 常直接报 "Fontconfig error: Cannot load default config file" 而没有片头。
 _SYSTEM_FONT_CANDIDATES = (
+    "C:/Windows/Fonts/NotoSansSC-VF.ttf",  # Noto Sans SC（即思源黑体，A5 默认字体）
+    "C:/Windows/Fonts/NotoSerifSC-VF.ttf",  # Noto Serif SC（宋体系，可选）
     "C:/Windows/Fonts/msyh.ttc",          # 微软雅黑（简体中文）
     "C:/Windows/Fonts/msyhbd.ttc",
     "C:/Windows/Fonts/simhei.ttf",        # 黑体
@@ -1074,9 +1622,16 @@ def mix_audio(
         parts.append("[m]anull[a]")
         maps += ["-map", "[a]"]
     else:
-        maps += ["-map", "0:a:0?"]
+        if loudnorm and _has_audio_stream(video):
+            parts.append(
+                f"[0:a]volume={source_audio_volume},"
+                "dynaudnorm=p=0.80:m=6.0:r=0.30[a]"
+            )
+            maps += ["-map", "[a]"]
+        else:
+            maps += ["-map", "0:a:0?"]
 
-    if loudnorm and narration and parts:
+    if loudnorm and parts:
         parts[-1] = (
             parts[-1].rsplit("[a]", 1)[0]
             + f"[tmp];[tmp]loudnorm=I={loudness_target}:TP=-1.5:LRA=11[a]"
@@ -1085,7 +1640,12 @@ def mix_audio(
     cmd: list[str] = [ffmpeg, *inputs]
     if parts:
         cmd += ["-filter_complex", ";".join(parts)]
-    cmd += [*maps, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(output)]
+    # A2：输出统一 48kHz 立体声。loudnorm 内部会升到 192kHz，不带 -ar 时编码器
+    # 会照单全收（实测成片音轨变成 96kHz），下游平台与拼接都要按 48k 处理。
+    cmd += [
+        *maps, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-ar", "48000", "-ac", "2", "-shortest", str(output),
+    ]
     _run(cmd)
     return output
 
@@ -1184,6 +1744,9 @@ class FFmpegCompose(BaseTool):
             "reframe_mode": {"type": "string", "enum": ["center", "face"], "default": "center"},
             "output_path": {"type": "string"},
             "srt_path": {"type": "string"},
+            "fontsdir": {"type": "string", "description": "burn_subtitles 的字体目录（缺省按 fontfile 解析）"},
+            "fontfile": {"type": "string", "description": "burn_subtitles 字体文件；解析其所在目录给 libass"},
+            "force_style": {"type": "string", "description": "burn_subtitles 的 ASS force_style 覆盖串"},
             "lut_path": {"type": "string", "description": "apply_lut 的 .cube 调色表路径"},
             "lut_strength": {"type": "number", "default": 1.0, "description": "LUT 混合强度 0-1"},
             "profile": {"type": "string", "description": "apply_profile 的平台档案名（youtube_landscape 等）"},
@@ -1204,6 +1767,16 @@ class FFmpegCompose(BaseTool):
             "ducking": {"type": "boolean", "default": False, "description": "旁白触发式音乐闪避。mix_audio 默认关；assemble 默认开"},
             "loudnorm": {"type": "boolean", "default": False, "description": "响度标准化（-14 LUFS）。mix_audio 默认关；assemble 默认开"},
             "mix_source_audio": {"type": "boolean", "default": False, "description": "把视频自带音轨（place_audio 的 SFX）混进 assemble"},
+            "level_audio": {
+                "type": "boolean", "default": False,
+                "description": "assemble 前逐镜配平音轨（A6；产物落 assets/leveled/，不改源素材）",
+            },
+            "force_level_audio": {"type": "boolean", "default": False, "description": "忽略配平缓存重算"},
+            "target_size": {
+                "type": "array", "items": {"type": "integer"},
+                "description": "拼接目标画布 [w,h]；缺省读 proposal_packet.output_profile",
+            },
+            "target_fps": {"type": "integer", "description": "拼接目标帧率；缺省读 output_profile"},
             "start_seconds": {"type": "number"},
             "duration_seconds": {"type": "number"},
             "edit_decisions": {"type": "object"},
@@ -1258,7 +1831,15 @@ class FFmpegCompose(BaseTool):
 
         if operation == "burn_subtitles":
             src, srt, out = Path(inputs["input_path"]), Path(inputs["srt_path"]), Path(inputs.get("output_path", "subs.mp4"))
-            burn_subtitles(src, srt, out)
+            fontsdir = inputs.get("fontsdir")
+            if not fontsdir:
+                font = resolve_font_file(inputs.get("fontfile"))
+                fontsdir = font.parent if font is not None else None
+            burn_subtitles(
+                src, srt, out,
+                fontsdir=fontsdir,
+                force_style=str(inputs.get("force_style") or ""),
+            )
             return ToolResult(success=True, data={"output": str(out), **probe(out)})
 
         if operation == "apply_lut":
@@ -1541,14 +2122,83 @@ class FFmpegCompose(BaseTool):
         out_dir = Path(inputs.get("output_path") or "renders/final.mp4")
         out_dir.parent.mkdir(parents=True, exist_ok=True)
         joined = out_dir.with_suffix(".joined.mp4")
+
+        # P0-8：post 层 vfx 在拼接前逐 cut 应用（输出替换为特效产物；时长守恒）。
+        # MONTAGE_NO_VFX=1 时 apply_post_vfx 内部直通。有 vfx 的 cut 天然走重编码。
+        vfx_applied = 0
+        processed_clips: list[Path] = []
+        for cut, clip in zip(cuts, clips):
+            vfx_items = cut.get("vfx") if isinstance(cut.get("vfx"), list) else []
+            has_post = any(
+                isinstance(v, dict) and str(v.get("layer") or "") == "post"
+                for v in vfx_items
+            )
+            if not has_post:
+                processed_clips.append(clip)
+                continue
+            vfx_out = clip.with_name(f"{clip.stem}_vfx.mp4")
+            try:
+                from montage.compose.effects import apply_post_vfx
+
+                apply_post_vfx(clip, vfx_out, vfx_items, work_dir=out_dir.parent)
+                processed_clips.append(vfx_out)
+                vfx_applied += 1
+            except ComposError as exc:
+                return ToolResult(success=False, error=f"cut {cut.get('shot_id')} 特效失败: {exc}")
+
         # cut 切点即便带着误写的 negative_gap 也只算硬切，避免整片走 xfade
         # 后因 ffmpeg 没有 transition=cut 而直接失败。
+        # A2/A3：成片画布与帧率**一次统一在拼接阶段**——按 proposal_packet 的
+        # output_profile 解析出 1920x1080@30，传给 xfade 链与 concat，之后
+        # finish 的 apply_profile 成为同尺寸复核而不是二次缩放。
+        project_dir = inputs.get("project_dir")
+        target_size, target_fps = profile_canvas(project_dir)
+        if not target_size:
+            hint = inputs.get("target_size")
+            if isinstance(hint, (list, tuple)) and len(hint) == 2:
+                try:
+                    target_size = (int(hint[0]), int(hint[1]))
+                except (TypeError, ValueError):
+                    target_size = None
+        if not target_fps:
+            try:
+                target_fps = int(inputs.get("target_fps") or 0) or None
+            except (TypeError, ValueError):
+                target_fps = None
+
+        # A6：逐镜音频配平（assemble 之前的独立步骤；place_audio 在原生音轨
+        # 路径整体早退，配平写在它之内不生效）。产物落 assets/leveled/，不覆盖源。
+        level_report: dict[str, Any] | None = None
+        if inputs.get("level_audio"):
+            from montage.compose.audio_level import level_clips
+
+            if project_dir:
+                leveled_dir = Path(project_dir) / "assets" / "leveled"
+            else:
+                leveled_dir = out_dir.parent / "leveled"
+            try:
+                level_report = level_clips(
+                    processed_clips,
+                    leveled_dir,
+                    force=bool(inputs.get("force_level_audio")),
+                )
+            except ComposError as exc:
+                return ToolResult(success=False, error=f"逐镜音频配平失败: {exc}")
+            if not level_report.get("disabled"):
+                processed_clips = [Path(p) for p in level_report.get("paths") or processed_clips]
+
         needs_transition = any(needs_transition_at(c) for c in cuts)
-        if needs_transition and len(clips) >= 2:
+        if needs_transition and len(processed_clips) >= 2:
             # cuts[j] 的转场描述 cuts[j-1] → cuts[j]（stitch 内 transitions[j-1]=cuts[j]）
-            stitch_with_transitions(clips, cuts, joined)
+            stitch_with_transitions(
+                processed_clips, cuts, joined,
+                target_size=target_size, fps=target_fps,
+            )
         else:
-            concat_videos(clips, joined)
+            concat_videos(
+                processed_clips, joined,
+                target_size=target_size, fps=target_fps,
+            )
 
         segs = inputs.get("music_segments")
         if not isinstance(segs, list):
@@ -1597,8 +2247,27 @@ class FFmpegCompose(BaseTool):
             "width": out_size[0],
             "height": out_size[1],
             "clips": clip_rows,
+            "vfx_clips": vfx_applied,
             "ffmpeg_version": ffmpeg_version(),
             "ffmpeg_capabilities": capabilities_snapshot()["capabilities"],
+            "canvas": {
+                "width": target_size[0] if target_size else 0,
+                "height": target_size[1] if target_size else 0,
+                "fps": target_fps or 0,
+            },
+            "audio_leveling": (
+                {
+                    "enabled": True,
+                    "target_db": level_report.get("target_db"),
+                    "spread_before": level_report.get("spread_before"),
+                    "spread_after": level_report.get("spread_after"),
+                    "outliers": level_report.get("outliers") or [],
+                    "dir": level_report.get("dir"),
+                    "clips": level_report.get("clips") or [],
+                }
+                if level_report and not level_report.get("disabled")
+                else {"enabled": False}
+            ),
         }
         proj = inputs.get("project_dir")
         if proj:

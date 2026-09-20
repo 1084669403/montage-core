@@ -6,12 +6,24 @@
 
 import json
 import os
+import re
 
 import pytest
 
 from montage.compose import ffmpeg_engine as fe
 from montage.compose import narration
 from montage.toolbase import ToolStatus
+
+
+_XFADE_RE = re.compile(r"xfade=transition=(\w+):duration=([\d.]+):offset=([\d.]+)")
+
+
+def _xfade_args(cmd: str) -> list[tuple[str, float, float]]:
+    """解析命令行里的 xfade 参数，避免断言写死小数位格式。"""
+    return [
+        (m.group(1), float(m.group(2)), float(m.group(3)))
+        for m in _XFADE_RE.finditer(cmd)
+    ]
 
 
 def test_status_reflects_ffmpeg():
@@ -362,9 +374,17 @@ def test_stitch_transitions_command(monkeypatch, tmp_path):
     )
     assert len(captured) == 1
     cmd = " ".join(captured[0])
-    # 负空隙重叠：offset = 累计时长 - 转场时长
-    assert "xfade=transition=fade:duration=0.500:offset=4.500" in cmd
-    assert "xfade=transition=fadeblack:duration=1.000:offset=9.000" in cmd
+    # 负空隙重叠：offset = 累计时长 - 转场时长；且 offset/duration 都落在帧边界上
+    # （半帧误差会在转场窗口末尾留 PTS 空洞，见 xfade_offsets 的说明）。
+    args = _xfade_args(cmd)
+    assert args[0][0] == "fade"
+    assert args[0][1] == pytest.approx(0.5)
+    assert args[0][2] == pytest.approx(4.5)
+    # A1：offset 按「真实链长」推进（累加本段、再扣本段交叠），不是老的
+    # 「累计原始时长 − 一刀 tdur」——后者会让 10 连转场整段不输出帧。
+    assert args[1][0] == "fadeblack"
+    assert args[1][1] == pytest.approx(1.0)
+    assert args[1][2] == pytest.approx(8.5)
     assert "-an" in cmd
 
 
@@ -420,7 +440,10 @@ def test_stitch_mixed_cut_and_crossfade(monkeypatch, tmp_path):
     assert not any("transition=cut" in j for j in joined)
     xfades = [j for j in joined if "xfade" in j]
     assert len(xfades) == 1
-    assert "xfade=transition=fade:duration=0.500:offset=4.500" in xfades[0]
+    args = _xfade_args(xfades[0])
+    assert args[0][0] == "fade"
+    assert args[0][1] == pytest.approx(0.5)
+    assert args[0][2] == pytest.approx(4.5)
     assert any("-f concat" in j for j in joined)
 
 
@@ -432,8 +455,41 @@ def test_needs_transition_at_rejects_cut_and_zero():
     assert fe.needs_transition_at({"transition": "fade_black", "negative_gap_seconds": 1.0}) is True
 
 
+def test_clips_need_reencode_detects_container_duration_drift(monkeypatch, tmp_path):
+    """容器时长被音频 padding 撑长时必须重编码。
+
+    concat demuxer 流拷贝按容器时长推进下一段起点，视频轨会留下空洞——《宦娘》
+    成片唯一一处 0.1s 断档（217.067s）就是这个成因（单镜容器 10.144s /
+    视频流 10.133s，转场段两者一致）。
+    """
+    a, b = tmp_path / "a.mp4", tmp_path / "b.mp4"
+    for f in (a, b):
+        f.write_bytes(b"x")
+
+    def params(*, video_duration: float, container_duration: float) -> dict:
+        return {
+            "width": 1920, "height": 1080, "fps": 30.0,
+            "sample_rate": 48000, "channels": 2,
+            "video_duration": video_duration,
+            "container_duration": container_duration,
+        }
+
+    monkeypatch.setattr(
+        fe, "probe_media_params",
+        lambda p: params(video_duration=10.133333, container_duration=10.144),
+    )
+    assert fe.clips_need_reencode([a, b]) is True
+
+    # 容器时长与视频流一致（差 <1ms）时不额外要求重编码：保留流拷贝快路径
+    monkeypatch.setattr(
+        fe, "probe_media_params",
+        lambda p: params(video_duration=10.144, container_duration=10.1444),
+    )
+    assert fe.clips_need_reencode([a, b]) is False
+
+
 def test_concat_reencode_fallback_keeps_clip_orientation(monkeypatch, tmp_path):
-    """回退重编码按片段实际尺寸建画布，不把竖屏硬拉成 1920x1080 横屏。"""
+    """参数不一致/帧率未知时逐片段归一到**片段实际尺寸**，不硬拉成 1920x1080。"""
     a, b = tmp_path / "a.mp4", tmp_path / "b.mp4"
     for f in (a, b):
         f.write_bytes(b"x")
@@ -441,8 +497,6 @@ def test_concat_reencode_fallback_keeps_clip_orientation(monkeypatch, tmp_path):
 
     def fake_run(cmd, timeout=1800):
         captured.append(cmd)
-        if len(captured) == 1:  # 流拷贝失败 → 触发回退重编码
-            raise fe.ComposError("copy failed")
 
     monkeypatch.setattr(fe, "_run", fake_run)
     monkeypatch.setattr(fe, "probe", lambda p: {
@@ -450,9 +504,11 @@ def test_concat_reencode_fallback_keeps_clip_orientation(monkeypatch, tmp_path):
         "streams": [{"codec_type": "video", "width": 720, "height": 1280}],
     })
     fe.concat_videos([a, b], tmp_path / "o.mp4")
-    reencode = " ".join(captured[1])
-    assert "scale=720:1280" in reencode and "pad=720:1280" in reencode
-    assert "1920:1080" not in reencode
+    all_cmds = " ".join(c for cmd in captured for c in cmd)
+    # 逐片段归一：第一刀就是把 720x1280 缩放到自身画布（无拉伸）
+    assert "scale=720:1280" in " ".join(captured[0])
+    assert "pad=720:1280" in " ".join(captured[0])
+    assert "1920:1080" not in all_cmds
 
 
 def test_stitch_negative_gap_alias(monkeypatch, tmp_path):
