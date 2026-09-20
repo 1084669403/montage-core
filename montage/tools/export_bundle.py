@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import zipfile
@@ -72,6 +73,97 @@ def _excluded(rel: Path) -> bool:
     return any(part in _EXCLUDE_PARTS for part in rel.parts)
 
 
+def sha256_file(path: str | Path, *, chunk: int = 1 << 20) -> str:
+    """文件 sha256（分块读，避免把整片读进内存）。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(chunk)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def verify_bundle(
+    bundle: str | Path,
+    project_dir: str | Path,
+) -> dict[str, Any]:
+    """核对交付包里的成片是否**仍是**磁盘上那一版。
+
+    动机（实测事故）：produce 出包之后又单独重编码了带字幕的 ``final.mp4``，
+    包里的成片就变成了旧版，而机器记录仍指向那个包——对外表现为"成片没有
+    字幕"。这里按 manifest 里记的 sha256 逐条比对，任何一处不一致都报出来。
+
+    返回 ``{checked, ok, mismatches[], missing[], bundle}``；manifest 缺失或
+    没记指纹时 ``checked=False``（老包按"没测到"处理，不误报）。
+    """
+    bundle_path = Path(bundle)
+    project = Path(project_dir)
+    report: dict[str, Any] = {
+        "bundle": str(bundle_path), "checked": False, "ok": True,
+        "mismatches": [], "missing": [],
+    }
+    if not bundle_path.is_file():
+        report["ok"] = False
+        report["missing"].append(str(bundle_path))
+        return report
+    try:
+        with zipfile.ZipFile(bundle_path) as zf:
+            manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            fingerprints = manifest.get("render_fingerprints") or []
+            for row in fingerprints:
+                rel = str(row.get("path") or "")
+                want = str(row.get("sha256") or "")
+                if not rel or not want:
+                    continue
+                report["checked"] = True
+                try:
+                    packed = sha256_file_from_zip(zf, rel)
+                except KeyError:
+                    report["ok"] = False
+                    report["missing"].append(rel)
+                    continue
+                if packed != want:
+                    report["ok"] = False
+                    report["mismatches"].append({
+                        "path": rel, "in_bundle": packed, "manifest": want,
+                    })
+    except (OSError, zipfile.BadZipFile, json.JSONDecodeError, KeyError):
+        report["ok"] = False
+        report["missing"].append("manifest.json")
+        return report
+    # 与磁盘现状比对：包内成片与当前 renders/ 不一致 = 包已过期
+    for row in fingerprints:
+        rel = str(row.get("path") or "")
+        if not rel:
+            continue
+        local = project / rel
+        if not local.is_file():
+            report["missing"].append(rel)
+            report["ok"] = False
+            continue
+        current = sha256_file(local)
+        if current != str(row.get("sha256") or ""):
+            report["ok"] = False
+            report["mismatches"].append({
+                "path": rel, "on_disk": current, "manifest": str(row.get("sha256") or ""),
+            })
+    return report
+
+
+def sha256_file_from_zip(zf: zipfile.ZipFile, name: str) -> str:
+    """zip 内条目的 sha256。"""
+    digest = hashlib.sha256()
+    with zf.open(name) as handle:
+        while True:
+            block = handle.read(1 << 20)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def build_bundle(
     project_dir: str | Path,
     output_dir: str | Path,
@@ -94,6 +186,7 @@ def build_bundle(
 
     entries: list[dict[str, Any]] = []
     media_files: list[dict[str, Any]] = []
+    render_fingerprints: list[dict[str, Any]] = []
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as zf:
         for sub, pattern in _EXPORT_GLOBS:
             base = project_dir / sub
@@ -109,6 +202,13 @@ def build_bundle(
                 entries.append(rel)
                 if sub == "renders" and f.suffix in (".mp4", ".webm"):
                     media_files.append(rel)
+                    # 成片指纹：出包后若有人重编码 renders/，verify_bundle 能立刻
+                    # 发现"登记的包不是最新成片"（实测字幕版就是这么丢的）。
+                    render_fingerprints.append({
+                        "path": rel,
+                        "size_bytes": f.stat().st_size,
+                        "sha256": sha256_file(f),
+                    })
 
         # 元数据文件（账本/决策/checkpoint）
         for name in ("cost.jsonl", "decisions.jsonl", "project.json"):
@@ -150,6 +250,7 @@ def build_bundle(
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "entries": entries,
             "media_files": media_files,
+            "render_fingerprints": render_fingerprints,
             "attributions": attributions,
             "note": "署名见 CREDITS.txt",
         }
