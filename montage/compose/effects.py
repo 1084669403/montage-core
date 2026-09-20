@@ -8,6 +8,10 @@
 - ``showcase_card``    展示卡片（9:16 letterbox + 底部标题）
 - ``cut_silence``      静音剪切/跳切（silencedetect 分析 + trim/concat）
 - ``auto_reframe``     智能重构图（比例转换；人脸追踪 OpenCV 可选，缺失降级居中）
+- ``impact_flash``     P0-8 冲击闪白（eq timeline 时间窗亮度脉冲，时长守恒）
+- ``zoom_punch``       P0-8 缩放冲击（crop 表达式急推回弹，不用 zoompan，时长守恒）
+- ``camera_shake``     P0-8 镜头震动（crop x/y 正弦抖动，时长守恒）
+- ``apply_post_vfx``   P0-8 post 层 vfx 分发器（按 onset 链式应用；MONTAGE_NO_VFX=1 直通）
 
 所有函数零第三方依赖（人脸追踪为可选 OpenCV，缺失自动降级）。
 """
@@ -410,11 +414,9 @@ def detect_silence(
         (ends if kind == "end" else starts).append(float(val))
     # 成对匹配（silence_end 对应最近的 silence_start）
     ranges: list[tuple[float, float]] = []
-    i = 0
-    for s in starts:
+    for i, s in enumerate(starts):
         e = ends[i] if i < len(ends) else s + min_duration
         ranges.append((s, e))
-        i += 1
     return ranges
 
 
@@ -460,7 +462,6 @@ def cut_silence(
     v_labels: list[str] = []
     a_labels: list[str] = []
     for i, (s, e) in enumerate(segments):
-        dur = e - s
         fc_parts.append(
             f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS[v{i}]"
         )
@@ -637,3 +638,199 @@ def lower_third(
         "-movflags", "+faststart", str(output),
     ])
     return output
+
+
+# ---------------------------------------------------------------------------
+# P0-8 后期特效（post 层 vfx）：冲击闪白 / 缩放冲击 / 镜头震动
+# ---------------------------------------------------------------------------
+# 时长守恒是硬约束：三个特效都不改变输出时长（保护 film_health.duration_check
+# 与 edit_metrics 不被自家特效打破）。滤镜选型约束：
+# - 亮度脉冲用 eq（有 timeline 支持）；curves 无 enable，会全程生效，不可用。
+# - 缩放冲击用 zoompan d=1（每输入帧出 1 帧，时长守恒；ot 驱动窗口）——
+#   crop 动态 w/h 会触发 filter 重初始化失败（ffmpeg 实测）。
+# - 震动用 crop x/y 表达式（x/y 动态求值不触发重初始化；w/h 固定才安全）。
+
+POST_VFX_KINDS: tuple[str, ...] = ("impact_flash", "zoom_punch", "camera_shake")
+
+
+def _post_vfx_guard(input_path: str | Path, output: str | Path) -> Path:
+    if not Path(input_path).exists():
+        raise ComposError(f"特效源文件不存在: {input_path}")
+    output = Path(output)
+    _out_dir(output)
+    return output
+
+
+def _post_vfx_cmd(
+    input_path: str | Path, output: Path, *, vf: str
+) -> list[str]:
+    """后期特效统一编码参数：重编码 + 音频直通 + 时长不显式裁剪（滤镜全部时长守恒）。"""
+    return [
+        _ffmpeg(), "-y", "-i", str(input_path),
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        "-movflags", "+faststart", str(output),
+    ]
+
+
+def impact_flash(
+    input_path: str | Path,
+    output: str | Path,
+    *,
+    onset: float,
+    duration: float = 0.12,
+    intensity: float = 0.6,
+) -> Path:
+    """冲击闪白：[onset, onset+duration] 时间窗内亮度脉冲（eq 有 timeline 支持）。
+
+    intensity 0-1 映射 brightness 0~0.5；窗外亮度增益为 0（enable 时间窗）。
+    """
+    if not 0.0 <= float(intensity) <= 1.0:
+        raise ComposError(f"impact_flash intensity 须在 [0,1]: {intensity}")
+    if float(duration) <= 0:
+        raise ComposError(f"impact_flash duration 须 > 0: {duration}")
+    if float(onset) < 0:
+        raise ComposError(f"impact_flash onset 须 >= 0: {onset}")
+    output = _post_vfx_guard(input_path, output)
+    start, end = float(onset), float(onset) + float(duration)
+    bright = 0.5 * float(intensity)
+    vf = (
+        f"eq=brightness={bright:.3f}"
+        f":enable='between(t,{start:.3f},{end:.3f})'"
+    )
+    _run(_post_vfx_cmd(input_path, output, vf=vf))
+    return output
+
+
+def zoom_punch(
+    input_path: str | Path,
+    output: str | Path,
+    *,
+    onset: float,
+    duration: float = 0.25,
+    intensity: float = 0.5,
+) -> Path:
+    """缩放冲击：[onset, onset+duration] 内急推放大后回弹（zoompan d=1）。
+
+    ffmpeg 实测约束：crop 动态 w/h 触发 filter 重初始化失败，不可用；
+    zoompan 配 ``d=1``（每输入帧恰好出 1 输出帧）时长天然守恒，用
+    ``ot``（out_time 秒）驱动三角波：0→1→0（上升急推、回弹），窗外 z=1 直通。
+    """
+    if not 0.0 < float(intensity) <= 1.0:
+        raise ComposError(f"zoom_punch intensity 须在 (0,1]: {intensity}")
+    if float(duration) <= 0:
+        raise ComposError(f"zoom_punch duration 须 > 0: {duration}")
+    if float(onset) < 0:
+        raise ComposError(f"zoom_punch onset 须 >= 0: {onset}")
+    output = _post_vfx_guard(input_path, output)
+    start, end = float(onset), float(onset) + float(duration)
+    lay = _media_layout(input_path)
+    zoom = 1.0 + 0.25 * float(intensity)
+    window = (
+        f"max(0\\,min(1\\,1-abs((ot-{start:.3f})/{duration:.3f}*2-1)))"
+    )
+    z_expr = (
+        f"if(between(ot\\,{start:.3f}\\,{end:.3f})"
+        f"\\,1+{zoom - 1:.4f}*{window}\\,1)"
+    )
+    vf = (
+        f"zoompan=z='{z_expr}'"
+        f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        f":d=1:s={lay['width']}x{lay['height']}:fps={lay['fps']}"
+    )
+    _run(_post_vfx_cmd(input_path, output, vf=vf))
+    return output
+
+
+def camera_shake(
+    input_path: str | Path,
+    output: str | Path,
+    *,
+    onset: float,
+    duration: float = 0.3,
+    intensity: float = 0.5,
+) -> Path:
+    """镜头震动：[onset, onset+duration] 内 crop x/y 正弦抖动，scale 回原尺寸。
+
+    幅度 = 帧高 * 0.03 * intensity；窗外位移 0。crop 表达式逐帧求值，
+    输出尺寸先锁定（偶数），时长天然守恒。
+    """
+    if not 0.0 < float(intensity) <= 1.0:
+        raise ComposError(f"camera_shake intensity 须在 (0,1]: {intensity}")
+    if float(duration) <= 0:
+        raise ComposError(f"camera_shake duration 须 > 0: {duration}")
+    if float(onset) < 0:
+        raise ComposError(f"camera_shake onset 须 >= 0: {onset}")
+    output = _post_vfx_guard(input_path, output)
+    start, end = float(onset), float(onset) + float(duration)
+    lay = _media_layout(input_path)
+    amp = max(2.0, lay["height"] * 0.03 * float(intensity))
+    # 窗内 sin 抖动；窗外位移 0（等价直通）。crop 无 enable timeline（ffmpeg 实测），
+    # 窗口判断内联进 x/y 表达式（if(between)），逐帧求值，时长天然守恒。
+    vf = (
+        f"crop=w=iw:h=ih"
+        f":x='if(between(t,{start:.3f},{end:.3f})\\,{amp:.2f}*sin(t*80)\\,0)'"
+        f":y='if(between(t,{start:.3f},{end:.3f})\\,{amp:.2f}*sin(t*120)\\,0)'"
+        f",scale=iw:ih"
+    )
+    _run(_post_vfx_cmd(input_path, output, vf=vf))
+    return output
+
+
+def apply_post_vfx(
+    input_path: str | Path,
+    output: str | Path,
+    vfx_list: list[dict[str, Any]] | None,
+    *,
+    work_dir: str | Path | None = None,
+) -> Path:
+    """post 层 vfx 分发器：按 onset 排序链式应用；空列表/MONTAGE_NO_VFX=1 直通。
+
+    非法 kind 报错（确定性）；合法但源文件缺失时报错由特效函数抛出。
+    work_dir 供链式中间产物落盘（缺省与 output 同目录）。
+    """
+    import os
+    import shutil
+
+    items = [v for v in (vfx_list or []) if isinstance(v, dict)]
+    post = sorted(
+        (v for v in items if str(v.get("layer") or "") == "post"),
+        key=lambda v: float(v.get("onset") or 0),
+    )
+    if os.environ.get("MONTAGE_NO_VFX", "").strip() == "1":
+        post = []
+    if not post:
+        # 直通：目标不存在时拷贝（调用方拿到的 output 一定存在）。
+        src, dst = Path(input_path), Path(output)
+        if src.resolve() != dst.resolve() and not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        return Path(output)
+    for v in post:
+        kind = str(v.get("kind") or "").strip()
+        if kind not in POST_VFX_KINDS:
+            raise ComposError(
+                f"未知 post 层特效 kind: {kind!r}（支持 {', '.join(POST_VFX_KINDS)}）"
+            )
+    work = Path(work_dir) if work_dir else Path(output).parent
+    work.mkdir(parents=True, exist_ok=True)
+    current = Path(input_path)
+    for i, v in enumerate(post):
+        kind = str(v["kind"])
+        last = i == len(post) - 1
+        target = Path(output) if last else work / f"_vfx_{i}_{kind}.mp4"
+        kwargs: dict[str, Any] = {
+            "onset": float(v.get("onset") or 0),
+        }
+        if v.get("duration") is not None:
+            kwargs["duration"] = float(v["duration"])
+        if v.get("intensity") is not None:
+            kwargs["intensity"] = max(0.0, min(1.0, float(v["intensity"])))
+        fn = {
+            "impact_flash": impact_flash,
+            "zoom_punch": zoom_punch,
+            "camera_shake": camera_shake,
+        }[kind]
+        current = fn(current, target, **kwargs)
+    return Path(output)
