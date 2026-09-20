@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -32,6 +33,7 @@ from montage.engine.director import (
 from montage.engine.episodes import is_series_root, materialize_episodes
 from montage.engine.finish import TITLE_CARD_SECONDS, LOWER_THIRD_SECONDS, inspect_finish
 from montage.engine.runtime import run_tool
+from montage.engine.material_contract import build_material_contract
 from montage.toolbase import BaseTool, ToolResult
 from montage.engine.policy import load_loop_policy
 from montage.tools.compose_planner import clip_path_for_shot, is_still_image
@@ -338,6 +340,12 @@ def _run_generate(
             sid = str(progress.get("sample_id") or "")
             if sid:
                 payload["force_ids"] = [sid]
+        generation_run_id = str(progress.get("generation_run_id") or uuid.uuid4().hex)
+        generation_batch_id = str(progress.get("generation_batch_id") or f"gen-{generation_run_id}")
+        progress["generation_run_id"] = generation_run_id
+        progress["generation_batch_id"] = generation_batch_id
+        payload["run_id"] = generation_run_id
+        payload["batch_id"] = generation_batch_id
         result = _call(runner_tool, payload, runner)
         data = result.data if isinstance(result.data, dict) else {}
         retryable = [str(x) for x in (data.get("retryable_ids") or []) if x]
@@ -428,10 +436,102 @@ def _run_generate(
                 progress["status"] = "fail"
                 save_progress(root, progress)
                 return {"success": False, "error": result.error, "progress": progress, "code": 2}
-            _mark(progress, "voice", "ok")
+            # narration_path 修复（v8.2 P1）：voice 成功后装配旁白轨，
+            # assemble 才有 narration_path 可传（原断链：sections 只在返回
+            # data 里，从不装配，TTS 对白永远进不了成片）。
+            vdata = result.data if isinstance(result.data, dict) else {}
+            sections = vdata.get("narration_sections")
+            narration_path = ""
+            if isinstance(sections, list) and sections:
+                ff = bag.get("ffmpeg_compose")
+                if ff is not None:
+                    npath = root / "assets" / "audio" / "narration.mp3"
+                    nres = _call(
+                        ff,
+                        {
+                            "operation": "assemble_narration",
+                            "sections": sections,
+                            "output_path": str(npath),
+                        },
+                        runner,
+                    )
+                    ndata = nres.data if isinstance(nres.data, dict) else {}
+                    narration_path = str(ndata.get("output") or "") if nres.success else ""
+            _mark(
+                progress, "voice", "ok",
+                extra={"narration_path": narration_path},
+            )
             save_progress(root, progress)
     return None
 
+
+
+def _build_segment_renders(
+    root: Path,
+    runnable: list[dict[str, Any]],
+    *,
+    bag: dict[str, BaseTool],
+    runner: Callable[..., ToolResult],
+) -> tuple[list[str], list[str]]:
+    """P0-6 segment 层：逐集按章拼段，返回 (段路径列表, 错误列表)。
+
+    有 chapters 的集：每章拼 renders/segments/<eid>__<chapter_id>.mp4，
+    段清单落 artifacts/segment_plan.json（BGM 所有权 + 叙事锚随层声明）；
+    无 chapters 的集（短篇集）整集 final.mp4 直通段层。
+    任一段缺失/失败记错误，caller 决定 fail 还是回退集 finals。
+    """
+    from montage.engine.story_outline import episode_segment_clips
+
+    ff = bag.get("ffmpeg_compose")
+    if ff is None:
+        return [], ["season-concat：缺少 ffmpeg_compose"]
+    seg_dir = root / "renders" / "segments"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    seg_paths: list[str] = []
+    seg_plan: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for ep in runnable:
+        eid = str(ep.get("episode_id") or "")
+        info = episode_segment_clips(Path(ep["path"]))
+        layers = info.get("layers") or []
+        if not layers:
+            # 无章集（短篇）：整集 final 直通段层（longform 仍以集为粒度）
+            final = Path(ep["path"]) / "renders" / "final.mp4"
+            if not final.is_file():
+                errors.append(f"season-concat：缺 {eid}/renders/final.mp4")
+                continue
+            seg_paths.append(str(final))
+            seg_plan.append({"episode_id": eid, "kind": "episode", "bgm_id": ""})
+            continue
+        for layer in layers:
+            cid = str(layer.get("chapter_id") or "")
+            out = seg_dir / f"{eid}__{cid}.mp4"
+            result = _call(
+                ff,
+                {"operation": "concat", "clips": layer["clips"], "output_path": str(out)},
+                runner,
+            )
+            if not result.success or not out.is_file():
+                errors.append(
+                    f"season-concat：{eid}/{cid} 段拼接失败"
+                    f"（{result.error or '无输出'}）"
+                )
+                continue
+            seg_paths.append(str(out))
+            seg_plan.append({
+                "episode_id": eid,
+                "kind": "chapter",
+                "chapter_id": cid,
+                "title": str(layer.get("title") or ""),
+                "bgm_id": str(layer.get("bgm_id") or ""),
+                "scene_ids": list(layer.get("scene_ids") or []),
+            })
+    if seg_plan:
+        ArtifactStore(root).write("segment_plan", {
+            "segments": seg_plan,
+            "outputs": seg_paths,
+        }, schema=None)
+    return seg_paths, errors
 
 
 def maybe_concat_season(
@@ -444,7 +544,12 @@ def maybe_concat_season(
     season_concat: bool,
     progress: dict[str, Any],
 ) -> str:
-    """全集 ok 且要拼季时写 renders/season.mp4。返回空串或含 season-concat 的错误。"""
+    """全集 ok 且要拼季时写 renders/season.mp4。返回空串或含 season-concat 的错误。
+
+    P0-6 分层泛化（short→segment→longform）：任一集有 chapters 时按
+    「章段拼接」产出段层（renders/segments/），longform 优先由段拼；
+    全部集都无 chapters 时保持旧行为（集 finals 直接拼）。
+    """
     if not season_concat:
         _mark(progress, "season", "skip")
         return ""
@@ -452,15 +557,36 @@ def maybe_concat_season(
     if pending:
         _mark(progress, "season", "skip")
         return ""
-    clips: list[str] = []
-    for ep in runnable:
-        eid = str(ep.get("episode_id") or "")
-        final = Path(ep["path"]) / "renders" / "final.mp4"
-        if not final.is_file():
-            msg = f"season-concat：缺 {eid}/renders/final.mp4"
+    from montage.engine.story_outline import chapter_layers
+
+    has_chapters = any(
+        chapter_layers(ArtifactStore(Path(ep["path"])).read("scene_plan"))
+        for ep in runnable
+    )
+    if has_chapters:
+        # segment 层：章段成片 + 段清单（BGM 所有权沿层声明）
+        seg_paths, seg_errors = _build_segment_renders(
+            root, runnable, bag=bag, runner=runner,
+        )
+        if seg_errors:
+            msg = "；".join(seg_errors[:3])
             _mark(progress, "season", "fail", error=msg)
             return msg
-        clips.append(str(final))
+        if not seg_paths:
+            msg = "season-concat：无可用段"
+            _mark(progress, "season", "fail", error=msg)
+            return msg
+        clips = seg_paths
+    else:
+        clips: list[str] = []
+        for ep in runnable:
+            eid = str(ep.get("episode_id") or "")
+            final = Path(ep["path"]) / "renders" / "final.mp4"
+            if not final.is_file():
+                msg = f"season-concat：缺 {eid}/renders/final.mp4"
+                _mark(progress, "season", "fail", error=msg)
+                return msg
+            clips.append(str(final))
     ff = bag.get("ffmpeg_compose")
     if ff is None:
         msg = "season-concat：缺少 ffmpeg_compose"
@@ -508,6 +634,7 @@ def run_series_produce(
     run_tool_fn: Callable[..., ToolResult] | None = None,
     headless: bool | None = None,
     season_concat: bool = False,
+    accept_degraded_vlm: bool = False,
 ) -> dict[str, Any]:
     """系列根：物化子集后按集调度。不对根跑 GEN/W0。"""
     root = Path(project_dir)
@@ -619,6 +746,7 @@ def run_series_produce(
                 run_tool_fn=runner,
                 headless=headless,
                 force_final_prompt_stop=False,
+                accept_degraded_vlm=accept_degraded_vlm,
             )
 
         def map_child(ep: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
@@ -716,6 +844,38 @@ def _shift_cues(cues: list[dict[str, Any]], offset: float) -> list[dict[str, Any
     ]
 
 
+def subtitle_cues_for_film(
+    compose_plan: dict[str, Any] | None,
+    *,
+    offset: float = 0.0,
+    fallback: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """成片字幕时间轴：**投影时间轴**（含 xfade 交叠、按实测时长）优先。
+
+    `compose_plan.shots[].subtitle_cues` 是计划时间轴，不含转场交叠——本片 9 处
+    非硬切累计把整片缩短 8s，直接拿它写字幕会整体后漂（成片里字幕落在错镜上，
+    `srt_rebuild` 审计 status=drift）。这里统一走
+    `subtitle_timeline.build_regenerated_srt`（与 srt_rebuild 同一算式），
+    `offset` 为片头卡片时长；投影不可用时才回落到计划 cue。
+    """
+    if isinstance(compose_plan, dict):
+        from montage.engine.subtitle_timeline import build_regenerated_srt
+
+        try:
+            rebuilt = build_regenerated_srt(
+                compose_plan, title_offset_seconds=float(offset or 0.0),
+            )
+            cues = [
+                cue for cue in rebuilt.get("cues") or []
+                if isinstance(cue, dict) and str(cue.get("text") or "").strip()
+            ]
+            if cues:
+                return cues
+        except (ValueError, TypeError):
+            pass
+    return _shift_cues(list(fallback or []), float(offset or 0.0))
+
+
 def _apply_film_health(
     root: Path,
     progress: dict[str, Any],
@@ -728,7 +888,16 @@ def _apply_film_health(
     tool = bag.get("film_health")
     if tool is None:
         return None
-    result = _call(tool, {"project_dir": str(root)}, runner)
+    finish_extra = (progress.get("steps") or {}).get("finish") or {}
+    try:
+        title_seconds = float(finish_extra.get("title_dur") or 0.0)
+    except (TypeError, ValueError):
+        title_seconds = 0.0
+    result = _call(
+        tool,
+        {"project_dir": str(root), "title_seconds": title_seconds},
+        runner,
+    )
     data = result.data if isinstance(result.data, dict) else {}
     passed = bool(data.get("pass", True))
     if passed or not block or os.environ.get("MONTAGE_RELAX_GATES") == "1":
@@ -743,6 +912,139 @@ def _apply_film_health(
     progress["status"] = "fail"
     save_progress(root, progress)
     return {"success": False, "error": err, "progress": progress, "code": 2}
+
+
+def _material_contract_gate(
+    root: Path,
+    progress: dict[str, Any],
+    *,
+    phase: str,
+    all_ai_video: bool,
+) -> dict[str, Any] | None:
+    """Read-only critical gate around assemble.
+
+    Warnings stay visible but do not block.  This keeps historical image-mode
+    projects compatible while preventing critical fallbacks under ``--all-video``.
+    """
+    store = ArtifactStore(root)
+    scene_plan = store.read("scene_plan")
+    asset_manifest = store.read("asset_manifest")
+    compose_plan = store.read("compose_plan")
+    if scene_plan is None or asset_manifest is None or compose_plan is None:
+        msg = "素材契约缺少 scene_plan / asset_manifest / compose_plan"
+        _mark(progress, "material_contract", "fail", error=msg, extra={"phase": phase})
+        progress["status"] = "fail"
+        save_progress(root, progress)
+        return {"success": False, "error": msg, "progress": progress, "code": 2}
+
+    try:
+        contract = build_material_contract(
+            scene_plan=scene_plan,
+            asset_manifest=asset_manifest,
+            compose_plan=compose_plan,
+            project_dir=root,
+            all_ai_video=all_ai_video,
+        )
+    except Exception as exc:  # noqa: BLE001 - contract failure must not corrupt assembly
+        msg = f"素材契约校验失败: {exc}"
+        _mark(progress, "material_contract", "fail", error=msg, extra={"phase": phase})
+        progress["status"] = "fail"
+        save_progress(root, progress)
+        return {"success": False, "error": msg, "progress": progress, "code": 2}
+
+    findings = [row for row in (contract.get("findings") or []) if isinstance(row, dict)]
+    critical = [row for row in findings if str(row.get("severity") or "") == "critical"]
+    extra = {
+        "phase": phase,
+        "summary": contract.get("summary") or {},
+        "finding_count": len(findings),
+        "critical_count": len(critical),
+        "pass": contract.get("pass"),
+        "blocked": bool(critical),
+        "findings": findings,
+    }
+    if critical:
+        msg = str(critical[0].get("message") or "material contract critical")
+        _mark(progress, "material_contract", "fail", error=msg, extra=extra)
+        progress["status"] = "fail"
+        save_progress(root, progress)
+        return {"success": False, "error": msg, "progress": progress, "code": 2}
+
+    _mark(progress, "material_contract", "ok", extra=extra)
+    return None
+
+
+def _quality_policy_gate(
+    root: Path,
+    progress: dict[str, Any],
+    *,
+    phase: str,
+    accept_degraded_vlm: bool = False,
+) -> dict[str, Any] | None:
+    """Enforce the project's explicit full/strict VLM policy before a write step."""
+    from montage.engine.delivery_report import build_quality_gate
+
+    store = ArtifactStore(root)
+    edit_metrics = store.read("edit_metrics")
+    film_health = store.read("film_health")
+    try:
+        quality_mode = str(load_loop_policy(root).get("quality_mode") or "degraded")
+        vlm_state = build_quality_gate(
+            edit_metrics=edit_metrics if isinstance(edit_metrics, dict) else None,
+            film_health=film_health if isinstance(film_health, dict) else None,
+            quality_mode=quality_mode,
+        ).get("vlm") or {}
+        if (
+            quality_mode in ("degraded", "manual_only")
+            and not bool(vlm_state.get("verified"))
+        ):
+            decision = (
+                "accepted_with_degraded_vlm"
+                if accept_degraded_vlm else "pending"
+            )
+            progress["human_review"] = {
+                "decision": decision,
+                "mode": quality_mode,
+                "reason": str(vlm_state.get("reason") or "VLM verification not recorded"),
+                "accepted_at": _now() if accept_degraded_vlm else "",
+            }
+        else:
+            decision = "pending"
+        quality = build_quality_gate(
+            edit_metrics=edit_metrics if isinstance(edit_metrics, dict) else None,
+            film_health=film_health if isinstance(film_health, dict) else None,
+            quality_mode=quality_mode,
+            human_review_decision=decision,
+        )
+    except Exception as exc:  # noqa: BLE001 - malformed artifacts must fail the gate cleanly
+        msg = f"质量策略校验失败: {exc}"
+        _mark(progress, "quality_policy", "fail", error=msg, extra={"phase": phase})
+        progress["status"] = "fail"
+        save_progress(root, progress)
+        return {"success": False, "error": msg, "progress": progress, "code": 2}
+
+    vlm = quality.get("vlm") if isinstance(quality.get("vlm"), dict) else {}
+    extra = {
+        "phase": phase,
+        "quality_mode": quality.get("mode"),
+        "blocked": bool(quality.get("blocked")),
+        "blocked_reasons": list(quality.get("blocked_reasons") or []),
+        "vlm_skipped": bool(vlm.get("skipped")),
+        "vlm_checked": int(vlm.get("checked") or 0),
+        "vlm_verified": bool(vlm.get("verified")),
+        "vlm_critical_count": int(vlm.get("critical_count") or 0),
+        "human_review_decision": decision,
+    }
+    if quality.get("blocked"):
+        reasons = list(quality.get("blocked_reasons") or [])
+        msg = "; ".join(reasons) or "quality policy blocked"
+        _mark(progress, "quality_policy", "fail", error=msg, extra=extra)
+        progress["status"] = "fail"
+        save_progress(root, progress)
+        return {"success": False, "error": msg, "progress": progress, "code": 2}
+
+    _mark(progress, "quality_policy", "ok", extra=extra)
+    return None
 
 
 def _apply_finish(
@@ -894,8 +1196,13 @@ def _apply_finish(
         if sub is None:
             extra["findings"].append({"severity": "warning", "field": "srt", "message": "缺少 subtitle_builder，跳过字幕旁路"})
         else:
-            # 片头插在正片之前：字幕必须整体后移 title_dur，否则成片里字幕会早 2s。
-            cues = _shift_cues(jobs["cues"], float(extra.get("title_dur") or 0.0))
+            # 片头插在正片之前：字幕整体后移 title_dur；时间轴取投影（含转场交叠）。
+            title_dur = float(extra.get("title_dur") or 0.0)
+            cues = subtitle_cues_for_film(
+                ArtifactStore(root).read("compose_plan"),
+                offset=title_dur,
+                fallback=jobs["cues"],
+            )
             result = _call(
                 sub,
                 {
@@ -914,12 +1221,12 @@ def _apply_finish(
             else:
                 did = True
     if jobs["burn_subs"]:
-        srt_path = root / "renders" / "final.srt"
-        if not srt_path.is_file():
+        sub = bag.get("subtitle_builder")
+        if sub is None:
             extra["findings"].append({
                 "severity": "warning",
                 "field": "burn_subs",
-                "message": "无 SRT，跳过烧录",
+                "message": "缺少 subtitle_builder，跳过烧录",
             })
         elif ff is None:
             extra["findings"].append({
@@ -929,26 +1236,100 @@ def _apply_finish(
             })
         else:
             scratch.mkdir(parents=True, exist_ok=True)
-            burned = scratch / "burned.mp4"
+            # A5：ASS 烧录走独立产物 renders/final_subbed.mp4（横屏侧挂 final.srt
+            # 保持不动），PlayRes 与成片分辨率一致、MarginV 兼容上下补边。
+            from montage.compose.ffmpeg_engine import (
+                font_family_name,
+                probe_size,
+                resolve_font_file,
+            )
+
+            size = probe_size(current) or (1920, 1080)
+            font_file = resolve_font_file(None)
+            family = font_family_name(font_file) or "Source Han Sans SC"
+            try:
+                margin_v = int(os.environ.get("MONTAGE_SUB_MARGIN_V") or 168)
+            except ValueError:
+                margin_v = 168
+            ass_path = root / "renders" / "final.ass"
+            cues = subtitle_cues_for_film(
+                ArtifactStore(root).read("compose_plan"),
+                offset=float(extra.get("title_dur") or 0.0),
+                fallback=jobs["cues"],
+            )
             result = _call(
-                ff,
+                sub,
                 {
-                    "operation": "burn_subtitles",
-                    "input_path": str(current),
-                    "srt_path": str(srt_path),
-                    "output_path": str(burned),
+                    "sentences": cues,
+                    "format": "ass",
+                    "output_path": str(ass_path),
+                    "font": family,
+                    "font_size": 72,
+                    "play_res_x": int(size[0]),
+                    "play_res_y": int(size[1]),
+                    "margin_v": margin_v,
                 },
                 runner,
             )
-            if not result.success or not burned.is_file():
+            burned = root / "renders" / "final_subbed.mp4"
+            if not result.success or not ass_path.is_file():
                 extra["findings"].append({
                     "severity": "warning",
                     "field": "burn_subs",
-                    "message": result.error or "烧录失败（缺字体不 fail）",
+                    "message": result.error or "ASS 生成失败（不 fail）",
                 })
             else:
-                _commit_final(burned, film)
-                did = True
+                result = _call(
+                    ff,
+                    {
+                        "operation": "burn_subtitles",
+                        "input_path": str(current),
+                        "srt_path": str(ass_path),
+                        "output_path": str(burned),
+                        "fontfile": str(font_file) if font_file else "",
+                    },
+                    runner,
+                )
+                if not result.success or not burned.is_file():
+                    extra["findings"].append({
+                        "severity": "warning",
+                        "field": "burn_subs",
+                        "message": result.error or "烧录失败（缺字体不 fail）",
+                    })
+                else:
+                    # 交付形态（2026-09-19 用户拍板）：主成片 final.mp4 直接带
+                    # 字幕（多数平台不会自动加载侧挂 SRT），无字幕母版另留
+                    # final_nosub.mp4 给需要软字幕的平台；final.srt/.ass 继续旁挂。
+                    clean_master = root / "renders" / "final_nosub.mp4"
+                    try:
+                        shutil.copy2(current, clean_master)
+                    except OSError as exc:  # noqa: PERF203 — 母版失败不挡主片
+                        extra["findings"].append({
+                            "severity": "warning",
+                            "field": "burn_subs",
+                            "message": f"无字幕母版写入失败（不 fail）: {exc}",
+                        })
+                    _commit_final(burned, film)
+                    current = film
+                    legacy = root / "renders" / "final_subbed.mp4"
+                    if legacy.is_file():
+                        try:
+                            legacy.unlink()
+                        except OSError:
+                            pass
+                    extra["findings"].append({
+                        "severity": "info",
+                        "field": "burn_subs",
+                        "message": (
+                            f"字幕已烧进 renders/final.mp4（字体 {family}，"
+                            f"PlayRes {size[0]}x{size[1]}，MarginV {margin_v}）；"
+                            "无字幕母版 renders/final_nosub.mp4"
+                        ),
+                    })
+                    extra["subbed"] = str(film)
+                    extra["clean_master"] = str(clean_master)
+                    extra["ass"] = str(ass_path)
+                    did = True
     if did:
         _mark(progress, "finish", "ok", extra=extra)
     else:
@@ -981,6 +1362,7 @@ def run_produce(
     headless: bool | None = None,
     season_concat: bool = False,
     force_final_prompt_stop: bool | None = None,
+    accept_degraded_vlm: bool = False,
 ) -> dict[str, Any]:
     """跑 W0 合成链，或 W1 --idea 收编，或 W2 缺 clip 时生成后再拼片。"""
     incoming = _clean_retry_ids(retry_ids)
@@ -1094,6 +1476,7 @@ def run_produce(
             run_tool_fn=run_tool_fn,
             headless=headless,
             season_concat=want_season,
+            accept_degraded_vlm=accept_degraded_vlm,
         )
     if retry_requested and status == "await_sample":
         return _retry_error(progress, "await_sample 时不能 --retry（先 --resume 或 --review none）")
@@ -1347,6 +1730,13 @@ def run_produce(
         music_path = ""
         music_segments: list[Any] = []
         mix_source = False
+        # narration_path 修复（v8.2 P1）：voice 步骤装配的旁白轨路径跨步骤恢复
+        # （与 music_path 同一恢复模式；step 未跑/失败/装配失败时为空不传）。
+        # 注意不能走 _step_done：非 resume 时它恒 False，会漏读刚跑完的 voice。
+        narration_path = ""
+        vrow = (progress.get("steps") or {}).get("voice") or {}
+        if str(vrow.get("status") or "") == "ok":
+            narration_path = str(vrow.get("narration_path") or "")
         if _step_done(progress, "place_audio", resume):
             prev = (progress.get("steps") or {}).get("place_audio") or {}
             music_path = str(prev.get("music_path") or "")
@@ -1391,6 +1781,20 @@ def run_produce(
 
         # assemble
         if not _step_done(progress, "assemble", resume):
+            blocked = _quality_policy_gate(
+                root, progress,
+                phase="pre_assemble",
+                accept_degraded_vlm=accept_degraded_vlm,
+            )
+            if blocked is not None:
+                return blocked
+            blocked = _material_contract_gate(
+                root, progress,
+                phase="pre_assemble",
+                all_ai_video=use_all_video,
+            )
+            if blocked is not None:
+                return blocked
             out = root / "renders" / "final.mp4"
             payload: dict[str, Any] = {
                 "operation": "assemble",
@@ -1398,12 +1802,17 @@ def run_produce(
                 "edit_decisions_path": str(root / "artifacts" / "edit_decisions.json"),
                 "output_path": str(out),
                 "mix_source_audio": mix_source,
+                # A6：逐镜音频配平（assemble 之前的独立步骤）。原生音轨路径下
+                # place_audio 整体早退，配平只能挂在这里。
+                "level_audio": True,
             }
             if music_path:
                 payload["music_path"] = music_path
             if isinstance(music_segments, list) and len(music_segments) >= 2:
                 payload["music_segments"] = music_segments
                 payload.pop("music_path", None)
+            if narration_path and Path(narration_path).is_file():
+                payload["narration_path"] = narration_path
             result = _call(bag["ffmpeg_compose"], payload, runner)
             if not result.success or not out.is_file():
                 err = result.error or "renders/ 无成片"
@@ -1413,6 +1822,13 @@ def run_produce(
                 return {"success": False, "error": err, "progress": progress, "code": 2}
             _mark(progress, "assemble", "ok", artifact=str(out))
             save_progress(root, progress)
+            blocked = _material_contract_gate(
+                root, progress,
+                phase="post_assemble",
+                all_ai_video=use_all_video,
+            )
+            if blocked is not None:
+                return blocked
 
         # finish：仅显式 lut / profile / script.title / 字幕 cues 才动手。
         if not _step_done(progress, "finish", resume):
@@ -1462,11 +1878,25 @@ def run_produce(
         export_zip = ""
         if skip_export:
             _apply_film_health(root, progress, bag=bag, runner=runner, block=False)
+            blocked = _quality_policy_gate(
+                root, progress,
+                phase="pre_export",
+                accept_degraded_vlm=accept_degraded_vlm,
+            )
+            if blocked is not None:
+                return blocked
             if not _step_done(progress, "export", resume):
                 _mark(progress, "export", "skip")
                 save_progress(root, progress)
         elif not _step_done(progress, "export", resume):
             blocked = _apply_film_health(root, progress, bag=bag, runner=runner, block=True)
+            if blocked is not None:
+                return blocked
+            blocked = _quality_policy_gate(
+                root, progress,
+                phase="pre_export",
+                accept_degraded_vlm=accept_degraded_vlm,
+            )
             if blocked is not None:
                 return blocked
             export_dir = root / "exports"

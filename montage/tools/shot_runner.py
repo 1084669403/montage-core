@@ -9,6 +9,10 @@
 from __future__ import annotations
 
 import os
+import threading
+import uuid
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import shutil
 import time
 from pathlib import Path
@@ -31,6 +35,7 @@ from montage.engine.policy import (
     resolve_allowed_providers,
 )
 from montage.engine.rework import pick_rework_mode, rework_prompt
+from montage.engine.retry_policy import decide_retry
 from montage.providers.capabilities import (
     agnes_access_tier,
     agnes_image_ref_entries,
@@ -54,6 +59,7 @@ from montage.providers.prompt_adapter import adapt_visual_prompt
 from montage.providers.selectors import ImageSelector, VideoSelector
 from montage.providers.video_prompts import prompt_profile
 from montage.toolbase import BaseTool, ToolResult, ToolRuntime, ToolStatus
+from montage.tools.generation_events import append_event
 
 from montage.tools._shot_constants import (
     MAX_ATTEMPTS,
@@ -93,6 +99,24 @@ from montage.tools._shot_route import (
     _next_still_urls,
     _agnes_is_v25,
     agnes_duration_chunks,
+    resolved_agnes_mode,
+    build_mode_plan,
+    shot_audio_ref_urls,
+    audios_compatible_with_mode,
+)
+from montage.engine.identity import (
+    clear_drift,
+    drift_issues,
+    entry_of as identity_entry,
+    evaluate_candidate,
+    findings as identity_findings,
+    identity_key,
+    identity_subject,
+    load_memory as load_identity_memory,
+    mark_retaken,
+    record_drift,
+    retake_subjects,
+    save_memory as save_identity_memory,
 )
 from montage.tools._shot_refs import (
     _http_video_urls,
@@ -146,6 +170,7 @@ from montage.tools._shot_refs import (
     cast_missing,
     _upsert_ref,
     _upsert_item,
+    name_refs_for_prompt,
     _script_prop_map,
     collect_prop_ids,
     resolve_shot_refs,
@@ -158,6 +183,26 @@ from montage.tools._shot_refs import (
     merge_image_bindings,
     reconcile_image_bindings,
 )
+
+
+class _IntervalPacer:
+    def __init__(self, interval: float) -> None:
+        self._lock = threading.Lock()
+        self._interval = max(float(interval), 0.0)
+        self._next_at = 0.0
+
+    def set_interval(self, interval: float) -> None:
+        self._interval = max(float(interval), 0.0)
+
+    def wait(self) -> None:
+        if self._interval <= 0:
+            return
+        with self._lock:
+            wait = self._next_at - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            self._next_at = time.monotonic() + self._interval
+
 
 class ShotRunner(BaseTool):
     name = "shot_runner"
@@ -216,6 +261,7 @@ class ShotRunner(BaseTool):
         quality_check: Callable[..., dict[str, Any]] | None = None,
         extract_last_frame: Callable[[str, str], str | None] | None = None,
         vlm_review: Callable[..., dict[str, Any]] | None = None,
+        event_emitter: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._image_execute = image_execute
         self._video_execute = video_execute
@@ -224,6 +270,10 @@ class ShotRunner(BaseTool):
         self._quality_check = quality_check
         self._extract_last_frame = extract_last_frame
         self._vlm_review = vlm_review
+        self._event_emitter = event_emitter
+        self._event_context: dict[str, Any] = {}
+        self._event_errors: list[dict[str, Any]] = []
+        self._event_lock = threading.Lock()
         self._image_selector = ImageSelector()
         self._video_selector = VideoSelector()
 
@@ -237,6 +287,17 @@ class ShotRunner(BaseTool):
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         project_dir = str(inputs.get("project_dir") or "")
         store = ArtifactStore(project_dir) if project_dir else None
+        if self._event_emitter is None and project_dir:
+            events_path = Path(project_dir) / "artifacts" / "generation_events.jsonl"
+            self._event_emitter = lambda row: append_event(events_path, row)
+        if self._event_emitter is not None:
+            run_id = str(inputs.get("run_id") or uuid.uuid4().hex)
+            self._event_context = {
+                "run_id": run_id,
+                "batch_id": str(inputs.get("batch_id") or run_id),
+                "stage": str(inputs.get("stage") or ""),
+            }
+            self._event_errors = []
         scene_plan = inputs.get("scene_plan") if isinstance(inputs.get("scene_plan"), dict) else None
         shot_prompts = inputs.get("shot_prompts") if isinstance(inputs.get("shot_prompts"), dict) else None
         manifest = inputs.get("asset_manifest") if isinstance(inputs.get("asset_manifest"), dict) else None
@@ -314,10 +375,13 @@ class ShotRunner(BaseTool):
         ref_overflow_mode = normalize_ref_overflow_mode(policy.get("ref_overflow_mode"))
         rpm = agnes_video_rpm() if agnes_loop else 0.0
         self._pace_video_s = (60.0 / rpm) if rpm > 0 else 0.0
+        self._video_pacer = _IntervalPacer(self._pace_video_s)
         self._last_video_at = 0.0
         self._last_image_at = 0.0
+        self._image_pacers = {}
         self._agnes_image_active = img_name == "agnes_image"
         self._agnes_video_active = agnes_loop
+        self._video_pacer = _IntervalPacer(self._pace_video_s)
 
         portraits = _portrait_index(manifest)
         portraits_by_form = _portrait_refs_by_form(manifest)
@@ -439,6 +503,13 @@ class ShotRunner(BaseTool):
 
         jobs: list[dict[str, Any]] = []
         findings_pre: list[dict[str, str]] = []
+        # mode_plan（v8.2 P0-mode-allocation）：审核快照 + findings 载体，不进
+        # 运行时查表——运行时真源仍是 scene_plan.shots[].agnes_mode 经
+        # overlay_plan_rework 覆盖后的 shot dict。冲突镜 finding 在此上屏。
+        mode_plan = build_mode_plan(shots, frames_mode=frames_mode)
+        findings_pre.extend(mode_plan.get("findings") or [])
+        if store and mode_plan.get("modes"):
+            store.write("mode_plan", mode_plan, schema=None)
         for item in needed_portrait_forms:
             cid = str(item.get("character_id") or "")
             fid = str(item.get("form_id") or "")
@@ -1018,6 +1089,12 @@ class ShotRunner(BaseTool):
             record_ledger = True
         record_ledger = bool(record_ledger)
         retry_ids = {str(x) for x in (inputs.get("retry_ids") or []) if x}
+        # 身份记忆库漂移 → 重拍定妆（P0-identity-memory）：并进 retry 集，复用
+        # 既有「retry 覆盖 → _job_already_done 不跳过」路径重跑定妆图。
+        identity_memory = load_identity_memory(project_dir) if project_dir else None
+        if identity_memory:
+            for subject in retake_subjects(identity_memory):
+                retry_ids.add(subject)
         format_card = store.read("format_card") if store else None
         skip = _spoken_skip_portraits(scene_plan, script, format_card, bible=bible)
         policy = load_loop_policy(project_dir) if project_dir else {}
@@ -1174,6 +1251,8 @@ class ShotRunner(BaseTool):
         refs = list(manifest.get("reference_assets") or [])
         results: list[dict[str, Any]] = []
         retryable: list[str] = []
+        # 本轮新生成的定妆候选（(cid, fid, ref_id, path, url)），循环后统一过检。
+        identity_candidates: list[dict[str, str]] = []
         img_dir = Path(project_dir) / "assets" / "images"
         img_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1248,6 +1327,16 @@ class ShotRunner(BaseTool):
                     allowed=AGNES_IMAGE_RATIOS,
                     allow_21_9=True,
                 )
+            elif img_name == "agnes_image" and kind in ("portrait", "turnaround"):
+                # 定妆=半身（头顶到腰/胸，头部完整）→ 3:4；
+                # 四视图=全身四视角 → 9:16。实测"全身"提示词方差大（会裁头），
+                # 定妆改半身后头部稳定入画，全身体态由四视图承担。
+                img_payload["size"] = img_payload.get("size") or "2K"
+                img_payload["ratio"] = "3:4" if kind == "portrait" else "9:16"
+            elif img_name == "agnes_image" and kind == "prop":
+                # 道具静物：方形最稳（居中陈列），显式声明而不是靠默认值。
+                img_payload["size"] = img_payload.get("size") or "2K"
+                img_payload["ratio"] = "1:1"
 
             if kling_loop and kind in ("portrait", "prop"):
                 if kind == "prop":
@@ -1336,6 +1425,14 @@ class ShotRunner(BaseTool):
                             refs, extra_ref, kind=ekind,
                             id_key=ekey, id_val=str(extra_ref.get(ekey) or cid),
                         )
+                        if ekind == "portrait":
+                            identity_candidates.append({
+                                "character_id": str(extra_ref.get("character_id") or cid),
+                                "form_id": str(extra_ref.get("form_id") or ""),
+                                "ref_id": str(extra_ref.get("id") or ref_id),
+                                "path": str(extra_ref.get("path") or ""),
+                                "url": str(extra_ref.get("url") or ""),
+                            })
                     for row in follow.get("items") or []:
                         if isinstance(row, dict) and row.get("path"):
                             _upsert_item(items, row)
@@ -1387,6 +1484,14 @@ class ShotRunner(BaseTool):
             if kind == "turnaround":
                 ref["views"] = ["front", "side", "back", "three_quarter"]
             _upsert_ref(refs, ref, kind=kind, id_key=id_key, id_val=id_val)
+            if kind == "portrait":
+                identity_candidates.append({
+                    "character_id": id_val,
+                    "form_id": job_fid,
+                    "ref_id": ref_id,
+                    "path": path,
+                    "url": url,
+                })
             row = {
                 "id": ref_id,
                 "kind": "image",
@@ -1402,6 +1507,19 @@ class ShotRunner(BaseTool):
                 "path": path,
                 "cached": bool((result.meta or {}).get("cache_hit")),
             })
+
+        # -- 身份记忆库：定妆候选 VLM 过检 + 保守更新 canonical 锚 -------------
+        self._update_identity_anchors(
+            memory=identity_memory,
+            candidates=identity_candidates,
+            refs=refs,
+            scene_plan=scene_plan,
+            findings=findings,
+        )
+        if identity_memory is not None:
+            findings.extend(identity_findings(identity_memory))
+            save_identity_memory(project_dir, identity_memory)
+            payload["identity_retakes"] = retake_subjects(identity_memory)
 
         manifest_out = {"items": items, "reference_assets": refs}
         self._write_image_bindings(
@@ -1564,6 +1682,11 @@ class ShotRunner(BaseTool):
         return self._image_selector.execute(inputs)
 
     def _run_video(self, inputs: dict[str, Any]) -> ToolResult:
+        if inputs.get("recover") and inputs.get("provider_task_id"):
+            tool = self._catalog_tool(self._video_selector, inputs)
+            poll = getattr(tool, "poll_result", None)
+            if callable(poll):
+                return poll(inputs)
         if self._video_execute:
             return self._video_execute(inputs)
         return self._video_selector.execute(inputs)
@@ -1589,6 +1712,101 @@ class ShotRunner(BaseTool):
             return str(extract_last_frame(Path(video_path), Path(output)))
         except Exception:  # noqa: BLE001
             return None
+
+    def _gen_bridge_frame_for(
+        self,
+        tail_path: str,
+        seg_index: int,
+        seg_refs: list[dict[str, Any]],
+        *,
+        owner_shot_id: str,
+        owner_subject: str,
+        img_tool: BaseTool | None,
+        i_caps: dict[str, Any],
+        vid_tool: BaseTool | None,
+        img_name: str,
+        cache,
+        findings: list[dict[str, str]],
+        retry_ids: set[str],
+        force_ids: set[str],
+        policy: dict[str, Any],
+        img_dir: Path,
+        project_dir: str,
+        payload: dict[str, Any],
+        book,
+        settle,
+        estimate_img,
+    ) -> str:
+        """桥帧合成（v8.2 提升）：尾帧 + 参考 → 图片侧合成，返回公网 URL。
+
+        段间桥与跨镜后向锚共用一条路径（payload_v25 只认 http）。ratio 显式
+        跟随本镜档案画幅（v8.2 修正：agnes_image 默认 1:1 会画幅漂移）。
+        cache_params 带尾帧路径 → 尾帧稳定时 resume 缓存命中不耗图片配额。
+        """
+        if not img_tool or not tail_path:
+            return ""
+        from lib.shot_prompt_builder import build_bridge_frame_prompt
+
+        img_refs: list[dict[str, Any]] = [
+            {"kind": "first_frame", "bridge": True, "name": "上一段尾帧",
+             "path": tail_path},
+            *[r for r in seg_refs if isinstance(r, dict)],
+        ]
+        bridge_path = str(img_dir / f"{owner_shot_id}_bridge{seg_index}.png")
+        img_payload: dict[str, Any] = {
+            "prompt": "",
+            "output_path": bridge_path,
+            "project_dir": project_dir,
+        }
+        if img_name == "agnes_image":
+            img_payload["size"] = "2K"
+            img_payload["ratio"] = self._profile_aspect(
+                policy,
+                env_key="AGNES_RATIO",
+                allowed=AGNES_IMAGE_RATIOS,
+                allow_21_9=True,
+            )
+        if img_name == "kling_image":
+            img_payload["result_type"] = "single"
+            img_payload["resolution"] = "2k"
+        if img_name == "seedream_image":
+            img_payload["aspect_ratio"] = self._seedream_aspect(policy)
+        notes = apply_image_refs(img_payload, img_refs, i_caps)
+        for note in notes:
+            findings.append({
+                "severity": "warning", "field": owner_subject, "message": note,
+                "proposed_fix": "换支持参考图的供应商或补 URL",
+            })
+        # 图例必须与实发顺序一致：URL 优先/本地兜底会重排，故按最终有序表生成。
+        entries, _extra = agnes_image_ref_entries(img_refs, i_caps)
+        img_payload["prompt"] = build_bridge_frame_prompt(entries)
+        usd = estimate_img
+        eid = book("image_generation", owner_subject, payload.get("image_tool") or img_name, usd)
+        res = self._generate_with_retry(
+            kind="image",
+            payload=img_payload,
+            output_path=bridge_path,
+            cache=cache,
+            cache_params={
+                "prompt": img_payload.get("prompt") or "",
+                "kind": "bridge_frame",
+                "shot_id": owner_shot_id,
+                "seg": seg_index,
+                "image_tool": img_name,
+                "tail": tail_path,
+            },
+            expected_duration=None,
+            skip_cache=_retry_covers(retry_ids, shot_id=owner_shot_id) or owner_shot_id in force_ids,
+        )
+        settle(eid, res.cost_usd if res.success else 0.0)
+        if not res.success:
+            findings.append({
+                "severity": "warning", "field": owner_subject,
+                "message": res.error or "续接首帧生成失败，本段不带桥接继续",
+                "proposed_fix": f"shot_runner retry_ids=[{owner_shot_id}]",
+            })
+            return ""
+        return _media_url(res)
 
     def _cache(self, project_dir: str):
         from montage.tools.generation_cache import GenerationCache
@@ -1679,12 +1897,18 @@ class ShotRunner(BaseTool):
         retryable: list[str] = []
         results: list[dict[str, Any]] = []
         vlm_rows: list[dict[str, Any]] = []
+        state_lock = threading.RLock()
         continuity_state = load_or_seed_continuity(project_dir) if project_dir else {}
         skipped_first = skipped_first or set()
         skipped_video = skipped_video or set()
         retry_ids = retry_ids or set()
         force_ids = force_ids or set()
         video_ids = video_ids or set()
+        # 身份记忆库（P0-identity-memory）：本阶段读观测 + 落盘；迟到定妆
+        # （shot 阶段补出的 portrait）也走 canonical 保守更新。重拍定妆由
+        # 下一轮 cast 阶段（_execute_cast 读 retake 标记）统一排队。
+        identity_memory = load_identity_memory(project_dir) if project_dir else None
+        identity_candidates: list[dict[str, str]] = []
         sample_one = len(retry_ids) == 1
         prompt_fallback = bool(payload.get("prompt_fallback"))
         prompt_too_long = False
@@ -1711,6 +1935,35 @@ class ShotRunner(BaseTool):
         self._agnes_image_active = img_name == "agnes_image"
         self._agnes_video_active = agnes_loop
 
+        self._video_pacer = _IntervalPacer(self._pace_video_s)
+
+        # ---- 档位池（v8.2 P0-scheduler）--------------------------------
+        # Agnes 闭环才启用：跑前盘点池（当前档耗尽→确定性切下一档，日志记
+        # finding），并快照用户声明档——scheduler 的 env 切档只在进程内生效，
+        # 结束时 restore 回声明值，不污染 .env / 其他进程。
+        declared_tier = agnes_access_tier() if agnes_loop else ""
+        if declared_tier:
+            os.environ.setdefault("MONTAGE_TIER_DECLARED", declared_tier)
+            from montage.engine import scheduler as _sched
+
+            if _sched.tier_exhausted(declared_tier):
+                next_tier = _sched.pick_next_tier(declared_tier)
+                if next_tier:
+                    _sched.activate_tier(next_tier)
+                    self._pace_video_s = (
+                        (60.0 / agnes_video_rpm()) if agnes_video_rpm() > 0 else 0.0
+                    )
+                    self._video_pacer.set_interval(self._pace_video_s)
+                    findings.append({
+                        "severity": "warning",
+                        "field": "agnes_tier",
+                        "message": (
+                            f"{_sched.tier_note(declared_tier)} 已耗尽，"
+                            f"本次切到 {_sched.tier_note(next_tier)} 继续"
+                        ),
+                        "proposed_fix": "次日配额归零后自动回主档；或补 tokenplan 配额",
+                    })
+
         def book(category: str, subject: str, item: str, usd: float) -> str:
             if ledger is None or usd <= 0:
                 return ""
@@ -1722,7 +1975,7 @@ class ShotRunner(BaseTool):
                 return
             ledger.settle(eid, actual)
 
-        def record_vlm(shot_id: str, meta: dict[str, Any] | None) -> None:
+        def record_vlm(shot_id: str, meta: dict[str, Any] | None, shot: dict[str, Any] | None = None) -> None:
             vlm = meta.get("vlm") if isinstance(meta, dict) else None
             if not isinstance(vlm, dict):
                 return
@@ -1732,6 +1985,34 @@ class ShotRunner(BaseTool):
                 "skipped": bool(vlm.get("skipped")),
                 "issues": list(vlm.get("issues") or []),
             })
+            # 身份漂移观测（P0-identity-memory）：本镜 VLM 报「人物不一致」时给
+            # 该角色记一次漂移；连续达阈值 → 下一轮重拍定妆。判定与记录分离：
+            # 这里只记观测，重拍在下一轮 _execute_cast 开跑时统一排队。
+            if identity_memory is not None and shot:
+                body = identity_memory
+                for cid, fid, _has_forms in _shot_character_forms(shot, scene_plan):
+                    key = identity_key(cid, fid)
+                    if not identity_entry(body, key).get("canonical"):
+                        continue
+                    issues = drift_issues(vlm)
+                    if issues:
+                        verdict = record_drift(
+                            body, key,
+                            shot_id=shot_id,
+                            message=str(issues[0].get("message") or ""),
+                        )
+                        findings.append({
+                            "severity": "warning" if verdict.get("retake") else "info",
+                            "field": f"identity/{identity_subject(cid, fid)}",
+                            "message": (
+                                f"身份漂移 {verdict.get('count')} 次"
+                                + ("，已触发重拍定妆" if verdict.get("retake") else "")
+                                + f"（{shot_id}）"
+                            ),
+                            "proposed_fix": f"重跑定妆 --retry {identity_subject(cid, fid)}，或改 agnes_mode=keyframe",
+                        })
+                    elif not vlm.get("skipped") and vlm.get("ok"):
+                        clear_drift(body, key)
             if vlm.get("skipped") and not any(f.get("field") == "vlm" for f in findings):
                 findings.append({
                     "severity": "warning",
@@ -1863,6 +2144,12 @@ class ShotRunner(BaseTool):
                             _upsert_item(items, row)
                     if portrait_ref:
                         portraits[cid] = portrait_ref
+                        identity_candidates.append({
+                            "character_id": cid, "form_id": "",
+                            "ref_id": str(portrait_ref.get("id") or ref_id),
+                            "path": str(portrait_ref.get("path") or ""),
+                            "url": str(portrait_ref.get("url") or ""),
+                        })
                     results.append({
                         "id": ref_id,
                         "ok": True,
@@ -1907,6 +2194,10 @@ class ShotRunner(BaseTool):
                 ref["form_id"] = fid
             portraits[cid] = ref
             _upsert_ref(refs, ref, kind="portrait", id_key="character_id", id_val=cid)
+            identity_candidates.append({
+                "character_id": cid, "form_id": fid,
+                "ref_id": ref["id"], "path": path, "url": url,
+            })
             row = {
                 "id": ref["id"], "kind": "image", "path": path,
                 "provider": ref["provider"],
@@ -2095,6 +2386,16 @@ class ShotRunner(BaseTool):
 
                 prompt0, over = apply_agnes_prompt_limit(prompt0, fallback=prompt_fallback)
                 shot["video_prompt"] = prompt0
+                # 剧情可以简洁，但**动作与台词不能省**（2026-09-19 用户拍板）：
+                # 压缩/截断后若本镜对白文本消失，显式报警而不是静默吞掉。
+                wanted_dialogue = str(_shot_dialogue(shot) or "").strip()
+                if wanted_dialogue and wanted_dialogue not in prompt0:
+                    findings.append({
+                        "severity": "warning",
+                        "field": subject,
+                        "message": "压缩后视频提示词里丢了本镜对白（台词不可省）",
+                        "proposed_fix": "拆镜或缩短环境/参考图描述；台词必须留在提示词里",
+                    })
                 if over:
                     prompt_too_long = True
                     findings.append({
@@ -2238,65 +2539,23 @@ class ShotRunner(BaseTool):
                 seg_index: int,
                 seg_refs: list[dict[str, Any]],
             ) -> str:
-                """尾帧 + 本段参考 → 图片侧合成续接首帧，返回公网 URL（失败 ""）。"""
-                if not img_tool or not tail_path:
-                    return ""
-                from lib.shot_prompt_builder import build_bridge_frame_prompt
+                """尾帧 + 本段参考 → 图片侧合成续接首帧，返回公网 URL（失败 ""）。
 
-                img_refs: list[dict[str, Any]] = [
-                    {"kind": "first_frame", "bridge": True, "name": "上一段尾帧",
-                     "path": tail_path},
-                    *[r for r in seg_refs if isinstance(r, dict)],
-                ]
-                bridge_path = str(img_dir / f"{shot_id}_bridge{seg_index}.png")
-                img_payload: dict[str, Any] = {
-                    "prompt": "",
-                    "output_path": bridge_path,
-                    "project_dir": project_dir,
-                }
-                if img_name == "agnes_image":
-                    img_payload["size"] = "2K"
-                if img_name == "kling_image":
-                    img_payload["result_type"] = "single"
-                    img_payload["resolution"] = "2k"
-                if img_name == "seedream_image":
-                    img_payload["aspect_ratio"] = self._seedream_aspect(policy)
-                notes = apply_image_refs(img_payload, img_refs, i_caps)
-                for note in notes:
-                    findings.append({
-                        "severity": "warning", "field": subject, "message": note,
-                        "proposed_fix": "换支持参考图的供应商或补 URL",
-                    })
-                # 图例必须与实发顺序一致：URL 优先/本地兜底会重排，故按最终有序表生成。
-                entries, _extra = agnes_image_ref_entries(img_refs, i_caps)
-                img_payload["prompt"] = build_bridge_frame_prompt(entries)
-                usd = self._estimate_job({"kind": "first_frame"}, img_tool, vid_tool, project_dir)
-                eid = book("image_generation", subject, payload.get("image_tool") or img_name, usd)
-                res = self._generate_with_retry(
-                    kind="image",
-                    payload=img_payload,
-                    output_path=bridge_path,
-                    cache=cache,
-                    cache_params={
-                        "prompt": img_payload.get("prompt") or "",
-                        "kind": "bridge_frame",
-                        "shot_id": shot_id,
-                        "seg": seg_index,
-                        "image_tool": img_name,
-                        "tail": tail_path,
-                    },
-                    expected_duration=None,
-                    skip_cache=_retry_covers(retry_ids, shot_id=shot_id) or shot_id in force_ids,
+                v8.2 起供段间桥与跨镜后向锚共用；跨镜调用走
+                ``self._gen_bridge_frame_for(tail, shot, refs)`` 包装。
+                """
+                return self._gen_bridge_frame_for(
+                    tail_path, seg_index, seg_refs,
+                    owner_shot_id=shot_id, owner_subject=subject,
+                    img_tool=img_tool, i_caps=i_caps, vid_tool=vid_tool,
+                    img_name=img_name, cache=cache, findings=findings,
+                    retry_ids=retry_ids, force_ids=force_ids,
+                    policy=policy, img_dir=img_dir, project_dir=project_dir,
+                    payload=payload, book=book, settle=settle,
+                    estimate_img=self._estimate_job(
+                        {"kind": "first_frame"}, img_tool, vid_tool, project_dir
+                    ),
                 )
-                settle(eid, res.cost_usd if res.success else 0.0)
-                if not res.success:
-                    findings.append({
-                        "severity": "warning", "field": subject,
-                        "message": res.error or "续接首帧生成失败，本段不带桥接继续",
-                        "proposed_fix": f"shot_runner retry_ids=[{shot_id}]",
-                    })
-                    return ""
-                return _media_url(res)
 
             for idx, chunk_sec in enumerate(chunks):
                 dest = final_path if len(chunks) == 1 else str(vid_dir / f"{shot_id}_p{idx + 1}.mp4")
@@ -2327,6 +2586,11 @@ class ShotRunner(BaseTool):
                     "duration": str(int(chunk_sec)),
                     "prompt_fallback": prompt_fallback,
                 }
+                # 显式 seed 透传（v8.2）：导演逐镜声明（scene_plan 经
+                # overlay_plan_rework 覆盖进 shot），_generate_with_retry 据此
+                # 锁种子重试不换种；未声明时由 retry 循环发 1000+attempt。
+                if str(shot.get("seed") or "").strip():
+                    vid_payload["seed"] = str(shot.get("seed")).strip()
                 if api_id:
                     vid_payload["api_id"] = api_id
                 if agnes_loop and v25:
@@ -2363,9 +2627,24 @@ class ShotRunner(BaseTool):
                         vid_payload["prompt"] = seg_prompt or prompt0
                     else:
                         vid_payload["prompt"] = f"{seg_prompt or prompt0} {_REFINE_HINT}"
-                    if frames_mode == "keyframe":
-                        # keyframe 只认首/尾帧，续段不叠参考图。
-                        pass
+                    if resolved_agnes_mode(shot, frames_mode) == "keyframe":
+                        # keyframe 只认首/尾帧，续段不叠参考图。v8.2：续段不再
+                        # 空转——上一段成片尾帧经图片侧合成桥帧（拿公网 URL）
+                        # 做本段 first_frame，keyframe 续接继承连续性。
+                        bridge_url = gen_bridge_frame(prev_tail_path, idx + 1, [])
+                        if bridge_url:
+                            vid_payload["mode"] = "keyframe"
+                            use_first = use_first_url = use_last = use_last_url = ""
+                            vid_payload["first_frame_url"] = bridge_url
+                        else:
+                            vid_payload["mode"] = "text"
+                            use_first = use_first_url = use_last = use_last_url = ""
+                            findings.append({
+                                "severity": "warning",
+                                "field": subject,
+                                "message": f"第 {idx + 1} 段桥帧合成失败，keyframe 续段回落文生",
+                                "proposed_fix": "检查 ffmpeg/图片侧配额，或在剧本层拆镜",
+                            })
                     else:
                         plan = shot.get("_agnes_ref_plan")
                         if not isinstance(plan, dict) or not plan:
@@ -2456,10 +2735,21 @@ class ShotRunner(BaseTool):
                         if not isinstance(plan, dict) or not plan:
                             plan = _agnes_flash_image_plan(identity)
                         images = list(plan["urls"])
-                        if frames_mode == "keyframe":
+                        # v8.2 两档时序：emit 期以本镜 resolved mode 为准
+                        # （显式 agnes_mode > packet frames_mode），并按
+                        # 「上镜尾帧/首帧是否真实可发」降级，不做两阶段重跑。
+                        emit_mode = resolved_agnes_mode(shot, frames_mode)
+                        if emit_mode == "keyframe":
                             # 真 I2V：不叠 identity 参考，只发首/尾帧；两者都缺则回落 text。
                             for key in ("images", "image_urls", "audios"):
                                 vid_payload.pop(key, None)
+                            if shot_audio_ref_urls(shot)[0]:
+                                findings.append({
+                                    "severity": "warning",
+                                    "field": subject,
+                                    "message": "本镜声明了音频参考，但 keyframe 模式不消费 audios，已丢弃",
+                                    "proposed_fix": "改 agnes_mode=reference 保音频参考，或去 audio_ref",
+                                })
                             if use_last and not use_last_url:
                                 findings.append({
                                     "severity": "warning",
@@ -2484,6 +2774,19 @@ class ShotRunner(BaseTool):
                         elif images:
                             vid_payload["images"] = images
                             vid_payload["mode"] = "reference"
+                            # 音频参考叠加（v8.2 P1-audio-ref）：reference 模式
+                            # images+audios 并存（官方允许）；节奏参考优先已在
+                            # shot_audio_ref_urls 排序，≤3 截断同样在那边处理。
+                            audio_urls, audio_notes = shot_audio_ref_urls(shot)
+                            for note in audio_notes:
+                                findings.append({
+                                    "severity": "warning",
+                                    "field": subject,
+                                    "message": note,
+                                    "proposed_fix": "为音频资产补公网 URL 或减少参考段数",
+                                })
+                            if audio_urls and audios_compatible_with_mode("reference"):
+                                vid_payload["audios"] = audio_urls
                             for key in (
                                 "image_url", "image_urls", "first_frame",
                                 "last_frame", "last_frame_url", "extra_body",
@@ -2491,6 +2794,13 @@ class ShotRunner(BaseTool):
                                 vid_payload.pop(key, None)
                         else:
                             vid_payload["mode"] = "text"
+                            if shot_audio_ref_urls(shot)[0]:
+                                findings.append({
+                                    "severity": "warning",
+                                    "field": subject,
+                                    "message": "本镜声明了音频参考，但该镜无参考图回落 text，audios 已丢弃",
+                                    "proposed_fix": "补参考图走 reference，或去 audio_ref",
+                                })
                     else:
                         keyframes: list[str] = []
                         for url in (
@@ -2584,14 +2894,16 @@ class ShotRunner(BaseTool):
                                 "proposed_fix": f"shot_runner retry_ids=[{shot_id}]",
                             })
                 if not vid_result.success:
-                    retryable.append(shot_id)
-                    findings.append({
-                        "severity": "warning",
-                        "field": subject,
-                        "message": vid_result.error or "视频生成失败",
-                        "proposed_fix": f"shot_runner retry_ids=[{shot_id}]",
-                    })
-                    record_vlm(shot_id, vid_result.meta)
+                    with state_lock:
+                        if shot_id and shot_id not in retryable:
+                            retryable.append(shot_id)
+                        findings.append({
+                            "severity": "warning",
+                            "field": subject,
+                            "message": vid_result.error,
+                            "proposed_fix": f"shot_runner retry_ids=[{shot_id}]",
+                        })
+                        record_vlm(shot_id, vid_result.meta, shot)
                     return
                 segment_paths.append(_media_path(vid_result, dest))
                 segment_url = _media_url(vid_result)
@@ -2630,32 +2942,55 @@ class ShotRunner(BaseTool):
                     ),
                     "proposed_fix": "介意误差则在剧本层改请求秒数；不要按计划时长手算字幕",
                 })
-            _upsert_item(items, _media_item(
-                item_id=f"{shot_id}_video",
-                kind="video",
-                path=video_path,
-                scene_id=scene_id,
-                shot_id=shot_id,
-                provider=getattr(vid_tool, "provider", "") or "",
-                url=video_url,
-                duration_seconds=measured,
-            ))
-            results.append({"id": f"{shot_id}_video", "ok": True, "path": video_path})
-            record_vlm(shot_id, vid_result.meta)
-            continuity_state = update_continuity(
-                continuity_state, shot,
-                scene_plan=scene_plan, registry=registry, script=script,
-            )
-            if not agnes_loop:
-                tail = self._extract_tail(video_path, str(img_dir / f"{shot_id}_tail.png"))
-                if tail:
-                    shot["_tail_path"] = tail
+            with state_lock:
+                _upsert_item(items, _media_item(
+                    item_id=f"{shot_id}_video",
+                    kind="video",
+                    path=video_path,
+                    scene_id=scene_id,
+                    shot_id=shot_id,
+                    provider=getattr(vid_tool, "provider", "") or "",
+                    url=video_url,
+                    duration_seconds=measured,
+                ))
+                results.append({"id": f"{shot_id}_video", "ok": True, "path": video_path})
+                record_vlm(shot_id, vid_result.meta, shot)
+                continuity_state = update_continuity(
+                    continuity_state, shot,
+                    scene_plan=scene_plan, registry=registry, script=script,
+                )
+            # 尾帧跨 run 持久化（v8.2）：Agnes 也抽尾帧并落 asset_manifest
+            # （item id {shot_id}_tail），多日 resume / 单镜 --retry 时后向锚
+            # 才有源可取。与桥帧 cache_params["tail"]（路径稳定）配合，次日
+            # resume 桥帧缓存命中不耗图片配额。
+            tail = self._extract_tail(video_path, str(img_dir / f"{shot_id}_tail.png"))
+            if tail:
+                shot["_tail_path"] = tail
+                with state_lock:
+                    _upsert_item(items, _media_item(
+                        item_id=f"{shot_id}_tail",
+                        kind="image",
+                        path=tail,
+                        scene_id=scene_id,
+                        shot_id=shot_id,
+                        provider=getattr(vid_tool, "provider", "") or "",
+                        url="",
+                    ))
+                    results.append({"id": f"{shot_id}_tail", "ok": True, "path": tail})
 
         prev_tail = ""
         prev_location = ""
 
         def _need_portrait(shot: dict[str, Any]) -> bool:
             if skip_portraits:
+                return False
+            if (
+                agnes_loop
+                and _agnes_is_v25()
+                and str((shot or {}).get("agnes_mode") or "").strip().lower() == "keyframe"
+            ):
+                # 门禁豁免（v8.2）：显式 keyframe 镜禁 images，首帧即身份锚
+                # （须来自带身份的成片尾帧或身份首帧设计稿）；不再强制定妆。
                 return False
             return any(cid in registry for cid in _character_ids(shot, scene_plan))
 
@@ -2782,7 +3117,9 @@ class ShotRunner(BaseTool):
                     video_loop=video_loop,
                 )
                 reserve_first = (
-                    frames_mode == "reference_first" and plan_first_url.startswith("http")
+                    resolved_agnes_mode(shot, frames_mode) != "keyframe"
+                    and frames_mode == "reference_first"
+                    and plan_first_url.startswith("http")
                 )
                 if reserve_first:
                     identity = [
@@ -2861,6 +3198,25 @@ class ShotRunner(BaseTool):
                 first_prompt = ""
                 video_prompt = ""
                 builder_data = pair.data if pair.success and isinstance(pair.data, dict) else {}
+                for contract_key in (
+                    "prompt_contract",
+                    "prompt_hash",
+                    "anchor_coverage",
+                    "reference_requirements",
+                    "forbidden_text_hits",
+                ):
+                    if contract_key in builder_data:
+                        shot[contract_key] = builder_data[contract_key]
+                if builder_data.get("forbidden_text_hits"):
+                    findings.append({
+                        "severity": "warning",
+                        "field": subject,
+                        "message": (
+                            "forbidden text 进入 prompt："
+                            + "、".join(str(x) for x in builder_data["forbidden_text_hits"][:4])
+                        ),
+                        "proposed_fix": "修改 prompt_contract.forbidden_text 或重编提示词",
+                    })
                 passthrough = bool(prompt_profile(str(route["api_id"] or "")).get("passthrough"))
                 if agnes_plan:
                     # 单一路径：Agnes 2.5 的 <Picture N> 只由最终有序表生成。
@@ -2944,7 +3300,24 @@ class ShotRunner(BaseTool):
                 if img_name == "seedream_image":
                     img_payload["aspect_ratio"] = self._seedream_aspect(policy)
                 resolved_refs = resolve_shot_refs(
-                    shot, {"reference_assets": refs}, script, scene_plan,
+                    {
+                        **shot,
+                        **(
+                            {"_include_turnaround_refs": True}
+                            if bool(policy.get("first_frame_turnaround"))
+                            else {}
+                        ),
+                    },
+                    {"reference_assets": refs}, script, scene_plan,
+                    # 首帧参考位上限（agnes_image=6）：超了才挤定妆图，没超就留着。
+                    max_refs=int((i_caps or {}).get("max_ref_images") or 0) or None,
+                )
+                # 图例要用中文名（"为宦娘基础形象的四视图"），不能写
+                # turnaround_huan_niang / prop_prop_guqin 这类内部 id。
+                resolved_refs = name_refs_for_prompt(
+                    resolved_refs,
+                    character_registry=(scene_plan or {}).get("character_registry"),
+                    script=script,
                 )
                 notes = apply_image_refs(img_payload, resolved_refs, i_caps)
                 for note in notes:
@@ -2971,6 +3344,17 @@ class ShotRunner(BaseTool):
                         allowed=AGNES_IMAGE_RATIOS,
                         allow_21_9=True,
                     )
+                elif img_name == "agnes_image":
+                    # 2026-09-19 用户实测：参考模式（image_reference）不传 ratio 时
+                    # Agnes 落回官方默认 1:1 → 首帧全是 2048×2048 方图，I2V 后
+                    # 整片画幅与 16:9 成片不符。这里**显式传档案画幅**（默认 16:9）。
+                    img_payload["size"] = img_payload.get("size") or "2K"
+                    img_payload["ratio"] = self._profile_aspect(
+                        policy,
+                        env_key="AGNES_RATIO",
+                        allowed=AGNES_IMAGE_RATIOS,
+                        allow_21_9=True,
+                    )
                 usd = self._estimate_job({"kind": "first_frame"}, img_tool, vid_tool, project_dir)
                 eid = book("image_generation", subject, payload["image_tool"], usd)
                 img_result = self._generate_with_retry(
@@ -2978,7 +3362,20 @@ class ShotRunner(BaseTool):
                     payload=img_payload,
                     output_path=first_path,
                     cache=cache,
-                    cache_params={"prompt": img_payload.get("prompt") or first_prompt, "kind": "first_frame", "shot_id": shot_id, "ratio": img_payload.get("ratio") or img_payload.get("aspect_ratio") or "", "image_tool": img_name},
+                    # refs 也要进缓存键：改了参考图（例如空镜去掉人物四视图）而提示词
+                    # 不变时，旧缓存会把"带人物的首帧"还回来（sc05_08 片尾空镜实测）。
+                    cache_params={
+                        "prompt": img_payload.get("prompt") or first_prompt,
+                        "kind": "first_frame",
+                        "shot_id": shot_id,
+                        "ratio": img_payload.get("ratio") or img_payload.get("aspect_ratio") or "",
+                        "image_tool": img_name,
+                        "refs": [
+                            str(r.get("url") or r.get("path") or r.get("id") or "")
+                            for r in (resolved_refs or [])
+                            if isinstance(r, dict)
+                        ],
+                    },
                     expected_duration=None,
                     skip_cache=_retry_covers(retry_ids, shot_id=shot_id) or shot_id in force_ids,
                     vlm_context={
@@ -2995,11 +3392,11 @@ class ShotRunner(BaseTool):
                         "message": img_result.error or "首帧生成失败",
                         "proposed_fix": f"shot_runner retry_ids=[{shot_id}]",
                     })
-                    record_vlm(shot_id, img_result.meta)
+                    record_vlm(shot_id, img_result.meta, shot)
                     continue
                 first_path = _media_path(img_result, first_path)
                 first_url = _media_url(img_result)
-                record_vlm(shot_id, img_result.meta)
+                record_vlm(shot_id, img_result.meta, shot)
                 continuity_state = update_continuity(
                     continuity_state, shot,
                     scene_plan=scene_plan, registry=registry, script=script,
@@ -3094,10 +3491,63 @@ class ShotRunner(BaseTool):
 
         if agnes_loop and not frames_only:
             neighbor = _next_still_urls(shots, still_by_id)
+
+            def _parallel_eligible(shot: dict[str, Any]) -> bool:
+                sid = str(shot.get('shot_id') or '')
+                if (
+                    str(shot.get('shot_kind') or 'video') == 'image'
+                    or sid in skipped_video
+                    or shot.get('_prompt_invalid')
+                ):
+                    return False
+                if not _may_emit_i2v(shot):
+                    return False
+                still = still_by_id.get(sid) or {}
+                first_url = str(still.get('url') or '')
+                emit_mode = resolved_agnes_mode(shot, frames_mode)
+                return (
+                    _agnes_is_v25()
+                    and emit_mode != 'keyframe'
+                    and first_url.startswith('http')
+                )
+
+            video_workers = self._agnes_video_workers()
+            parallel_shots = [shot for shot in shots if _parallel_eligible(shot)]
+            parallel_ids = {
+                str(shot.get('shot_id') or '') for shot in parallel_shots
+            }
+            parallel_done = self._run_dynamic_video_batch(
+                parallel_shots,
+                workers=video_workers,
+                still_by_id=still_by_id,
+                emit_video=emit_video,
+                retryable=retryable,
+                findings=findings,
+                state_lock=state_lock,
+            )
+            payload['agnes_video_concurrency'] = video_workers
+            payload['agnes_video_scheduling'] = 'dynamic_fifo'
+            payload['agnes_video_order'] = {
+                'parallel': [str(shot.get('shot_id') or '') for shot in parallel_shots],
+                'sequential': [
+                    str(shot.get('shot_id') or '')
+                    for shot in shots
+                    if str(shot.get('shot_id') or '') not in parallel_ids
+                ],
+            }
+
+            back_prev_tail = ""
+            back_prev_location = ""
             for shot in shots:
+                shot_id = str(shot.get("shot_id") or "")
+                if shot_id in parallel_done:
+                    continue
+                if _clears_bridge(shot, back_prev_location):
+                    # 后向锚与可灵链同规则清桥：hard cut 或换 location 不接。
+                    back_prev_tail = ""
+                back_prev_location = str(shot.get("location_id") or "").strip()
                 if str(shot.get("shot_kind") or "video") == "image":
                     continue
-                shot_id = str(shot.get("shot_id") or "")
                 if shot_id in skipped_video:
                     continue
                 if shot.get("_prompt_invalid"):
@@ -3107,8 +3557,9 @@ class ShotRunner(BaseTool):
                 still = still_by_id.get(shot_id) or {}
                 first_url = str(still.get("url") or "")
                 need_url = _need_portrait(shot)
+                emit_mode = resolved_agnes_mode(shot, frames_mode)
                 if _agnes_is_v25():
-                    if need_url:
+                    if need_url and emit_mode != "keyframe":
                         identity = _identity_http_refs(
                             shot, refs, script, scene_plan,
                             cast_ref_kind=cast_ref_kind,
@@ -3121,6 +3572,36 @@ class ShotRunner(BaseTool):
                         ):
                             _block_i2v(shot, "缺定妆/四视图公网 URL，禁止降级文生")
                             continue
+                    if emit_mode == "keyframe" and back_prev_tail:
+                        # 后向锚（v8.2，路径①）：上镜成片尾帧（本地）经桥帧
+                        # 合成拿公网 URL 做 first_frame——payload_v25 只认
+                        # http。仅 keyframe 意图时才物化（省图片配额）。
+                        bridge_url = gen_bridge_frame(
+                            back_prev_tail, 0, [],
+                            owner_shot_id=shot_id,
+                            owner_subject=f"{shot.get('scene_id')}/{shot_id}",
+                        )
+                        if bridge_url:
+                            findings.append({
+                                "severity": "info",
+                                "field": f"{shot.get('scene_id')}/{shot_id}",
+                                "message": "后向锚：上镜成片尾帧已合成桥帧做本镜 keyframe 首帧",
+                                "proposed_fix": "改显式 agnes_mode=reference 可回身份图锚",
+                            })
+                            emit_video(
+                                shot,
+                                "",
+                                bridge_url,
+                                last_path="",
+                                last_url=neighbor.get(shot_id, ""),
+                            )
+                            continue
+                        findings.append({
+                            "severity": "warning",
+                            "field": f"{shot.get('scene_id')}/{shot_id}",
+                            "message": "后向锚桥帧合成失败，keyframe 意图回落常规路径",
+                            "proposed_fix": "检查 ffmpeg/图片侧配额；或显式 agnes_mode=reference",
+                        })
                     emit_video(
                         shot,
                         str(still.get("path") or ""),
@@ -3156,13 +3637,37 @@ class ShotRunner(BaseTool):
                     last_path="",
                     last_url=neighbor.get(shot_id, ""),
                 )
+                back_prev_tail = str(shot.get("_tail_path") or back_prev_tail)
 
         lifted = lift_shot_prompts(timeline_shots or shots)
         manifest_out = {"items": items, "reference_assets": refs}
+        if identity_memory is not None and project_dir:
+            # 迟到定妆（shot 阶段补出）也走 canonical 保守更新；必须在
+            # asset_manifest 落盘前完成，否则 canonical 标记写不进产物。
+            self._update_identity_anchors(
+                memory=identity_memory,
+                candidates=identity_candidates,
+                refs=refs,
+                scene_plan=scene_plan,
+                findings=findings,
+            )
         if store:
             store.write("shot_prompts", lifted)
             if not prompt_only:
                 store.write("asset_manifest", manifest_out, schema=None)
+        if identity_memory is not None and project_dir:
+            # 漂移观测落盘（P0-identity-memory）：canonical 锚由 cast/shot 阶段
+            # 维护，这里更新漂移计数/retake 标记；顺带把重拍提示转成 findings。
+            for row in identity_findings(identity_memory):
+                if not any(
+                    f.get("field") == row.get("field") and f.get("message") == row.get("message")
+                    for f in findings
+                ):
+                    findings.append(row)
+            save_identity_memory(project_dir, identity_memory)
+            if store:
+                store.write("identity_memory", identity_memory, schema=None)
+            payload["identity_retakes"] = retake_subjects(identity_memory)
         if project_dir and not prompt_only:
             self._write_image_bindings(
                 store=store,
@@ -3193,6 +3698,19 @@ class ShotRunner(BaseTool):
             "blocked": bool(blocked_i2v),
             "prompt_too_long": prompt_too_long,
         })
+        self._apply_event_errors(payload)
+        # 档位池收尾（v8.2 P0-scheduler）：restore 回用户声明档（进程内 env
+        # 切换不落盘）；记账已在 agnes_usage 按档分桶，跨天自然归零。
+        if declared_tier:
+            from montage.engine import scheduler as _sched
+
+            active_now = agnes_access_tier()
+            if active_now != declared_tier:
+                payload["tier_switched"] = {
+                    "from": declared_tier, "to": active_now,
+                    "note": _sched.tier_note(active_now),
+                }
+            _sched.restore_tier(declared_tier)
         if prompt_too_long:
             payload["prompt_over_ids"] = [
                 str(s.get("shot_id") or "")
@@ -3208,7 +3726,87 @@ class ShotRunner(BaseTool):
             )
         return ToolResult(success=True, data=payload, meta={"shots": len(shots), "failed": len(retryable)})
 
+    def _apply_event_errors(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Expose degraded event-write failures without changing tool success."""
+        if self._event_context:
+            payload["generation_run_id"] = str(self._event_context.get("run_id") or "")
+            payload["generation_batch_id"] = str(self._event_context.get("batch_id") or "")
+        payload["generation_event_errors"] = list(self._event_errors)
+        return payload
+
+    def _agnes_video_workers(self) -> int:
+        raw = os.environ.get('MONTAGE_AGNES_VIDEO_CONCURRENCY')
+        try:
+            cap = int(raw) if raw is not None else 5
+        except (TypeError, ValueError):
+            cap = 5
+        cap = max(1, min(cap, 5))
+        rpm_workers = max(1, int(round(float(getattr(self, '_pace_video_s', 0) or 0))))
+        return min(cap, rpm_workers)
+
+    def _run_dynamic_video_batch(
+        self,
+        shots: list[dict[str, Any]],
+        *,
+        workers: int,
+        still_by_id: dict[str, dict[str, Any]],
+        emit_video: Callable[..., None],
+        retryable: list[str],
+        findings: list[dict[str, str]],
+        state_lock: threading.RLock,
+    ) -> set[str]:
+        done: set[str] = set()
+        if not shots or workers <= 0:
+            return done
+        pending = deque(shots)
+        max_workers = min(workers, len(shots))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            in_flight: dict[Any, dict[str, Any]] = {}
+            while pending or in_flight:
+                while pending and len(in_flight) < workers:
+                    shot = pending.popleft()
+                    sid = str(shot.get('shot_id') or '')
+                    still = still_by_id.get(sid) or {}
+                    future = pool.submit(
+                        emit_video,
+                        shot,
+                        str(still.get('path') or ''),
+                        str(still.get('url') or ''),
+                        last_path='',
+                        last_url='',
+                    )
+                    in_flight[future] = shot
+                if not in_flight:
+                    break
+                completed, _not_done = wait(
+                    set(in_flight), return_when=FIRST_COMPLETED,
+                )
+                for future in completed:
+                    shot = in_flight.pop(future)
+                    sid = str(shot.get('shot_id') or '')
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        with state_lock:
+                            if sid and sid not in retryable:
+                                retryable.append(sid)
+                            findings.append({
+                                'severity': 'warning',
+                                'field': sid,
+                                'message': f'并发视频任务异常: {exc}',
+                                'proposed_fix': f'shot_runner retry_ids=[{sid}]',
+                            })
+                    done.add(sid)
+        return done
+
     def _pace_wait(self) -> None:
+        if _skip_pacing():
+            return
+        pacer = getattr(self, '_video_pacer', None)
+        if pacer is not None:
+            pacer.set_interval(float(getattr(self, '_pace_video_s', 0) or 0))
+            pacer.wait()
+            return
         gap = float(getattr(self, "_pace_video_s", 0) or 0)
         if gap <= 0 or _skip_pacing():
             return
@@ -3220,6 +3818,17 @@ class ShotRunner(BaseTool):
         self._last_video_at = time.time()
 
     def _pace_image_wait(self, size: str) -> None:
+        gap = 60.0 / max(agnes_image_rpm(size), 0.001)
+        if gap <= 0 or _skip_pacing():
+            return
+        if not hasattr(self, '_image_pacers'):
+            self._image_pacers = {}
+        pacer = self._image_pacers
+        if size not in pacer:
+            pacer[size] = _IntervalPacer(gap)
+        pacer[size].set_interval(gap)
+        pacer[size].wait()
+        return
         """图片侧 pacing：gap = 60 / 实际 RPM（按 size 档）。仅 agnes_image 生效。"""
         gap = 60.0 / max(agnes_image_rpm(size), 0.001)
         if gap <= 0 or _skip_pacing():
@@ -3230,6 +3839,71 @@ class ShotRunner(BaseTool):
             if wait > 0:
                 time.sleep(wait)
         self._last_image_at = time.time()
+
+    def _emit_generation_event(
+        self,
+        *,
+        event: str,
+        kind: str,
+        attempt: int,
+        meta: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        cache_params: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+        error: str = "",
+    ) -> None:
+        """Emit one append-only event; write failures must not stop media work."""
+        emitter = self._event_emitter
+        if emitter is None:
+            return
+        context = self._event_context
+        if not context.get("run_id"):
+            context = {
+                "run_id": uuid.uuid4().hex,
+                "batch_id": uuid.uuid4().hex,
+                "stage": "",
+            }
+            self._event_context = context
+        shot_id = str(
+            (cache_params or {}).get("shot_id")
+            or (payload or {}).get("shot_id")
+            or context.get("shot_id")
+            or ""
+        )
+        if not shot_id:
+            return
+        data = data if isinstance(data, dict) else {}
+        raw = {
+            "run_id": str(context.get("run_id") or ""),
+            "batch_id": str(context.get("batch_id") or context.get("run_id") or ""),
+            "shot_id": shot_id,
+            "kind": str(kind),
+            "event": str(event),
+            "attempt": max(int(attempt or 1), 1),
+            "provider": str((meta or {}).get("provider") or ""),
+            "model": str((meta or {}).get("model") or ""),
+            "provider_task_id": str((meta or {}).get("provider_task_id") or ""),
+            "prompt_hash": str((cache_params or {}).get("prompt_hash") or ""),
+            "ref_fingerprint": str((payload or {}).get("ref_fingerprint") or ""),
+            "seed": str((payload or {}).get("seed") or ""),
+            "cache_hit": bool((meta or {}).get("cache_hit")),
+            "requested_seconds": (payload or {}).get("seconds"),
+            "output_path": str(
+                data.get("local_path") or data.get("output") or data.get("path") or ""
+            ),
+            "error_class": str((meta or {}).get("error_class") or ""),
+            "error_message": str(error or ""),
+        }
+        try:
+            with self._event_lock:
+                emitter(raw)
+        except Exception as exc:  # noqa: BLE001 - event loss is degraded, not fatal
+            self._event_errors.append({
+                "event": event,
+                "shot_id": shot_id,
+                "attempt": attempt,
+                "error": str(exc),
+            })
 
     def _generate_with_retry(
         self,
@@ -3256,8 +3930,13 @@ class ShotRunner(BaseTool):
         else:
             pace = None
         backoff = 2.0
+        # seed 拦截点收窄（v8.2）：Agnes 视频且 payload 已带显式 seed（导演逐镜
+        # 声明，经 overlay_plan_rework 透传）时锁种子，重试不换种；其余仍 1000+attempt。
+        explicit_seed = ""
+        if kind == "video" and getattr(self, "_agnes_video_active", False):
+            explicit_seed = str(payload.get("seed") or "").strip()
         for attempt in range(MAX_ATTEMPTS):
-            seed = 1000 + attempt
+            seed = int(explicit_seed) if explicit_seed.isdigit() else 1000 + attempt
             payload["seed"] = seed
             cache_params = dict(cache_params)
             cache_params["seed"] = seed
@@ -3271,12 +3950,163 @@ class ShotRunner(BaseTool):
                 pace=pace,
             )
             if not last.success:
+                meta = last.meta or {}
+                decision = decide_retry(
+                    state=str(meta.get("state") or "unknown"),
+                    attempt=attempt + 1,
+                    max_attempts=MAX_ATTEMPTS,
+                    provider_task_id=str(meta.get("provider_task_id") or ""),
+                    http_status=meta.get("http_status"),
+                    error=last.error,
+                )
+                if decision.action == "poll":
+                    self._emit_generation_event(
+                        event="poll_timeout",
+                        kind=kind,
+                        attempt=attempt + 1,
+                        meta=meta,
+                        payload=payload,
+                        cache_params=cache_params,
+                        data=last.data if isinstance(last.data, dict) else {},
+                        error=last.error,
+                    )
+                    task_id = str(meta.get("provider_task_id") or "")
+                    recovery = self._run_video({
+                        **payload,
+                        "output_path": output_path,
+                        "provider_task_id": task_id,
+                        "recover": True,
+                        "provider": meta.get("provider"),
+                        "model": meta.get("model"),
+                    })
+                    if recovery.success:
+                        self._emit_generation_event(
+                            event="downloaded",
+                            kind=kind,
+                            attempt=attempt + 1,
+                            meta=recovery.meta or {},
+                            payload=payload,
+                            cache_params=cache_params,
+                            data=recovery.data if isinstance(recovery.data, dict) else {},
+                        )
+                        path = _media_path(recovery, output_path)
+                        report = self._check_quality(
+                            path, expected_duration=expected_duration
+                        )
+                        if not _critical_fail(report):
+                            vlm = self._review_identity(path, vlm_context)
+                            recovery.meta = dict(recovery.meta or {})
+                            recovery.meta["quality"] = report
+                            recovery.meta["vlm"] = vlm
+                            recovery.meta["recovered_from_task_id"] = task_id
+                            if not _critical_fail(vlm):
+                                self._emit_generation_event(
+                                    event="validated",
+                                    kind=kind,
+                                    attempt=attempt + 1,
+                                    meta=recovery.meta or {},
+                                    payload=payload,
+                                    cache_params=cache_params,
+                                    data=recovery.data if isinstance(recovery.data, dict) else {},
+                                )
+                                self._emit_generation_event(
+                                    event="succeeded",
+                                    kind=kind,
+                                    attempt=attempt + 1,
+                                    meta=recovery.meta or {},
+                                    payload=payload,
+                                    cache_params=cache_params,
+                                    data=recovery.data if isinstance(recovery.data, dict) else {},
+                                )
+                                return recovery
+                        last = ToolResult(
+                            success=False,
+                            error="quality/VLM gate failed after task recovery",
+                            data=recovery.data,
+                            meta={
+                                **(recovery.meta or {}),
+                                "quality": report,
+                                "vlm": vlm,
+                                "attempt": attempt + 1,
+                            },
+                        )
+                        continue
+                    last = recovery
+                    if (last.meta or {}).get("recovery_action") in {"poll", "download"}:
+                        self._emit_generation_event(
+                            event="failed",
+                            kind=kind,
+                            attempt=attempt + 1,
+                            meta=last.meta or {},
+                            payload=payload,
+                            cache_params=cache_params,
+                            data=last.data if isinstance(last.data, dict) else {},
+                            error=last.error,
+                        )
+                        break
+                    continue
+                if decision.action == "fail":
+                    last.meta = dict(meta)
+                    last.meta["retry_policy"] = {
+                        "action": decision.action,
+                        "state": decision.state,
+                        "reason": decision.reason,
+                        "error_class": decision.error_class,
+                    }
+                    self._emit_generation_event(
+                        event="failed",
+                        kind=kind,
+                        attempt=attempt + 1,
+                        meta=last.meta or {},
+                        payload=payload,
+                        cache_params=cache_params,
+                        data=last.data if isinstance(last.data, dict) else {},
+                        error=last.error,
+                    )
+                    break
                 # 429 指数退避（对齐 _poll_video）；状态码经 ToolResult.meta 透传
                 if int((last.meta or {}).get("http_status") or 0) == 429:
                     if not _skip_pacing():
-                        time.sleep(backoff)
-                    backoff = min(backoff * 2, 30)
+                        time.sleep(decision.delay_seconds)
+                    # 档位池（v8.2 P0-scheduler）：429 可能是本档日配额耗尽——
+                    # 账面耗尽时确定性切池内下一档，RPM/键随 env 自动跟档；
+                    # 账面未耗尽的 429 是瞬时限流，仍走退避重试。
+                    if kind == "video" and getattr(self, "_agnes_video_active", False):
+                        from montage.engine import scheduler as _sched
+
+                        cur = agnes_access_tier()
+                        if _sched.tier_exhausted(cur):
+                            nxt = _sched.pick_next_tier(cur)
+                            if nxt and _sched.activate_tier(nxt):
+                                rpm_now = agnes_video_rpm()
+                                self._pace_video_s = (
+                                    (60.0 / rpm_now) if rpm_now > 0 else 0.0
+                                )
+                                self._video_pacer.set_interval(self._pace_video_s)
+                                backoff = 2.0
+                elif not _skip_pacing():
+                    time.sleep(decision.delay_seconds)
+                self._emit_generation_event(
+                    event="retry_scheduled",
+                    kind=kind,
+                    attempt=attempt + 1,
+                    meta=meta,
+                    payload=payload,
+                    cache_params=cache_params,
+                    data=last.data if isinstance(last.data, dict) else {},
+                    error=last.error,
+                )
                 continue
+            if not (last.meta or {}).get("cache_hit"):
+                self._emit_generation_event(
+                    event="downloaded",
+                    kind=kind,
+                    attempt=attempt + 1,
+                    meta=last.meta or {},
+                    payload=payload,
+                    cache_params=cache_params,
+                    data=last.data if isinstance(last.data, dict) else {},
+                )
             # Token Plan 记帐：必须在质量门禁 / VLM 之前——这两步失败会 continue
             # 再生成一次，那次也是真实配额消耗。缓存命中未真实调用 API，不计数。
             if not (last.meta or {}).get("cache_hit"):
@@ -3289,6 +4119,16 @@ class ShotRunner(BaseTool):
             path = _media_path(last, output_path)
             report = self._check_quality(path, expected_duration=expected_duration)
             if _critical_fail(report):
+                self._emit_generation_event(
+                    event="failed",
+                    kind=kind,
+                    attempt=attempt + 1,
+                    meta=last.meta or {},
+                    payload=payload,
+                    cache_params=cache_params,
+                    data=last.data if isinstance(last.data, dict) else {},
+                    error=last.error,
+                )
                 last = ToolResult(
                     success=False,
                     error="质量门禁 critical: " + "; ".join(
@@ -3298,11 +4138,30 @@ class ShotRunner(BaseTool):
                     meta={"quality": report, "attempt": attempt + 1},
                 )
                 continue
+            self._emit_generation_event(
+                event="validated",
+                kind=kind,
+                attempt=attempt + 1,
+                meta=last.meta or {},
+                payload=payload,
+                cache_params=cache_params,
+                data=last.data if isinstance(last.data, dict) else {},
+            )
             vlm = self._review_identity(path, vlm_context)
             last.meta = dict(last.meta or {})
             last.meta["quality"] = report
             last.meta["vlm"] = vlm
             if _critical_fail(vlm):
+                self._emit_generation_event(
+                    event="failed",
+                    kind=kind,
+                    attempt=attempt + 1,
+                    meta=last.meta or {},
+                    payload=payload,
+                    cache_params=cache_params,
+                    data=last.data if isinstance(last.data, dict) else {},
+                    error=last.error,
+                )
                 last = ToolResult(
                     success=False,
                     error="VLM critical: " + "; ".join(
@@ -3312,6 +4171,15 @@ class ShotRunner(BaseTool):
                     meta={"quality": report, "vlm": vlm, "attempt": attempt + 1},
                 )
                 continue
+            self._emit_generation_event(
+                event="succeeded",
+                kind=kind,
+                attempt=attempt + 1,
+                meta=last.meta or {},
+                payload=payload,
+                cache_params=cache_params,
+                data=last.data if isinstance(last.data, dict) else {},
+            )
             return last
         return last
 
@@ -3329,3 +4197,72 @@ class ShotRunner(BaseTool):
             mode=str(context.get("mode") or "first_frame"),
             portrait_path=str(context.get("portrait_path") or ""),
         )
+
+    def _update_identity_anchors(
+        self,
+        *,
+        memory: dict[str, Any] | None,
+        candidates: list[dict[str, Any]],
+        refs: list[dict[str, Any]],
+        scene_plan: dict[str, Any] | None,
+        findings: list[dict[str, Any]],
+    ) -> None:
+        """定妆候选 VLM 过检 → canonical 锚保守更新（cast/shot 两阶段共用）。
+
+        只有 ``init``/``adopt`` 才在 manifest ref 上打 ``canonical`` 标记（旧锚
+        同时摘标记），保证 ``_ref_index`` 的 canonical 优先真有唯一真源。
+        """
+        if memory is None or not candidates:
+            return
+        registry_map = _registry_map(scene_plan)
+        for cand in candidates:
+            cid = str(cand.get("character_id") or "")
+            fid = str(cand.get("form_id") or "")
+            key = identity_key(cid, fid)
+            char = _char_for_prompt(registry_map.get(cid) or {"id": cid})
+            if fid:
+                form = next(
+                    (
+                        f for f in character_forms(registry_map.get(cid) or {})
+                        if str(f.get("id") or "") == fid
+                    ),
+                    None,
+                )
+                if isinstance(form, dict):
+                    char = blend_character_form(char, form)
+            review = self._review_identity(str(cand.get("path") or ""), {
+                "expected": {
+                    "appearance": str(char.get("appearance") or ""),
+                    "outfit": str(char.get("outfit_anchor") or char.get("outfit") or ""),
+                },
+                "portrait_path": "",
+                "mode": "first_frame",
+            })
+            verdict = evaluate_candidate(
+                memory, key,
+                review=review,
+                ref_id=str(cand.get("ref_id") or ""),
+                path=str(cand.get("path") or ""),
+                url=str(cand.get("url") or ""),
+            )
+            action = str(verdict.get("action") or "")
+            if action in ("init", "adopt"):
+                for ref in refs:
+                    if str(ref.get("kind") or "") != "portrait":
+                        continue
+                    if str(ref.get("character_id") or "") != cid:
+                        continue
+                    if str(ref.get("form_id") or "") != fid:
+                        continue
+                    if str(ref.get("id") or "") == str(cand.get("ref_id") or ""):
+                        ref["canonical"] = True
+                        ref["identity_key"] = key
+                    else:
+                        ref.pop("canonical", None)
+                mark_retaken(memory, key, ref_id=str(cand.get("ref_id") or ""))
+            findings.append({
+                "severity": "info",
+                "field": f"identity/{identity_subject(cid, fid)}",
+                "message": f"定妆身份锚判定 {action or 'hold'}：{verdict.get('reason')}",
+                "proposed_fix": "漂移反复则改显式 agnes_mode=keyframe（首帧即身份锚）",
+            })

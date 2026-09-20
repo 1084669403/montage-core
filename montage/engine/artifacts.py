@@ -41,11 +41,19 @@ class ArtifactStore:
                 raise ValueError(f"产物 {name} 校验失败: {errors}")
         path = self._path(name)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(tmp, path)
+        try:
+            tmp.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except PermissionError:
+            # Windows 受控目录可能允许改写已有产物，但拒绝创建同名 .tmp。
+            # 这是降级路径，牺牲原子性换取可继续编译；正常环境仍走 os.replace。
+            path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         return path
 
     def read(self, name: str) -> dict[str, Any] | None:

@@ -232,13 +232,22 @@ def default_english_negative_prompt() -> str:
 
 
 
-_STATIC_SECTION_KEYS = {"角色与外貌", "物体与道具", "环境", "光线"}
-_DYNAMIC_SECTION_KEYS = {"动作", "台词", "背景音乐", "衔接", "声音"}
+_STATIC_SECTION_KEYS = {"角色与外貌", "在场清单", "空镜", "物体与道具", "环境", "光线"}
+# P0-8 「特效」是动态专属段（时间点事件，只进 video_prompt；首帧静态图是
+# 特效发生前的状态，不携带）。
+_DYNAMIC_SECTION_KEYS = {"动作", "台词", "背景音乐", "衔接", "承接", "画外", "声音", "特效"}
 
-_IMAGE_QUALITY_TEXT = "高视觉密度，次要细节可辨"
+_IMAGE_QUALITY_TEXT = (
+    "电影级写实质感：皮肤保留微纹理与自然高光（不磨皮），"
+    "布料纤维与褶皱清晰，器物有真实反光与使用痕迹；高视觉密度，次要细节可辨"
+)
 _KEEP_REFERENCE_TEXT = "保留身份、轮廓与构图，只改本镜姿态与光线"
 _IMAGE_SECTION_ORDER = (
+    "构图",
     "角色与外貌",
+    "在场清单",
+    "空镜",
+    "画外",
     "姿态",
     "物体与道具",
     "环境",
@@ -347,6 +356,7 @@ def _opening_pose_text(
     shot: dict[str, Any],
     pose_beat_id: str | None = None,
     at_seconds: float | None = None,
+    character_registry: list[dict[str, Any]] | None = None,
 ) -> str:
     """把每个主体的开场（或选定）节拍定格为静态姿势。
 
@@ -357,7 +367,13 @@ def _opening_pose_text(
     vd = shot.get("visual_details") or {}
     parts: list[str] = []
     for subj in vd.get("subjects") or []:
-        name = (subj.get("id") or "").strip()
+        cid = (subj.get("id") or "").strip()
+        # 中文显示名优先：提示词里不写 wen_ruchun 这类内部 id。
+        name = cid
+        for row in character_registry or []:
+            if isinstance(row, dict) and str(row.get("id") or "") == cid:
+                name = str(row.get("name") or cid)
+                break
         beat = _pick_subject_beat(subj, pose_beat_id, at_seconds)
         if beat:
             verb = (beat.get("verb") or "").strip()
@@ -534,6 +550,7 @@ def _split_first_frame_sections(
     keep_reference: bool = False,
     dense: bool = True,
     jimeng_prompt: bool = False,
+    character_registry: list[dict[str, Any]] | None = None,
 ) -> tuple[list[str], list[str]]:
     """把组装好的段落拆分为 (首帧静态, 视频动态)。
 
@@ -562,7 +579,9 @@ def _split_first_frame_sections(
             dynamic.append(s)
 
     extras: list[str] = []
-    pose = _opening_pose_text(shot, pose_beat_id, at_seconds)
+    pose = _opening_pose_text(
+        shot, pose_beat_id, at_seconds, character_registry=character_registry,
+    )
     if pose:
         extras.append(f"【姿态】 {pose}")
     objects_text = _objects_first_frame_text(shot)
@@ -892,5 +911,3 @@ def _enrich_video_with_library(
         enriched = video_prompt + suffix
 
     return enriched
-
-

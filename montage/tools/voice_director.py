@@ -270,4 +270,9 @@ class VoiceDirector(BaseTool):
             })
         data["narration_sections"] = sections
         data["findings"] = findings
+        # narration_path 修复（v8.2 P1）：sections 落盘产物。原实现只挂在返回
+        # data 里，produce 的 voice 步骤标 ok 后不保存，assemble 拿不到旁白轨
+        # ——TTS 对白永远混不进成片。落盘后 assemble 步骤从产物读取。
+        if store and sections:
+            store.write("narration_sections", {"version": "1", "sections": sections}, schema=None)
         return ToolResult(success=True, data=data)

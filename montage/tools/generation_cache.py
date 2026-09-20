@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +54,7 @@ class GenerationCache(BaseTool):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self.cache_dir / "index.json"
         self._index: dict[str, str] = {}
+        self._index_lock = threading.RLock()
         if self._index_path.exists():
             try:
                 self._index = json.loads(self._index_path.read_text(encoding="utf-8"))
@@ -58,9 +62,20 @@ class GenerationCache(BaseTool):
                 self._index = {}
 
     def _save_index(self) -> None:
-        tmp = self._index_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._index, ensure_ascii=False, indent=2), encoding="utf-8")
-        shutil.move(str(tmp), str(self._index_path))
+        """???????mkstemp ??????????? index.tmp?"""
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=self._index_path.name + ".",
+            suffix=".tmp",
+            dir=str(self.cache_dir),
+        )
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(self._index, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._index_path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
 
     def _resolve_key(self, inputs: dict[str, Any]) -> tuple[str, str]:
         """返回 (key, 错误信息)；错误时 key 为空串。"""
@@ -90,9 +105,10 @@ class GenerationCache(BaseTool):
             return ToolResult(success=False, error="'path' 必填且文件需存在")
         suffix = Path(src).suffix or ".bin"
         dest = self.cache_dir / f"{key}{suffix}"
-        shutil.copy2(src, dest)
-        self._index[key] = str(dest)
-        self._save_index()
+        with self._index_lock:
+            shutil.copy2(src, dest)
+            self._index[key] = str(dest)
+            self._save_index()
         return ToolResult(success=True, data={"key": key, "cached_path": str(dest)})
 
     def stats(self) -> ToolResult:

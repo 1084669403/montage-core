@@ -54,7 +54,15 @@ def _seed_project(root: Path, *, rel_clip=True, png=False, pipeline="cinematic")
     clip_dir = proj / "assets" / "videos"
     clip_dir.mkdir(parents=True, exist_ok=True)
     clip = clip_dir / ("a.png" if png else "a.mp4")
-    clip.write_bytes(b"\x89PNG" if png else b"vid")
+    if png:
+        clip.write_bytes(b"\x89PNG")
+    else:
+        # 真 1s 小视频：素材契约在 --all-video 下会 ffprobe 每个 kind=video，
+        # 假字节会被判 critical（"moov atom not found"）。
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from conftest import write_tiny_video
+
+        write_tiny_video(clip)
     path = "assets/videos/" + clip.name if rel_clip else str(clip)
     store.write("asset_manifest", {
         "items": [{
@@ -113,12 +121,34 @@ def _bag(proj: Path, *, events=None, fail_at=None, overlay_fail=False):
         if fail_at == "compose_plan":
             return ToolResult(success=False, error="compose boom")
         assert inputs.get("overwrite") is True
-        clip = (store.read("asset_manifest") or {}).get("items", [{}])[0].get("path")
-        plan = {"shots": [{"shot_id": "sh01", "clip_path": clip, "effects": []}]}
-        decisions = {
-            "render_runtime": "ffmpeg",
-            "cuts": [{"shot_id": "sh01", "clip_path": clip, "transition": "cut"}],
-        }
+        # 真 compose_planner 会为 **每个** scene_plan 镜头产出一条 cut；
+        # 假工具以前只写 sh01，被素材契约的"每镜一条 video/cut"检查拦下
+        # （missing compose shots: sh02），所以这里按 scene_plan 展开。
+        manifest = store.read("asset_manifest") or {}
+        items = [i for i in (manifest.get("items") or []) if isinstance(i, dict)]
+        fallback_clip = items[0].get("path") if items else ""
+        by_shot: dict[str, str] = {}
+        for item in items:
+            sid = str(item.get("shot_id") or "")
+            if sid and item.get("path"):
+                by_shot.setdefault(sid, str(item["path"]))
+        shots_rows: list[dict] = []
+        cuts: list[dict] = []
+        for scene in (store.read("scene_plan") or {}).get("scenes") or []:
+            if not isinstance(scene, dict):
+                continue
+            for shot in scene.get("shots") or []:
+                if not isinstance(shot, dict):
+                    continue
+                shot_id = str(shot.get("shot_id") or "")
+                clip = by_shot.get(shot_id) or fallback_clip
+                shots_rows.append({"shot_id": shot_id, "clip_path": clip, "effects": []})
+                cuts.append({"shot_id": shot_id, "clip_path": clip, "transition": "cut"})
+        if not cuts:
+            cuts = [{"shot_id": "sh01", "clip_path": fallback_clip, "transition": "cut"}]
+            shots_rows = [{"shot_id": "sh01", "clip_path": fallback_clip, "effects": []}]
+        plan = {"shots": shots_rows}
+        decisions = {"render_runtime": "ffmpeg", "cuts": cuts}
         store.write("compose_plan", plan)
         store.write("edit_decisions", decisions)
         return ToolResult(success=True, data={"compose_plan": plan, "edit_decisions": decisions})

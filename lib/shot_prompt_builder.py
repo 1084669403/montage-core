@@ -219,7 +219,15 @@ def _subject_display_name(
     """身份行显示名：声明形态且有形态名时用「角色·形态」。"""
     cid = str(subject.get("id") or "")
     fid = str(subject.get("form_id") or "").strip()
-    if not cid or not fid or not character_registry:
+    if not cid:
+        return cid
+    # 有中文名就用中文名（形态名前缀保持 id·形态 兼容旧行为）。
+    if not fid:
+        for char in character_registry or []:
+            if char.get("id") == cid:
+                return str(char.get("name") or cid)
+        return cid
+    if not character_registry:
         return cid
     for char in character_registry:
         if char.get("id") != cid:
@@ -285,7 +293,7 @@ def _resolve_appearance(
     return _DEFAULT_EAST_ASIAN_APPEARANCE
 
 
-def _beat_timeline_text(subject: dict[str, Any]) -> str:
+def _beat_timeline_text(subject: dict[str, Any], *, name: str = "") -> str:
     """渲染某个主体的节拍级动作时间线。
 
     当 ``subject.action_sequence`` 非空时，返回时间线字符串：
@@ -296,7 +304,7 @@ def _beat_timeline_text(subject: dict[str, Any]) -> str:
     seq = subject.get("action_sequence") or []
     if not seq:
         return ""
-    name = subject.get("id") or ""
+    name = str(name or subject.get("id") or "")
     beats = sorted(seq, key=lambda b: float(b.get("start_seconds", 0.0)))
     parts = []
     for b in beats:
@@ -338,7 +346,12 @@ def dialogue_line_role(item: Any) -> str:
     return ""
 
 
-def _dialogue_segment(item: Any, *, use_full_text: bool) -> str:
+def _dialogue_segment(
+    item: Any,
+    *,
+    use_full_text: bool,
+    names: dict[str, str] | None = None,
+) -> str:
     """一行对白的提示词片段。无全文且无 dialogue_ref 时返回空，禁止 ``说出台词（）``。"""
     if not isinstance(item, dict):
         text = dialogue_line_text(item)
@@ -346,6 +359,9 @@ def _dialogue_segment(item: Any, *, use_full_text: bool) -> str:
             return ""
         return f"说出：\"{text}\"" if use_full_text else text
     role = dialogue_line_role(item)
+    # 说话人写中文名（台词段此前会把 huan_niang 这类 id 写进提示词）。
+    if role and names:
+        role = names.get(role, role)
     full = dialogue_line_text(item)
     ref = str(item.get("dialogue_ref") or "").strip()
     if use_full_text and full:
@@ -363,7 +379,12 @@ def _dialogue_segment(item: Any, *, use_full_text: bool) -> str:
     return seg.strip()
 
 
-def _dialogue_section_text(shot: dict[str, Any], *, use_full_text: bool = False) -> str:
+def _dialogue_section_text(
+    shot: dict[str, Any],
+    *,
+    use_full_text: bool = False,
+    names: dict[str, str] | None = None,
+) -> str:
     """把镜头的对白（台词）渲染成散文式【台词】段。
 
     对白必须逐字保留：每一行通过 ``{{对白:...}}`` 占位符引用脚本文本
@@ -378,7 +399,7 @@ def _dialogue_section_text(shot: dict[str, Any], *, use_full_text: bool = False)
     ap = shot.get("audio_prompt") or {}
     parts: list[str] = []
     for d in ap.get("dialogue") or []:
-        seg = _dialogue_segment(d, use_full_text=use_full_text)
+        seg = _dialogue_segment(d, use_full_text=use_full_text, names=names)
         if seg:
             parts.append(seg)
     return "；".join(parts)
@@ -462,14 +483,25 @@ def _location_sensory_text(
     return str(shot.get("description") or "").strip()
 
 
-def _subject_blocking_zh(shot: dict[str, Any]) -> list[str]:
+def _subject_blocking_zh(
+    shot: dict[str, Any],
+    character_registry: list[dict[str, Any]] | None = None,
+) -> list[str]:
     lines: list[str] = []
     vd = shot.get("visual_details") if isinstance(shot.get("visual_details"), dict) else {}
     shot_block = blocking_to_zh(shot.get("blocking"))
     for subj in vd.get("subjects") or []:
         if not isinstance(subj, dict):
             continue
-        name = str(subj.get("name") or subj.get("id") or "").strip() or "角色"
+        # 中文显示名优先（registry.name），否则回落 id —— 提示词里不该出现
+        # wen_ruchun 这类内部 id（2026-09-19 用户实测反馈）。
+        cid = str(subj.get("id") or "").strip()
+        display = ""
+        for row in character_registry or []:
+            if isinstance(row, dict) and str(row.get("id") or "") == cid:
+                display = str(row.get("name") or "")
+                break
+        name = str(subj.get("name") or display or cid or "").strip() or "角色"
         pos = blocking_to_zh(subj.get("blocking") or subj.get("position")) or shot_block
         act = subj.get("action") if isinstance(subj.get("action"), dict) else {}
         verb = str(act.get("verb") or "").strip()
@@ -510,8 +542,14 @@ def _ref_header_lines(refs: list[dict[str, Any]] | None) -> list[str]:
             kind_zh = "角色四视图" if kind == "turnaround" or "体态" in str(ref.get("role") or "") else "定妆照"
             line = f"参考图{i}（<Picture {i}>）为{who}基础形象的{kind_zh}，锁外貌与体态"
             if kind == "turnaround":
-                # 四视图是分格拼板：只作身份参考，输出必须是单幅画面。
-                line += "；仅供身份参考，禁止分格/拼贴，只输出单幅画面"
+                # 四视图是分格拼板：**必须显式说明这四个角度是同一个人**，
+                # 否则 I2V 会把四格读成多个人（实测：宦娘被画成两个女主）。
+                line += (
+                    "；这张参考图是**同一个人**的四个角度（正面/侧面/背面/四分之三侧），"
+                    "**不是四个不同的人、也不是多胞胎**；"
+                    "画面中该角色只能出现一次，禁止分格/拼贴、禁止复制成多个个体，"
+                    "只输出单幅画面"
+                )
             lines.append(line + "。")
         elif kind == "scene_ref" or "场景" in str(ref.get("role") or ""):
             place = name or "场景"
@@ -519,7 +557,13 @@ def _ref_header_lines(refs: list[dict[str, Any]] | None) -> list[str]:
                 f"参考图{i}（<Picture {i}>）为{place}的场景环境参考，锁空间结构、陈设、材质和光影，不锁镜头机位。"
             )
         elif kind == "prop":
-            lines.append(f"参考图{i}（<Picture {i}>）为{name or '道具'}的道具参考，锁外形。")
+            # 道具参考也是四视图拼板：必须说明"同一件物品的四个角度"，
+            # 否则 I2V 会把四格读成多件道具（与人物四视图同理）。
+            lines.append(
+                f"参考图{i}（<Picture {i}>）为{name or '道具'}的**道具四视图**"
+                "（正面/侧面/背面/俯视四个角度，**是同一件物品**，不是四件物品、"
+                "也不是多件同类道具），锁外形；画面中该道具只按一件来画。"
+            )
         else:
             continue
     return lines
@@ -575,7 +619,12 @@ def _v25_audio_line(shot: dict[str, Any]) -> str:
 
 
 def _compress_agnes_v25(text: str, max_chars: int) -> str:
-    """先砍 BGM 形容词，最后才动方位/走位/对白。"""
+    """先砍 BGM 形容词与参考图长句；**动作与对白永不删**（用户拍板）。
+
+    只做两类压缩：①"全片统一BGM：…" 收成"压低"；②参考图说明句超过 80 字的
+    截到 70 字。方位/走位/动作/对白一律原样保留——剧情可以简洁，但动作与台词
+    不能省。
+    """
     body = text
     if len(body) <= max_chars:
         return body
@@ -596,9 +645,12 @@ def build_agnes_v25_prompt(
     refs: list[dict[str, Any]] | None = None,
     duration_seconds: float | None = None,
     max_chars: int = 3000,
+    presence_names: dict[str, str] | None = None,
+    style_context: dict[str, Any] | None = None,
 ) -> str:
     """2.5 视频提示词：薄骨架 + 交叉方位散文。不发明地点卡里没有的地标。"""
-    del character_registry  # 外貌锁在参考图行；正文不复述以免和四视图打架
+    # 外貌锁在参考图行、正文不复述（以免和四视图打架）；但**显示名**要用 registry，
+    # 否则正文里会出现 wen_ruchun 这类 id。
     seconds = duration_seconds
     if seconds is None:
         try:
@@ -619,17 +671,52 @@ def build_agnes_v25_prompt(
 
     lines = _ref_header_lines(refs)
     story: list[str] = ["【剧情】"]
+    # 中文名映射：角色取 registry，道具/场景取 presence_names（visual_prompt_builder 注入）。
+    # 在场清单、承接表、台词说话人都用它，避免把 wen_ruchun / loc_court / prop_guqin 写进提示词。
+    names: dict[str, str] = {}
+    for row in character_registry or []:
+        if isinstance(row, dict) and row.get("id"):
+            names[str(row["id"])] = str(row.get("name") or row["id"])
+    names.update(presence_names or {})
+    # B2.5：在场清单 / 画外 / 承接也进视频提示词——I2V 最需要知道"谁在场、
+    # 谁只在画外、上镜哪些必须保留"，否则会凭空多出人物或丢掉承接物。
+    presence = shot.get("presence") if isinstance(shot.get("presence"), dict) else None
+    if presence:
+        from lib.shot_presence import presence_prompt_lines
+
+        continuity = shot.get("continuity") if isinstance(shot.get("continuity"), dict) else None
+        story.extend(presence_prompt_lines(presence, continuity, names=names))
     if env:
         story.append(f"场景：{env.rstrip('。')}。")
+    if (
+        isinstance(presence, dict)
+        and str(presence.get("empty_reason") or "").strip()
+        and not ((shot.get("visual_details") or {}).get("subjects") or [])
+    ):
+        # 空镜：I2V 同样不能"补人"（片尾山道空镜实测会自己加两个角色）。
+        story.append("【空镜】画面内不出现任何人物、人影或动物，只保留场景与指定道具。")
+    # 2026-09-19 用户要求：视频提示词也要带质感要求（写实材质），
+    # 否则 I2V 会把材质渲染成塑料/磨皮感。取 playbook 的 texture 描述。
+    texture = ""
+    if isinstance(style_context, dict):
+        vl = style_context.get("visual_language")
+        if isinstance(vl, dict):
+            texture = str(vl.get("texture") or "").strip()
+    story.append(
+        "【质感】中国式三维动画电影质感、写实材质："
+        + (texture + "；" if texture else "")
+        + "皮肤保留微纹理与自然高光（不磨皮），布料纤维与褶皱可见，"
+        "器物有真实反光与使用痕迹；光照按物理规律落影。"
+    )
     beat = f"[0-{seconds_i}s] {size_zh}。"
-    body_bits = _subject_blocking_zh(shot)
+    body_bits = _subject_blocking_zh(shot, character_registry)
     if cam_zh:
         cam_sentence = f"镜头{cam_zh}"
         if extra_cam:
             cam_sentence += f"，{extra_cam}"
         cam_sentence += "。"
         body_bits.append(cam_sentence)
-    dialogue = _dialogue_section_text(shot, use_full_text=True)
+    dialogue = _dialogue_section_text(shot, use_full_text=True, names=names)
     if dialogue:
         body_bits.append(dialogue + "。")
     pic_lock = ""
@@ -970,6 +1057,12 @@ def build_kling_prompt(
     light = _kling_light_text(shot)
     if light:
         extra.append("光：" + light)
+    # P0-8：prompt 层特效（仅动态侧；静帧是特效发生前的状态）。复用主
+    # builder 的 dense 语义——只保主特效 1 条，极简措辞进 extra 块。
+    if not still:
+        vfx = _vfx_section_text(shot, dense=True)
+        if vfx:
+            extra.append("特效：" + vfx)
     extra.extend(_kling_registry_identity(shot, character_registry))
     return _kling_join_budget(bits, extra, max_chars)
 
@@ -1299,6 +1392,44 @@ def _bgm_section_text(shot: dict[str, Any]) -> str:
     return seg or ""
 
 
+def _vfx_section_text(shot: dict[str, Any], *, dense: bool = True) -> str:
+    """把镜头的 prompt 层 vfx 渲染成【特效】段（P0-8）。
+
+    只渲染 ``layer=prompt`` 条目（post 层是 ffmpeg 后期，不进生成提示词）。
+    每条格式：「onset 秒处，kind（强度 X）」——onset 是镜内相对秒；
+    onset 缺省按 0 处理。dense 下只保 onset 靠前的主特效 1 条
+    （具体视觉语言由 VFX_DIRECTOR.md 纪律保证；抽象词由 _ABSTRACT_WORD_RE
+    兜底剔除）。没有 prompt 层条目时返回 ""。
+    """
+    items = [v for v in (shot.get("vfx") or []) if isinstance(v, dict)]
+    prompt_items = [
+        v for v in items
+        if str(v.get("layer") or "") == "prompt" and str(v.get("kind") or "").strip()
+    ]
+    if not prompt_items:
+        return ""
+    prompt_items.sort(key=lambda v: float(v.get("onset") or 0))
+    if dense:
+        prompt_items = prompt_items[:1]
+
+    def _one(v: dict[str, Any]) -> str:
+        kind = str(v.get("kind")).strip()
+        onset = float(v.get("onset") or 0)
+        seg = f"{onset:.1f}秒处，{kind}"
+        intensity = v.get("intensity")
+        if intensity is not None:
+            try:
+                val = float(intensity)
+            except (TypeError, ValueError):
+                val = None
+            if val is not None:
+                strength = "强" if val >= 0.66 else ("中" if val >= 0.33 else "弱")
+                seg += f"（强度{strength}）"
+        return seg
+
+    return "；".join(_one(v) for v in prompt_items)
+
+
 def _section_assembler(
     shot: dict[str, Any],
     character_registry: list[dict[str, Any]] | None,
@@ -1307,6 +1438,7 @@ def _section_assembler(
     agnes_audio: bool = False,
     dense: bool = True,
     is_i2v: bool = False,
+    presence_names: dict[str, str] | None = None,
 ) -> list[str]:
     """把提示词组装成有序的带标签段落列表。
 
@@ -1337,12 +1469,25 @@ def _section_assembler(
     if role_parts:
         sections.append("【角色与外貌】 " + "；".join(role_parts))
 
+    # 空镜硬约束（2026-09-20）：presence.empty_reason 写明"人已退场"的镜，
+    # 提示词必须显式禁止出现人物——否则模型会往山道/庭院里"补人"（片尾空镜实测）。
+    presence_row = shot.get("presence") if isinstance(shot.get("presence"), dict) else {}
+    if (
+        str(presence_row.get("empty_reason") or "").strip()
+        and not vd.get("subjects")
+    ):
+        sections.append(
+            "【空镜】本镜是纯环境空镜：画面内**不出现任何人物、人影、剪影或动物**；"
+            "只保留场景陈设与清单里写明的道具；镜头运动只表现环境（雨雾、光、风）"
+        )
+
     # 动作
     action_parts = []
     for subj in vd.get("subjects", []):
-        name = subj.get("id") or ""
+        # 用中文显示名，避免把 wen_ruchun 这类 id 写进生成提示词。
+        name = _subject_display_name(subj, character_registry) or subj.get("id") or ""
         # 存在节拍级时间线时优先采用（向后兼容）。
-        timeline = _beat_timeline_text(subj)
+        timeline = _beat_timeline_text(subj, name=name)
         if timeline:
             action_parts.append(timeline)
             continue
@@ -1361,6 +1506,12 @@ def _section_assembler(
     if action_parts:
         sections.append("【动作】 " + "；".join(action_parts))
 
+    # 特效（P0-8）：prompt 层 vfx 时间点事件（动态专属段——首帧静态图是特效
+    # 发生前的状态，不携带）。dense 下只保主特效 1 条（即梦 400 字预算不挤爆）。
+    vfx_text = _vfx_section_text(shot, dense=dense)
+    if vfx_text:
+        sections.append("【特效】 " + vfx_text)
+
     # 物体与道具
     objects = [o.get("appearance") or o.get("id") or "" for o in vd.get("objects", [])]
     objects = [o for o in objects if o]
@@ -1378,7 +1529,18 @@ def _section_assembler(
         sections.append("【光线】 " + lighting)
 
     # 台词（verbatim：占位符 {{对白}} 完整保留，永不缩减；Agnes 路径用台词全文）→ 进视频动态提示词
-    dialogue_text = _dialogue_section_text(shot, use_full_text=agnes_audio)
+    dialogue_text = _dialogue_section_text(
+        shot,
+        use_full_text=agnes_audio,
+        names={
+            **{
+                str(row["id"]): str(row.get("name") or row["id"])
+                for row in (character_registry or [])
+                if isinstance(row, dict) and row.get("id")
+            },
+            **(presence_names or {}),
+        },
+    )
     if dialogue_text:
         sections.append("【台词】 " + dialogue_text)
 
@@ -1447,6 +1609,22 @@ def _section_assembler(
     if continuity_parts:
         sections.append("【衔接】 " + "；".join(continuity_parts))
 
+    # 在场清单 + 承接表（B2.5）：每镜独立送给模型，模型看不到上一镜，
+    # 所以"谁在场/拿什么/在哪 + 上镜哪些必须保留"必须逐镜写全。
+    presence = shot.get("presence")
+    if isinstance(presence, dict) and presence:
+        from lib.shot_presence import presence_prompt_lines
+
+        continuity = shot.get("continuity") if isinstance(shot.get("continuity"), dict) else None
+        # 提示词里用**中文名**而不是 id：角色取自 registry，道具/场景取 presence_names
+        # （visual_prompt_builder 从 script.props 注入）。缺名时回落 id，不静默删段。
+        names: dict[str, str] = {}
+        for row in character_registry or []:
+            if isinstance(row, dict) and row.get("id"):
+                names[str(row["id"])] = str(row.get("name") or row["id"])
+        names.update(presence_names or {})
+        sections.extend(presence_prompt_lines(presence, continuity, names=names))
+
     if dense:
         # 删抽象套话（共享精简门）：去掉「优雅地/电影感/高质量/8k/杰作」等
         # 不携带像素/运动/声音信息的词。角色名与台词原样保留（台词 verbatim）。
@@ -1508,6 +1686,7 @@ def build_shot_prompt_detailed(
         agnes_audio=agnes_audio,
         dense=dense,
         is_i2v=is_i2v,
+        presence_names=presence_names,
     )
     raw = "。".join(sections)
 
@@ -1546,7 +1725,7 @@ def _compress_prompt(raw: str, sections: list[str], max_chars: int) -> str:
     后者最先被丢弃，让音效用最少的字。
     """
     _PRIORITY = [
-        "台词", "角色与外貌", "环境", "姿态", "动作", "镜头",
+        "台词", "角色与外貌", "环境", "姿态", "动作", "特效", "镜头",
         "风格", "光线", "层次", "物体与道具", "质量", "保留",
         "衔接", "背景音乐", "声音",
     ]
@@ -1619,6 +1798,7 @@ def build_shot_prompt_pair(
     refs: list[dict[str, Any]] | None = None,
     master_prompt: str | None = None,
     master_pattern: str | None = None,
+    presence_names: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """把一个镜头/场景拆成两条提示词：首帧图片 + 视频运动。
 
@@ -1710,6 +1890,7 @@ def build_shot_prompt_pair(
         agnes_audio=agnes_audio,
         dense=dense,
         is_i2v=is_i2v,
+        presence_names=presence_names,
     )
     static_sections, dynamic_sections = _split_first_frame_sections(
         sections,
@@ -1720,6 +1901,7 @@ def build_shot_prompt_pair(
         keep_reference=keep_reference,
         dense=dense,
         jimeng_prompt=jimeng_prompt,
+        character_registry=character_registry,
     )
 
     first_frame_raw = "。".join(static_sections)
@@ -1783,6 +1965,8 @@ def build_shot_prompt_pair(
             refs=refs,
             duration_seconds=shot.get("duration_seconds"),
             max_chars=int(provider_max_chars or 3000),
+            presence_names=presence_names,
+            style_context=style_context,
         )
 
     if kling_prompt:
@@ -1876,7 +2060,23 @@ def build_reference_image_prompt(
         sections = [f"【角色与外貌】 {role}"]
         if outfit:
             sections.append(f"【物体与道具】 {outfit}")
-        sections.append("【镜头】 主体完整、特征清晰的定妆构图")
+        # 定妆照必须是**全身正面立像**：早前只写"主体完整"导致模型给出
+        # 裁掉头部的半身/服装特写（用户实测 portrait_monk / portrait_wen_ruchun
+        # 只有躯干），身份参考因此不可用。
+        # 构图段放最前：Agnes 图片不支持 negative_prompt，"禁裁切"只能靠正向提示词，
+        # 且模型对开头的构图句最敏感（实测把构图放末尾仍被裁掉头）。
+        sections.insert(0, (
+            # 2026-09-19 用户拍板 + 三次实测：定妆照走**近景胸像**——
+            # "全身"与"半身到腰"都会被模型推近成"躯干+衣袍"（头顶出画，方差大）；
+            # 以面部为主体的胸像构图稳定给出完整头部与脸。全身体态交给四视图。
+            "【构图】 近景胸像定妆照：以人物面部为主体，画面范围从**完整发顶**到胸口；"
+            "脸部清晰居中、占画面约三分之一；头部绝对完整（发际线与头顶都在画面内）；"
+            "严禁裁切头顶、严禁只拍躯干或衣袍局部；纯色中性背景，无环境道具"
+        ))
+        sections.append(
+            "【镜头】 正面胸像：再次确认发顶没有被切掉、整张脸完整可见；"
+            "肩线入画；背景纯色、无环境道具"
+        )
         style = _image_style_text(style_context, "。".join(sections))
         if style:
             sections.append(f"【风格】 {style}")
@@ -1912,7 +2112,10 @@ def build_reference_image_prompt(
         role = f"{name}: {core}" if name else core
         sections = [
             f"【角色与外貌】 {role}",
-            "【镜头】 全身四视图转面：正面、侧面、背面、四分之三侧，同一张图，中性背景，身份与服装锁定",
+            "【镜头】 全身四视图转面（远距离拍摄，相机距人物约四米）："
+            "正面、侧面、背面、四分之三侧，同一张图分四格等距排列；"
+            "每一格都必须从头顶到脚完整入画、比例一致；严禁裁切头部或只画半身；"
+            "中性背景，身份与服装锁定",
         ]
         if outfit:
             sections.append(f"【物体与道具】 {outfit}")
@@ -1937,6 +2140,15 @@ def build_reference_image_prompt(
         if not desc:
             raise ValueError("scene_ref requires scene.description")
         sections = [f"【环境】 {desc}"]
+        # 空镜参考图的三条硬约束（用户实测：殿内空镜被画成庭院外景+雨幕、
+        # 画面里生出匾额对联、道具被画成琵琶）：
+        sections.append(
+            "【镜头】 纯环境空镜：画面内不出现任何人物、人影或动物；"
+            "机位与空间关系严格按上述场景描述（写室内就是室内机位，"
+            "不得自行改到室外庭院）；雾/烟只作薄层，不得遮蔽主体结构；"
+            "只画描述里提到的陈设，不得新增匾额、对联、屏风文字等元素"
+        )
+        sections.append("【物体与道具】 画面内不出现乐器等无关道具（描述里没有就不画）")
         style = _image_style_text(style_context, desc)
         if style:
             sections.append(f"【风格】 {style}")
@@ -1984,5 +2196,3 @@ def build_reference_image_prompt(
             style_context, english_visual=english_visual
         ),
     }
-
-

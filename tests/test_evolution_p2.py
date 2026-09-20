@@ -341,3 +341,17 @@ def test_multi_shot_stays_shot_by_shot_http():
     )
     assert any("逐镜" in n for n in route["notes"])
     assert route["gen_strategy"] == "single_call_multi_shot"
+
+
+def test_multi_shot_dead_field_for_agnes_degrades_with_named_finding():
+    """Agnes n 固定 1：single_call_multi_shot 必降级且 finding 点名死字段，不静默。"""
+    route = _route_shot(
+        _shot(gen_strategy="single_call_multi_shot"),
+        video_loop="agnes",
+        vid_prov="agnes",
+        vid_name="agnes_video",
+    )
+    assert route["api_id"] == "agnes_v25"
+    assert route["gen_strategy"] == "shot_by_shot"
+    assert route["degraded"] is True
+    assert any("死字段" in n for n in route["notes"])

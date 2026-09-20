@@ -130,6 +130,11 @@ def write_episode_skeleton(
             "对本集跑 `python -m montage produce .` ；默认不在系列根拼季，全集完成后才可 `--season-concat` 写出 `renders/season.mp4`。\n",
             encoding="utf-8",
         )
+    # V39/V46：集随行手册同款复制——必须"缺才写"（materialize 反复调用本函数，
+    # 无守卫会把 Agent 写了一半的集手账覆盖回空白骨架）。
+    from montage.engine.project import _copy_tracker_files
+
+    _copy_tracker_files(ep_dir)
 
 
 def materialize_episodes(series_dir: str | Path) -> dict[str, Any]:

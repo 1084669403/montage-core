@@ -646,6 +646,12 @@ def _character_ids(shot: dict[str, Any], scene_plan: dict[str, Any] | None) -> l
             ids.append(str(sub["id"]))
     if ids:
         return ids
+    # 2026-09-20 修正：**显式空镜**不能回落到场景级 character_ids。
+    # sc05_08 是空镜（subjects=[]、presence.empty_reason 写明"人已退场"），
+    # 回落会把该场两个角色当成本镜人物 → 参考图带上他俩、成片里人又回来了。
+    presence = shot.get("presence") if isinstance(shot.get("presence"), dict) else {}
+    if str(presence.get("empty_reason") or "").strip():
+        return []
     scene_id = str(shot.get("scene_id") or "")
     for scene in (scene_plan or {}).get("scenes") or []:
         if str(scene.get("id") or "") == scene_id:
@@ -923,12 +929,16 @@ def _ref_index(
     id_key: str,
 ) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
+    canonical: dict[str, dict[str, Any]] = {}
     for ref in (manifest or {}).get("reference_assets") or []:
         if not isinstance(ref, dict) or str(ref.get("kind") or "") != kind:
             continue
         kid = str(ref.get(id_key) or "")
         if kid and (ref.get("path") or ref.get("url")):
-            out[kid] = ref
+            # 身份记忆库 canonical 锚优先（P0-identity-memory）：重拍定妆后旧图
+            # 可能仍在 manifest 里，若按「最后一张胜」会静默顶掉真源。
+            (canonical if ref.get("canonical") else out)[kid] = ref
+    out.update(canonical)
     return out
 
 
@@ -946,13 +956,16 @@ def _ref_index_by_form(
 ) -> dict[tuple[str, str], dict[str, Any]]:
     """按 (character_id, form_id) 索引某 kind 的参考图；form_id 缺省为 ""。"""
     out: dict[tuple[str, str], dict[str, Any]] = {}
+    canonical: dict[tuple[str, str], dict[str, Any]] = {}
     for ref in (manifest or {}).get("reference_assets") or []:
         if not isinstance(ref, dict) or str(ref.get("kind") or "") != kind:
             continue
         cid = str(ref.get("character_id") or "")
         if not cid or not (ref.get("path") or ref.get("url")):
             continue
-        out[(cid, str(ref.get("form_id") or ""))] = ref
+        key = (cid, str(ref.get("form_id") or ""))
+        (canonical if ref.get("canonical") else out)[key] = ref
+    out.update(canonical)
     return out
 
 
@@ -1329,6 +1342,8 @@ def resolve_shot_refs(
     manifest: dict[str, Any] | None,
     script: dict[str, Any] | None = None,
     scene_plan: dict[str, Any] | None = None,
+    *,
+    max_refs: int | None = None,
 ) -> list[dict[str, Any]]:
     """按 character_ids / scene_id / prop 引用收集 reference_assets。
 
@@ -1338,7 +1353,12 @@ def resolve_shot_refs(
     use_turnaround=True 取回。
     """
     refs: list[dict[str, Any]] = []
+    turn_refs: list[dict[str, Any]] = []
+    portrait_refs: list[dict[str, Any]] = []
+    scene_refs: list[dict[str, Any]] = []
+    prop_refs: list[dict[str, Any]] = []
     include_turnaround = bool(shot.get("_include_turnaround_refs"))
+    skip_portrait = bool(shot.get("_skip_portrait_refs"))
     portraits = _portrait_index(manifest)
     turnarounds = _turnaround_index(manifest)
     portraits_by_form = _portrait_refs_by_form(manifest)
@@ -1352,10 +1372,13 @@ def resolve_shot_refs(
             else None
         )
         hit_p = _form_ref(portraits_by_form, portraits, cid, fid, has_forms)
-        for hit in (hit_t, hit_p):
+        for hit, bucket in ((hit_t, turn_refs),):
             if hit and hit.get("id") not in seen:
-                refs.append(hit)
+                bucket.append(hit)
                 seen.add(str(hit.get("id") or cid))
+        if hit_p and not skip_portrait and hit_p.get("id") not in seen:
+            portrait_refs.append(hit_p)
+            seen.add(str(hit_p.get("id") or cid))
     scene_id = str(shot.get("scene_id") or "")
     location_id = str(shot.get("location_id") or "")
     if not location_id and scene_plan:
@@ -1370,18 +1393,80 @@ def resolve_shot_refs(
         if rid in seen:
             continue
         if location_id and str(ref.get("location_id") or "") == location_id:
-            refs.append(ref)
+            scene_refs.append(ref)
             seen.add(rid)
             continue
         if scene_id and str(ref.get("scene_id") or "") == scene_id:
-            refs.append(ref)
+            scene_refs.append(ref)
             seen.add(rid)
-    for pid in collect_prop_ids([shot], script, cap=_MAX_PROPS):
+    # 道具只取**本镜在场清单里**的那几件（presence.props）；没有 presence 时才回落到
+    # 全片 props。overlay 会把全片道具塞进每镜 objects，直接用它会让每镜都挂 3 件无关
+    # 道具、把参考位（首帧上限 6 张）挤掉。
+    presence = shot.get("presence") if isinstance(shot.get("presence"), dict) else {}
+    declared = [
+        str(row.get("id") or "").strip()
+        for row in (presence.get("props") or [])
+        if isinstance(row, dict) and str(row.get("id") or "").strip()
+    ]
+    prop_ids = declared or collect_prop_ids([shot], script, cap=_MAX_PROPS)
+    for pid in prop_ids:
         hit = props.get(pid)
         if hit and str(hit.get("id") or pid) not in seen:
-            refs.append(hit)
+            prop_refs.append(hit)
             seen.add(str(hit.get("id") or pid))
-    return refs
+    # 参考位分配（2026-09-19 用户要求）：**先算数，真超了才挤**。
+    # 保序：身份四视图 → 场景 → 本镜道具 → 定妆（定妆放最后，超限时才被挤掉；
+    # 四视图本身就含正脸，挤掉定妆的信息损失最小）。
+    if max_refs and max_refs > 0:
+        core = [*turn_refs, *scene_refs]
+        room = max(0, max_refs - len(core))
+        kept_props = prop_refs[:room]
+        room -= len(kept_props)
+        kept_portraits = portrait_refs[:room]
+        return [*turn_refs, *kept_portraits, *scene_refs, *kept_props]
+    return [*turn_refs, *portrait_refs, *scene_refs, *prop_refs]
+
+
+def name_refs_for_prompt(
+    refs: list[dict[str, Any]] | None,
+    *,
+    character_registry: list[dict[str, Any]] | None = None,
+    script: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """给参考图补中文显示名（图例用），不改 url/path/顺序。
+
+    2026-09-19 用户要求：首帧/视频的参考图说明必须让模型与人都看懂
+    "这是某角色的四视图 / 某道具的四视图"，不能写 turnaround_huan_niang
+    这类内部 id。
+    """
+    names: dict[str, str] = {}
+    for row in character_registry or []:
+        if isinstance(row, dict) and row.get("id"):
+            names[str(row["id"])] = str(row.get("name") or row["id"])
+    doc = script if isinstance(script, dict) else {}
+    for key in ("characters", "props", "locations"):
+        for row in doc.get(key) or []:
+            if isinstance(row, dict) and row.get("id"):
+                names.setdefault(str(row["id"]), str(row.get("name") or row["id"]))
+    out: list[dict[str, Any]] = []
+    for ref in refs or []:
+        if not isinstance(ref, dict):
+            out.append(ref)
+            continue
+        row = dict(ref)
+        if not str(row.get("name") or "").strip():
+            for key in ("character_id", "prop_id", "location_id", "id"):
+                ident = str(row.get(key) or "").strip()
+                if not ident:
+                    continue
+                hit = names.get(ident)
+                if not hit and "_" in ident:
+                    hit = names.get(ident.split("_", 1)[1])
+                if hit:
+                    row["name"] = hit
+                    break
+        out.append(row)
+    return out
 
 
 def _binding_ref_row(
@@ -1695,11 +1780,20 @@ def reconcile_image_bindings(
 
 
 def _prop_prompt(prop: dict[str, Any]) -> str:
+    """道具参考图 = **同一件物品的四视图**（2026-09-19 用户拍板）。
+
+    与人物四视图同构：四个角度画在一张图里，并在提示词里写死"同一件物品的
+    不同角度、不是多件物品"，否则 I2V 会把四格读成多件道具。
+    """
     name = str(prop.get("name") or prop.get("id") or "道具")
     appearance = str(prop.get("appearance") or name)
     return (
-        f"道具白底静物照：{name}，{appearance}；纯白背景，物体孤立居中，"
-        "静物题材，影棚均匀布光，画面无人物无手部，非手持拍摄，细节清晰"
+        f"道具四视图（同一件物品的四个角度）：{name}，{appearance}；"
+        "同一画面分成四格（2×2）等距排列：正面、侧面、背面、俯视或四分之三视角；"
+        "四格必须是**同一件物品**的不同角度（不是四件物品、不是多件同类道具），"
+        "每一格里的物体都**居中且尺寸一致**（四格都填满格子、不留大片空白），"
+        "比例一致、朝向统一；纯白背景，影棚均匀布光；"
+        "画面无人物无手部，非手持拍摄，细节清晰"
     )
 
 

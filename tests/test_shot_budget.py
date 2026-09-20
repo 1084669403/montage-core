@@ -72,7 +72,9 @@ def test_ratio_pending_ignores_existing_video(tmp_path):
     plan = _plan("hero", "hero", "talk", "talk")
     vid = proj / "assets" / "videos" / "a.mp4"
     vid.parent.mkdir(parents=True, exist_ok=True)
-    vid.write_bytes(b"vid")
+    from conftest import write_tiny_video
+
+    write_tiny_video(vid)
     manifest = {"items": [{
         "id": "sh01_video", "kind": "video", "shot_id": "sh01", "path": str(vid),
     }]}

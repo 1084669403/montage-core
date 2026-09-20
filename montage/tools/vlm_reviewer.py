@@ -27,6 +27,9 @@ _DEFAULT_MODEL = "qwen-vl-plus"
 _DEFAULT_BASE = "https://dashscope.aliyuncs.com"
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
+#: 单次请求最多带几帧。千问 VL 多图有上限，且帧越多 token 越贵——审片抽检不需要整段。
+MAX_FRAMES = 3
+
 
 def _api_base() -> str:
     return str(os.environ.get("DASHSCOPE_API_BASE") or _DEFAULT_BASE).rstrip("/")
@@ -68,6 +71,110 @@ def extract_still(path: str | Path, output: str | Path) -> str | None:
         return str(extract_last_frame(src, dest))
     except Exception:  # noqa: BLE001
         return None
+
+
+def sample_timestamps(duration: float, count: int = MAX_FRAMES) -> list[float]:
+    """整段等距取 ``count`` 个采样点（取每段**中点**）。
+
+    避开首尾：首尾常是黑场/台标/尾帧缺帧，抽在那里只会得到「看起来没问题」的假阴性。
+    """
+    if count <= 0 or duration <= 0:
+        return []
+    if count == 1:
+        return [round(float(duration) / 2, 3)]
+    return [round(float(duration) * (i + 0.5) / count, 3) for i in range(count)]
+
+
+def default_timestamps(media_path: str | Path, count: int = MAX_FRAMES) -> list[float]:
+    """视频时长 → 等距采样点。图片/量不出时长 → ``[]``（调用方退回单帧）。"""
+    src = Path(media_path)
+    if not src.is_file() or src.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+        return []
+    try:
+        from montage.compose.ffmpeg_engine import probe
+
+        info = probe(src)
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        duration = float((info.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        return []
+    return sample_timestamps(duration, count)
+
+
+def extract_frames(
+    media_path: str | Path,
+    timestamps: list[float],
+    *,
+    prefix: str = "_vlm",
+) -> dict[str, Any]:
+    """按时间点抽帧。返回 ``{frames, sampled, missed}``。
+
+    抽不出的点**跳过并计数**，不抛：一次抽检少一帧不影响其余帧的结论，
+    为它中断整片体检不划算（失败点会带进报告，人能看到少抽了哪一段）。
+    """
+    src = Path(media_path)
+    if not src.is_file():
+        return {"frames": [], "sampled": [], "missed": [round(float(t), 3) for t in timestamps]}
+    if src.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+        return {"frames": [str(src)], "sampled": [], "missed": []}
+    from montage.compose.ffmpeg_engine import extract_frame_at
+
+    base = str(src.with_suffix("")) + prefix
+    frames: list[str] = []
+    sampled: list[float] = []
+    missed: list[float] = []
+    for i, t in enumerate(timestamps):
+        dest = Path(f"{base}_{i:02d}.jpg")
+        try:
+            frames.append(str(extract_frame_at(src, float(t), dest)))
+        except Exception:  # noqa: BLE001
+            missed.append(round(float(t), 3))
+            continue
+        sampled.append(round(float(t), 3))
+    return {"frames": frames, "sampled": sampled, "missed": missed}
+
+
+def _sample_frames(
+    media_path: str,
+    *,
+    mode: str,
+    timestamps: list[float] | None,
+    max_frames: int,
+) -> tuple[list[str], dict[str, Any]]:
+    """抽要送 VLM 的帧。返回 ``(frames, sampled)``。
+
+    - 显式 ``timestamps``：按点抽（超 ``max_frames`` 截断）
+    - ``mode="video_clip"``：整段等距抽 ``max_frames`` 帧（**分段抽帧**）
+    - 其余（含图片）：沿用单帧老路径，行为与 P3 完全一致
+    """
+    limit = max(1, int(max_frames or MAX_FRAMES))
+    if timestamps:
+        result = extract_frames(media_path, [float(t) for t in timestamps][:limit])
+        return result["frames"], {
+            "mode": "timestamps",
+            "frames": len(result["frames"]),
+            "sampled": result["sampled"],
+            "missed": result["missed"],
+        }
+    if str(mode) == "video_clip":
+        auto = default_timestamps(media_path, limit)
+        if auto:
+            result = extract_frames(media_path, auto)
+            return result["frames"], {
+                "mode": "video_clip",
+                "frames": len(result["frames"]),
+                "sampled": result["sampled"],
+                "missed": result["missed"],
+            }
+    still = extract_still(media_path, str(Path(media_path).with_suffix("")) + "_vlm.jpg")
+    return ([still] if still else []), {
+        "mode": "single",
+        "frames": 1 if still else 0,
+        "sampled": [],
+        "missed": [],
+    }
 
 
 def parse_vlm_response(raw: Any) -> dict[str, Any]:
@@ -145,18 +252,24 @@ def _critical_fail(report: dict[str, Any]) -> bool:
     return any(i.get("severity") == "critical" for i in (report.get("issues") or []))
 
 
-def _prompt(expected: dict[str, Any], mode: str) -> str:
+def _prompt(expected: dict[str, Any], mode: str, *, frame_count: int = 1) -> str:
     appearance = str(expected.get("appearance") or "").strip()
     outfit = str(expected.get("outfit") or "").strip()
     location = str(expected.get("location") or "").strip()
     props = expected.get("props") or []
     prop_text = "、".join(str(p) for p in props if p)
+    multi = (
+        f"共 {frame_count} 帧按时间顺序给出；同一人物跨帧不一致（发色/服装/脸型/道具）也要报 kind=人物不一致。"
+        if frame_count > 1
+        else ""
+    )
     return (
         "你是成片质检。对照「定妆/场记」检查生成画面。"
         "只输出 JSON："
         '{"ok":true/false,"score":0到1,"issues":[{"severity":"critical|warning",'
         '"kind":"人物不一致|道具丢失|场景错位|崩坏|构图","message":"…","proposed_fix":"…"}]}。'
         f"mode={mode}。"
+        f"{multi}"
         f"<appearance>{appearance or '（无）'}</appearance>"
         f"<outfit>{outfit or '（无）'}</outfit>"
         f"<location>{location or '（无）'}</location>"
@@ -173,13 +286,21 @@ def review_media(
     mode: str = "first_frame",
     portrait_path: str = "",
     post_fn=None,
+    timestamps: list[float] | None = None,
+    max_frames: int = MAX_FRAMES,
 ) -> dict[str, Any]:
-    """返回 {ok, score, issues, skipped}。无密钥 skipped=True 且 ok=False。"""
+    """返回 ``{ok, score, issues, skipped, sampled}``。无密钥 skipped=True 且 ok=False。
+
+    ``timestamps`` 显式给点、或 ``mode="video_clip"``（整段等距抽帧）时走**分段抽帧**；
+    都不给则仍是「单帧」老行为（P3 调用方零改动）。
+    """
     key = os.environ.get("DASHSCOPE_API_KEY")
     if not key:
         return {"ok": False, "score": None, "issues": [], "skipped": True}
-    still = extract_still(media_path, str(Path(media_path).with_suffix("")) + "_vlm.jpg")
-    if not still or not Path(still).is_file():
+    frames, sampled = _sample_frames(
+        media_path, mode=mode, timestamps=timestamps, max_frames=max_frames,
+    )
+    if not frames:
         return {
             "ok": True,
             "score": None,
@@ -190,16 +311,18 @@ def review_media(
                 "proposed_fix": "检查 ffmpeg 或媒体文件",
             }],
             "skipped": False,
+            "sampled": sampled,
         }
     content: list[dict[str, Any]] = [
-        {"type": "image_url", "image_url": {"url": encode_image_data_url(still)}},
+        {"type": "image_url", "image_url": {"url": encode_image_data_url(frame)}}
+        for frame in frames
     ]
     if portrait_path and Path(portrait_path).is_file():
         content.append({
             "type": "image_url",
             "image_url": {"url": encode_image_data_url(portrait_path)},
         })
-    content.append({"type": "text", "text": _prompt(expected or {}, mode)})
+    content.append({"type": "text", "text": _prompt(expected or {}, mode, frame_count=len(frames))})
     payload = {
         "model": _model(),
         "messages": [{"role": "user", "content": content}],
@@ -220,9 +343,11 @@ def review_media(
                 "proposed_fix": "检查 DASHSCOPE_API_KEY / 配额",
             }],
             "skipped": False,
+            "sampled": sampled,
         }
     parsed = parse_vlm_response(raw)
     parsed["skipped"] = False
+    parsed["sampled"] = sampled
     if _critical_fail(parsed):
         parsed["ok"] = False
     return parsed
@@ -244,9 +369,16 @@ class VlmReviewer(BaseTool):
                 "type": "string",
                 "enum": ["first_frame", "video_clip"],
                 "default": "first_frame",
+                "description": "video_clip = 整段等距分段抽帧（P0-7）；first_frame = 单帧",
             },
             "expected": {"type": "object"},
             "portrait_path": {"type": "string"},
+            "timestamps": {
+                "type": "array",
+                "items": {"type": "number"},
+                "description": "P0-7：显式抽帧时间点（秒），优先级高于 mode",
+            },
+            "max_frames": {"type": "integer", "default": MAX_FRAMES},
         },
     }
 
@@ -257,10 +389,22 @@ class VlmReviewer(BaseTool):
         return 0.01 if os.environ.get("DASHSCOPE_API_KEY") else 0.0
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
+        raw_ts = inputs.get("timestamps")
+        timestamps = (
+            [float(t) for t in raw_ts if isinstance(t, (int, float))]
+            if isinstance(raw_ts, list)
+            else None
+        )
+        try:
+            max_frames = int(inputs.get("max_frames") or MAX_FRAMES)
+        except (TypeError, ValueError):
+            max_frames = MAX_FRAMES
         data = review_media(
             media_path=str(inputs.get("media_path") or ""),
             expected=inputs.get("expected") if isinstance(inputs.get("expected"), dict) else {},
             mode=str(inputs.get("mode") or "first_frame"),
             portrait_path=str(inputs.get("portrait_path") or ""),
+            timestamps=timestamps,
+            max_frames=max_frames,
         )
         return ToolResult(success=True, data=data)

@@ -153,7 +153,10 @@ _IMAGE_ENGLISH_GUARD = "无运动模糊，无文字，无水印"
 
 # 仅图片的负面提示词（非 Agnes 生成器）。不含语音护栏，也不含多肢体 /
 # 畸形手之类的措辞（对生物类主体安全）。作为 image_negative_prompt 返回。
-_IMAGE_ENGLISH_NEGATIVE = "低画质，模糊，水印，文字，标志，运动模糊"
+_IMAGE_ENGLISH_NEGATIVE = (
+    "低画质，模糊，水印，文字，匾额，对联，书法，招牌，印章，标志，运动模糊，"
+    "琵琶，月琴，古筝"
+)
 
 # 会把运动时长泄漏进静态姿势的方式片段（保留 急促/前倾）。
 _MANNER_TIME_RE = re.compile(
@@ -181,13 +184,18 @@ _FRAME_CONSISTENCY_EN = (
 _ENGLISH_NEGATIVE_PROMPT = (
     "低画质，模糊，脱焦，肢体畸形，手指畸形，面部扭曲，画面闪烁，"
     "镜头抖动不稳，过度磨皮的AI感，塑料皮肤，英语语音，英语旁白，"
-    "英文字幕，画面文字，外语发音，人物朗读对白，水印，标志"
+    "英文字幕，画面文字，匾额，对联，书法，外语发音，人物朗读对白，水印，标志，"
+    "琵琶，月琴，古筝"
 )
 
 # 有序的提示词段落标签（组装 / 压缩 / 审核用固定顺序）。
 _SECTION_ORDER = [
+    ("构图", "framing"),
     ("角色与外貌", "role_appearance"),
+    ("在场清单", "presence"),
+    ("画外", "off_frame"),
     ("动作", "action"),
+    ("特效", "vfx"),
     ("物体与道具", "objects"),
     ("环境", "environment"),
     ("光线", "lighting"),
@@ -209,5 +217,3 @@ _ABSTRACT_WORD_RE = re.compile(
     r"\b8K\b|\b4K\b|\bHDR\b)",
     re.IGNORECASE,
 )
-
-

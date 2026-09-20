@@ -66,7 +66,12 @@ def collect_shots(
     return nested
 
 
-_REWORK_KEYS = ("rework_mode", "revision_note", "retake_segment")
+# scene_plan → shot dict 覆盖键。agnes_mode/seed/tail_frame_state 是 v8.2 按需分配
+# 新增：不进白名单会复现 sc01_01「改了仍按旧值静默重发」的教训。
+_REWORK_KEYS = (
+    "rework_mode", "revision_note", "retake_segment",
+    "agnes_mode", "seed", "tail_frame_state",
+)
 
 
 def overlay_plan_rework(
@@ -114,6 +119,7 @@ def lift_shot_prompts(shots: list[dict[str, Any]]) -> dict[str, Any]:
             "cut", "location_id", "shot_budget_class", "blocking",
             "dialogue_audio_mode", "gen_strategy", "api_id", "negative_prompt",
             "rework_mode", "revision_note", "retake_segment",
+            "agnes_mode", "seed", "tail_frame_state", "vfx",
         ):
             if key in shot and shot[key] not in (None, "", []):
                 row[key] = shot[key]
@@ -323,7 +329,7 @@ def _route_caps(api_id: str, vid_name: str, vid_prov: str) -> dict[str, Any]:
         "last_frame_requires_first", "max_duration", "duration_policy",
         "edit_clip", "extend_clip", "passthrough", "citation_syntax",
         "ratio_adaptive_when_frames_locked", "negative_prompt",
-        "watermark_default",
+        "watermark_default", "modes", "max_ref_audios",
     ):
         if key in surface:
             out[key] = dict(surface[key]) if isinstance(surface[key], dict) else surface[key]
@@ -466,7 +472,12 @@ def _route_shot(
     strategy = str(data.get("gen_strategy") or "shot_by_shot") or "shot_by_shot"
     if strategy == "single_call_multi_shot":
         if not caps.get("multi_shot"):
-            notes.append("当前面无 multi_shot，已降级 shot_by_shot")
+            if api_id in ("agnes_v20", "agnes_v25"):
+                # 官方契约：Agnes n 固定 1、无 multi_shot——该字段对本面必降级，
+                # 显式点名避免编剧误以为一场多镜生效。
+                notes.append("single_call_multi_shot 对 Agnes 是死字段（n 固定 1），已降级 shot_by_shot")
+            else:
+                notes.append("当前面无 multi_shot，已降级 shot_by_shot")
             strategy = "shot_by_shot"
             degraded = True
         else:
@@ -591,6 +602,124 @@ def _agnes_is_v25() -> bool:
     return not want_video_v20()
 
 
+def resolved_agnes_mode(shot: dict[str, Any] | None, frames_mode: Any = "") -> str:
+    """per-shot 生成模式解析（v8.2 按需分配）。
+
+    显式 ``agnes_mode``（text|keyframe|reference）最高优先；空/非法值回落
+    packet 级 ``frames_mode`` 语义：keyframe → keyframe，其余（preview /
+    reference_first）→ reference。text 只在显式声明或无参考时出现。
+    """
+    explicit = str((shot or {}).get("agnes_mode") or "").strip().lower()
+    if explicit in ("text", "keyframe", "reference"):
+        return explicit
+    if str(frames_mode or "").strip().lower() == "keyframe":
+        return "keyframe"
+    return "reference"
+
+
+# v8.2 模式自动兜底顺序：显式 agnes_mode 缺席时按剧本信号推断 mode 意图。
+# 路由只出「意图」；「上镜尾帧是否真实存在」emit 期才知道，缺失时由
+# emit 侧按实况降级（回落 reference/text + finding），不做两阶段重跑。
+AUTO_MODE_SIGNALS = ("bridge", "tail_frame_state", "identity", "broll")
+
+
+def auto_agnes_mode(shot: dict[str, Any] | None) -> tuple[str, str]:
+    """自动兜底路由（显式 agnes_mode 优先在 resolved_agnes_mode 里已处理）。
+
+    返回 ``(mode, reason)``，reason 供 mode_plan.json 与冲突 finding 定位：
+      1. tail_frame_state 非空（转场匹配 / 门开→门关）→ keyframe
+      2. 桥接镜（同场下一镜存在，且本镜非 hard cut / 未换景）→ keyframe
+      3. 声明 reference_asset_ids 或出场角色 → reference
+      4. 其余空镜 / B-roll → text
+    """
+    if str((shot or {}).get("tail_frame_state") or "").strip():
+        return "keyframe", "tail_frame_state"
+    if str(shot.get("reference_asset_ids") or "").strip() not in ("", "None"):
+        return "reference", "reference_asset_ids"
+    if not _clears_bridge(shot, str(shot.get("prev_location_id") or "")):
+        return "keyframe", "bridge"
+    return "text", "broll"
+
+
+def mode_conflict_finding(
+    shot: dict[str, Any] | None,
+    *,
+    auto_mode: str,
+) -> dict[str, str] | None:
+    """「有角色 + 有桥」冲突镜：记 finding 逼编剧显式二选一，不静默降级。
+
+    keyframe（首帧即身份锚，省定妆依赖但身份靠帧级锚）与 reference
+    （保身份锚丢帧级连续性）都可行；编剧导演必须显式 agnes_mode。
+    """
+    shot = shot or {}
+    if auto_mode != "keyframe":
+        return None
+    # 延迟导入：_shot_refs 反向依赖本模块（collect_shots），模块级导入成环。
+    from montage.tools._shot_refs import _character_ids
+
+    if not _character_ids(shot, None):
+        return None
+    scene_id = str(shot.get("scene_id") or "")
+    shot_id = str(shot.get("shot_id") or "")
+    if not shot_id:
+        return None
+    return {
+        "severity": "warning",
+        "field": f"{scene_id}/{shot_id}".strip("/"),
+        "message": (
+            "该镜既有出场角色又有桥接信号（上镜尾帧/转场态），"
+            "keyframe（首帧即身份锚）与 reference（保身份图锚）两可；"
+            "请显式声明 agnes_mode，否则按 keyframe 自动执行"
+        ),
+        "proposed_fix": "scene_plan 该镜补 agnes_mode=keyframe 或 =reference",
+    }
+
+
+def build_mode_plan(
+    shots: list[dict[str, Any]],
+    *,
+    frames_mode: Any = "",
+) -> dict[str, Any]:
+    """mode_plan.json 构建器：审核快照 + findings 载体，不进运行时查表。
+
+    运行时真源仍是 scene_plan.shots[].agnes_mode（经 overlay_plan_rework
+    覆盖进 shot dict）；两者不一致时以 shot dict 为准。此处只做：
+    1) resolved mode 快照（显式优先，自动兜底只补意图）；
+    2) 冲突镜 finding；3) 显式声明登记（导演覆盖可审计）。
+    """
+    rows: list[dict[str, Any]] = []
+    findings: list[dict[str, str]] = []
+    for shot in shots:
+        shot_id = str(shot.get("shot_id") or "")
+        if not shot_id:
+            continue
+        explicit = str(shot.get("agnes_mode") or "").strip().lower()
+        if explicit in ("text", "keyframe", "reference"):
+            mode, reason = explicit, "explicit"
+        else:
+            mode, reason = auto_agnes_mode(shot)
+            if str(frames_mode or "").strip().lower() == "keyframe":
+                mode, reason = "keyframe", "packet_frames_mode"
+        row: dict[str, Any] = {
+            "shot_id": shot_id,
+            "scene_id": str(shot.get("scene_id") or ""),
+            "mode": mode,
+            "reason": reason,
+        }
+        if explicit in ("text", "keyframe", "reference"):
+            row["explicit"] = True
+        conflict = mode_conflict_finding(shot, auto_mode=mode)
+        if conflict:
+            row["conflict"] = True
+            findings.append(conflict)
+        if str(shot.get("tail_frame_state") or "").strip():
+            row["tail_frame_state"] = str(shot["tail_frame_state"])
+        if str(shot.get("seed") or "").strip():
+            row["seed"] = shot.get("seed")
+        rows.append(row)
+    return {"version": "1", "modes": rows, "findings": findings}
+
+
 def agnes_duration_chunks(seconds: float, *, v25: bool | None = None) -> list[float]:
     """按当前 Agnes 模型上限切段；过短余量丢弃（由 validator 建议在剧本层拆镜）。"""
     if v25 is None:
@@ -608,3 +737,50 @@ def agnes_duration_chunks(seconds: float, *, v25: bool | None = None) -> list[fl
     if remain >= floor:
         chunks.append(remain)
     return chunks or [min(sec, cap)]
+
+
+# v8.2 P1-audio-ref：audios ≤ 3（agnes._MAX_REF_AUDIOS）；截断优先级
+# 节奏参考（BGM/rhythm）> 音色参考（人声/timbre），与官方 images+audios
+# 叠加并存、与 keyframe 互斥（keyframe 模式不消费 audios）。
+MAX_SHOT_AUDIO_REFS = 3
+
+
+def shot_audio_ref_urls(shot: dict[str, Any] | None) -> tuple[list[str], list[str]]:
+    """解析本镜音频参考 → (http_urls, notes)。
+
+    来源优先级：audio_ref[].url 直取 > id 在 reference_assets/asset 条目里
+    找 path/url。本地 path 无上传器（v8.1 已核实）转不成公网 URL，记 note
+    丢弃不静默。URL 按角色排序：rhythm（BGM 节奏）在前，timbre（人声）在后。
+    """
+    from montage.providers.agnes import _MAX_REF_AUDIOS
+
+    shot = shot or {}
+    ap = shot.get("audio_prompt") if isinstance(shot.get("audio_prompt"), dict) else {}
+    raw = ap.get("audio_ref") if isinstance(ap.get("audio_ref"), list) else []
+    entries = [e for e in raw if isinstance(e, dict)]
+    if not entries:
+        return [], []
+    urls: list[str] = []
+    notes: list[str] = []
+    shot_id = str(shot.get("shot_id") or "")
+    for e in entries:
+        url = str(e.get("url") or "").strip()
+        if url.startswith(("http://", "https://")):
+            urls.append((str(e.get("role") or "rhythm"), url))
+            continue
+        notes.append(f"shot {shot_id}: 音频参考无公网 URL 已丢弃（{str(e.get('id') or e.get('path') or '?')[:40]}）")
+    # 节奏参考 > 音色参考；同角色内保持声明序
+    urls.sort(key=lambda t: 0 if t[0] == "rhythm" else 1)
+    ordered = [u for _role, u in urls]
+    if len(ordered) > _MAX_REF_AUDIOS:
+        notes.append(
+            f"shot {shot_id}: 音频参考超过上限 {_MAX_REF_AUDIOS}，已按节奏优先截断"
+        )
+        ordered = ordered[:_MAX_REF_AUDIOS]
+    return ordered, notes
+
+
+def audios_compatible_with_mode(mode: str) -> bool:
+    """audios 只在 reference 模式发（与 images 叠加）；keyframe/text 丢弃。"""
+    return mode == "reference"
+

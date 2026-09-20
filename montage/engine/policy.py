@@ -44,6 +44,10 @@ MAX_REF_SEGMENTS = 4
 # 身份参考图类型：portrait（单张定妆，默认） / turnaround（四视图拼板）。
 # 三级优先级：form.cast_ref_kind > character.cast_ref_kind > proposal_packet.cast_ref_kind。
 CAST_REF_KINDS = ("portrait", "turnaround")
+#: 未声明时的回落值。2026-09-19 用户拍板"后续项目一律用四视图"——落实在
+#: ``init_project`` 的项目包里（新项目会显式写入 cast_ref_kind=turnaround），
+#: 而不是改这个全局回落：老项目/最小夹具没有声明时应保持原行为（单张定妆），
+#: 改回落值会牵动 40 处既有断言与参考预算逻辑。
 DEFAULT_CAST_REF_KIND = "portrait"
 
 
@@ -60,7 +64,7 @@ def normalize_ref_overflow_mode(raw: Any) -> str:
 
 
 def normalize_cast_ref_kind(raw: Any) -> str:
-    """未知/空值一律回落 portrait（已拍板默认）。"""
+    """未知/空值一律回落 DEFAULT_CAST_REF_KIND（现为四视图 turnaround）。"""
     text = str(raw or "").strip().lower()
     return text if text in CAST_REF_KINDS else DEFAULT_CAST_REF_KIND
 
@@ -75,6 +79,8 @@ def resolve_cast_ref_kind(
     """身份参考图类型：form > character > packet；可灵环强制 turnaround。
 
     可灵用 look_sheet（一张拼板即四视图）机制，故无论声明什么一律等价 turnaround。
+    2026-09-19 用户拍板：**默认就是 turnaround（四视图）** —— 未显式声明时不再
+    落回单张 portrait，保证以后新建项目的人物参考一律是四视图。
     """
     if str(video_loop or "").strip().lower() == "kling":
         return "turnaround"
@@ -157,6 +163,9 @@ def load_loop_policy(project_dir: str | Path | None) -> dict[str, Any]:
         ceiling_f = float(ceiling) if ceiling is not None else None
     except (TypeError, ValueError):
         ceiling_f = None
+    from montage.engine.delivery_report import normalize_quality_mode
+
+    quality_mode = normalize_quality_mode(packet.get("quality_mode") or "degraded")
     return {
         "video_loop": loop,
         "video_surface": packet.get("video_surface"),
@@ -170,6 +179,7 @@ def load_loop_policy(project_dir: str | Path | None) -> dict[str, Any]:
         "frames_mode": normalize_frames_mode(packet.get("frames_mode")),
         "ref_overflow_mode": normalize_ref_overflow_mode(packet.get("ref_overflow_mode")),
         "cast_ref_kind": normalize_cast_ref_kind(packet.get("cast_ref_kind")),
+        "quality_mode": quality_mode,
     }
 
 

@@ -229,6 +229,32 @@ def test_mix_audio_loudnorm(monkeypatch, tmp_path):
     assert "loudnorm=I=-14.0:TP=-1.5:LRA=11" in cmd
 
 
+def test_mix_audio_loudnorm_without_narration(monkeypatch, tmp_path):
+    """无旁白的 AI 对白片也必须整体响度归一，避免段落间电平脱节。"""
+    v, m, o = (tmp_path / x for x in ("v.mp4", "m.mp3", "o.mp4"))
+    for f in (v, m):
+        f.write_bytes(b"fake")
+    captured: list[list[str]] = []
+    monkeypatch.setattr(fe, "_run", lambda cmd, timeout=1800: captured.append(cmd))
+    fe.mix_audio(v, None, m, o, loudnorm=True)
+    cmd = " ".join(captured[0])
+    assert "loudnorm=I=-14.0:TP=-1.5:LRA=11" in cmd
+
+
+def test_mix_audio_loudnorm_source_audio_only(monkeypatch, tmp_path):
+    """保留原生音轨且无 BGM 时，也必须对源音轨做整体响度归一。"""
+    v, o = (tmp_path / x for x in ("v.mp4", "o.mp4"))
+    v.write_bytes(b"fake")
+    captured: list[list[str]] = []
+    monkeypatch.setattr(fe, "_run", lambda cmd, timeout=1800: captured.append(cmd))
+    monkeypatch.setattr(fe, "_has_audio_stream", lambda p: True)
+    fe.mix_audio(v, None, None, o, loudnorm=True)
+    cmd = " ".join(captured[0])
+    assert "-map" in cmd and "[a]" in cmd
+    assert "dynaudnorm=p=0.80:m=6.0:r=0.30" in cmd
+    assert "loudnorm=I=-14.0:TP=-1.5:LRA=11" in cmd
+
+
 def test_mix_audio_dispatch_ducking(monkeypatch, tmp_path):
     v, n, m, o = (tmp_path / x for x in ("v.mp4", "n.mp3", "m.mp3", "o.mp4"))
     for f in (v, n, m):

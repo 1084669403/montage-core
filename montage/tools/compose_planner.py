@@ -27,6 +27,15 @@ def is_still_image(path: str) -> bool:
     return Path(path).suffix.lower() in _STILL_EXTS
 
 
+def _shot_vfx(shot: dict[str, Any]) -> list[dict[str, Any]]:
+    """P0-8：透传 shot.vfx[]（特效指导制定的观感特效）。
+
+    只收 dict 条目；层过滤留给 assemble 端（prompt 层在 assemble 无意义但
+    保留透传完整性，便于 edit_decisions 审计）。
+    """
+    return [v for v in (shot.get("vfx") or []) if isinstance(v, dict)]
+
+
 def _probe_image_size(path: Path) -> tuple[int, int] | None:
     """源图实测尺寸；失败 None（ken_burns 交给其默认，但不再由本层假设 1080p）。"""
     return probe_size(path)
@@ -193,6 +202,52 @@ def _normalize_kind(raw: Any) -> str:
     return kind
 
 
+VALID_TRANSITION_CONTRACT_DECISIONS = {
+    "fade",
+    "xfade",
+    "match_cut",
+    "audio_bridge",
+    "shared_element",
+    "establishing_shot",
+    "user_accepted_hard_cut",
+}
+
+
+def _valid_transition_contract(shot: dict[str, Any]) -> dict[str, Any] | None:
+    """Return an explicit, complete contract attached to the scene shot."""
+    contract = shot.get("transition_contract")
+    if not isinstance(contract, dict):
+        return None
+    decision = str(contract.get("decision") or "").strip()
+    reason = str(contract.get("reason") or "").strip()
+    if decision not in VALID_TRANSITION_CONTRACT_DECISIONS or not reason:
+        return None
+    return {**contract, "decision": decision, "reason": reason}
+
+
+def _transition_for_contract(
+    contract: dict[str, Any], shot: dict[str, Any], pack_tdur: float
+) -> tuple[str, float]:
+    """Map an editorial contract onto a compose-executable transition."""
+    decision = str(contract.get("decision"))
+    requested = str(shot.get("transition") or "").strip()
+    raw_duration = shot.get("transition_duration")
+    try:
+        requested_duration = float(raw_duration or 0)
+    except (TypeError, ValueError):
+        requested_duration = 0.0
+    duration = requested_duration if requested_duration > 0 else pack_tdur
+    if decision == "user_accepted_hard_cut":
+        return "cut", 0.0
+    if decision == "fade":
+        return ("fade" if requested not in {"fade", "crossfade"} else requested), duration
+    if decision == "xfade":
+        return ("crossfade" if requested in {"", "cut"} else requested), duration
+    # Narrative bridges can be a hard cut; preserve any explicitly selected
+    # compose transition, but never invent a visual wipe from the contract name.
+    return (requested or "cut"), (duration if requested not in {"", "cut"} else 0.0)
+
+
 def _measured_durations(manifest: dict[str, Any] | None) -> dict[str, float]:
     """asset_manifest.items[] 里 kind=video 的实测时长 → {shot_id: seconds}。
 
@@ -300,9 +355,16 @@ def compile_compose_plan(plan: dict[str, Any]) -> dict[str, Any]:
             "transition_in": tname,
             "transition_duration": float(shot.get("transition_duration") or 0),
         }
+        contract = _valid_transition_contract(shot)
+        if contract:
+            cut["transition_contract"] = contract
+            cut["transition_reason"] = str(contract.get("reason"))
         gap = shot.get("negative_gap_seconds")
         if gap not in (None, ""):
             cut["negative_gap_seconds"] = float(gap)
+        vfx = _shot_vfx(shot)
+        if vfx:
+            cut["vfx"] = vfx
         cuts.append(cut)
         prev_id = sid
     return {
@@ -416,11 +478,27 @@ def build_compose_plan(
                 "proposed_fix": "先跑 shot_runner，或手填 clip_path",
             })
         junction = junctions.get(shot_id) or {}
-        transition = "cut" if (i == 0 or cut_only) else str(junction.get("suggested_transition") or "cut")
-        gap = 0.0 if (i == 0 or cut_only) else float(junction.get("negative_gap_seconds") or 0)
-        tdur = 0.0
-        if transition != "cut":
-            tdur = gap if gap > 0 else pack_tdur
+        contract = _valid_transition_contract(shot)
+        if shot.get("transition_contract") is not None and contract is None:
+            findings.append({
+                "severity": "warning",
+                "field": shot_id,
+                "message": "transition_contract 缺少合法 decision 或 reason，已忽略",
+                "proposed_fix": "补 decision/reason；不要静默保留不完整契约",
+            })
+        if i == 0 or cut_only:
+            transition = "cut"
+            gap = 0.0
+            tdur = 0.0
+        elif contract:
+            transition, tdur = _transition_for_contract(
+                shot=shot, contract=contract, pack_tdur=pack_tdur
+            )
+            gap = float(shot.get("negative_gap_seconds") or 0)
+        else:
+            transition = str(junction.get("suggested_transition") or "cut")
+            gap = float(junction.get("negative_gap_seconds") or 0)
+            tdur = (gap if gap > 0 else pack_tdur) if transition != "cut" else 0.0
         shot_kind = str(shot.get("shot_kind") or "video")
         effects: list[dict[str, Any]] = []
         if shot_kind == "image":
@@ -462,10 +540,16 @@ def build_compose_plan(
             "transition": transition,
             "transition_duration": tdur,
             "negative_gap_seconds": gap,
+            # schema 里 transition_contract 是 object；无合法契约时**省略键**
+            # 而不是写 null（null 会被 schema 校验拒，实测 test_compose_planner
+            # 的 build_and_compile_valid 就是被这条卡住）。
+            **({"transition_contract": contract} if contract else {}),
+            "transition_reason": str((contract or {}).get("reason") or ""),
             "lut": lut,
             "subtitle_cues": cues,
             "audio_events": audio_events,
             "effects": effects,
+            "vfx": _shot_vfx(shot),
             "render_kind": kind,
             "hero_moment": bool(shot.get("hero_moment")),
         })

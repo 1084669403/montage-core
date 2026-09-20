@@ -209,7 +209,9 @@ def test_partial_clips_only_fill_missing(tmp_path):
     store.write("scene_plan", plan)
     vid = proj / "assets" / "videos" / "sh01.mp4"
     vid.parent.mkdir(parents=True, exist_ok=True)
-    vid.write_bytes(b"vid")
+    from conftest import write_tiny_video
+
+    write_tiny_video(vid)
     store.write("asset_manifest", {
         "items": [{
             "id": "sh01_video",
@@ -768,3 +770,85 @@ def test_kling_sample_cast_partial_and_phase_a_window(tmp_path, monkeypatch):
     gens2 = [p for p in counted2.payloads if not p.get("dry_run")]
     assert gens2 and "retry_ids" not in gens2[0]
     assert gens2[0].get("force_ids") == ["sh01"]
+
+
+def test_voice_step_assembles_narration_and_assemble_consumes_it(tmp_path):
+    """narration_path repair: voice step assembles narration track; assemble payload carries it."""
+    proj = _seed_gen(tmp_path)
+    # _seed_gen 场景无对白（voice 会被 skip）——写进镜头对白触发 voice 步骤
+    store0 = ArtifactStore(proj)
+    plan = store0.read("scene_plan")
+    plan["scenes"][0]["shots"][0]["audio_prompt"] = {
+        "dialogue": [{"role": "李", "text": "雨还在下。"}],
+    }
+    store0.write("scene_plan", plan)
+    tools, order, _bgm, voice_calls = _gen_bag(proj)
+    calls: list[dict] = []
+
+    # voice_director 返回两个 TTS 段（模拟真实 synthesize 后产物）
+    def voice_with_sections(inputs):
+        order.append("voice")
+        voice_calls.append(dict(inputs))
+        return ToolResult(success=True, data={
+            "assignments": [],
+            "narration_sections": [
+                {"id": "sh01", "narration_audio": "assets/audio/line_00.mp3"},
+                {"id": "sh02", "narration_audio": "assets/audio/line_01.mp3"},
+            ],
+        })
+
+    tools["voice_director"] = FakeTool("voice_director", voice_with_sections)
+
+    # ffmpeg_compose 记录 operation + narration_path
+    assemble_payloads: list[dict] = []
+
+    class FF(FakeTool):
+        def execute(self, inputs):
+            calls.append(dict(inputs))
+            op = str(inputs.get("operation") or "assemble")
+            if op == "assemble_narration":
+                out = Path(inputs["output_path"])
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(b"narr")
+                return ToolResult(success=True, data={"output": str(out)})
+            assemble_payloads.append(dict(inputs))
+            return super().execute(inputs)
+
+    tools["ffmpeg_compose"] = FF("ffmpeg_compose", tools["ffmpeg_compose"]._handler)
+
+    result = _run(proj, tools, sample_hero=False, tts=True)
+    assert result["success"], result["error"]
+    ops = [c.get("operation") for c in calls]
+    assert "assemble_narration" in ops
+    ncall = next(c for c in calls if c.get("operation") == "assemble_narration")
+    assert len(ncall["sections"]) == 2
+    # assemble payload carries narration_path only when the file exists
+    assert assemble_payloads, "assemble must be called"
+    narration_sent = assemble_payloads[0].get("narration_path") or ""
+    # fake narration file path written by assemble_narration branch
+    expected = str(proj / "assets" / "audio" / "narration.mp3")
+    assert narration_sent == expected
+    # voice step records narration_path for resume
+    vrow = (result["progress"].get("steps") or {}).get("voice") or {}
+    assert vrow.get("narration_path") == expected
+
+
+def test_voice_skip_means_no_narration_path(tmp_path):
+    """no tts -> voice skip -> assemble payload must NOT carry narration_path."""
+    proj = _seed_gen(tmp_path)
+    tools, _order, _bgm, _vc = _gen_bag(proj)
+    assemble_payloads: list[dict] = []
+
+    orig_execute = tools["ffmpeg_compose"].execute
+
+    class FF(FakeTool):
+        def execute(self, inputs):
+            if str(inputs.get("operation") or "") == "assemble":
+                assemble_payloads.append(dict(inputs))
+            return orig_execute(inputs)
+
+    tools["ffmpeg_compose"] = FF("ffmpeg_compose", tools["ffmpeg_compose"]._handler)
+    result = _run(proj, tools, sample_hero=False, tts=False)
+    assert result["success"], result["error"]
+    assert assemble_payloads
+    assert not assemble_payloads[0].get("narration_path")

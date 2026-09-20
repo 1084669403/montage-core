@@ -409,7 +409,9 @@ def test_no_key_shot_runner_still_succeeds(tmp_path, monkeypatch):
     assert lifted["shots"][0]["shot_id"] == "sh01"
 
 
-def test_cast_does_not_call_vlm(tmp_path, monkeypatch):
+def test_cast_vlm_review_only_for_new_portraits(tmp_path, monkeypatch):
+    """P0-identity-memory：cast 只对新生成的定妆做 VLM 过检（canonical 锚），
+    已存在的定妆不再重复过检——不把 VLM 变成每次 cast 的固定开销。"""
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     proj = tmp_path / "p"
     (proj / "artifacts").mkdir(parents=True)
@@ -417,7 +419,7 @@ def test_cast_does_not_call_vlm(tmp_path, monkeypatch):
 
     def track_vlm(_path, _ctx):
         called.append(1)
-        return {"ok": True, "skipped": False, "issues": []}
+        return {"ok": True, "score": 0.9, "skipped": False, "issues": []}
 
     tool = ShotRunner(
         image_execute=_uniq_image,
@@ -427,7 +429,7 @@ def test_cast_does_not_call_vlm(tmp_path, monkeypatch):
         quality_check=_pass_quality,
         vlm_review=track_vlm,
     )
-    result = tool.execute({
+    payload = {
         "stage": "cast",
         "bible": {
             "playbook": "cyberpunk_neon",
@@ -436,9 +438,20 @@ def test_cast_does_not_call_vlm(tmp_path, monkeypatch):
         },
         "project_dir": str(proj),
         "dry_run": False,
-    })
+    }
+    result = tool.execute(dict(payload))
     assert result.success, result.error
-    assert called == []
+    assert len(called) == 1  # 仅角色 a 的定妆过检
+    portraits = [
+        r for r in result.data["asset_manifest"]["reference_assets"]
+        if r["kind"] == "portrait"
+    ]
+    assert [r.get("canonical") for r in portraits] == [True]
+
+    # 二次 cast：定妆已就绪 → 不再过检
+    again = tool.execute(dict(payload))
+    assert again.success, again.error
+    assert len(called) == 1
 
 
 def test_machine_complete_skips_assets_on_vlm_fail(tmp_path, monkeypatch):

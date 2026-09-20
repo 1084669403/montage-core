@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from montage.engine.artifacts import ArtifactStore
 from montage.pipelines import CINEMATIC, CLIP_FACTORY, DOCUMENTARY
 from montage.providers.jimeng import JimengImage, JimengVideo
@@ -34,7 +36,9 @@ def _pass_quality(path, *, expected_duration=None):
 
 
 def _fake_tail(src, dst):
-    Path(dst).write_bytes(b"tail")
+    from conftest import write_tiny_video
+
+    write_tiny_video(Path(dst), fallback=b"tail")
     return dst
 
 
@@ -48,7 +52,14 @@ def _fake_image(inputs):
 def _fake_video(inputs):
     out = Path(inputs["output_path"])
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(b"vid")
+    # 真 1s 小视频：素材契约会 ffprobe 每个 kind=video 产物，假字节会被判坏镜。
+    from conftest import write_tiny_video
+
+    try:
+        seconds = float(inputs.get("seconds") or inputs.get("duration") or 5.0)
+    except (TypeError, ValueError):
+        seconds = 5.0
+    write_tiny_video(out, seconds=max(seconds, 0.5))
     return ToolResult(success=True, data={"output": str(out), "url": "https://example.test/vid.mp4"}, cost_usd=0.2)
 
 
@@ -1640,7 +1651,12 @@ def test_first_frame_ratio_set_for_pure_t2i(tmp_path, monkeypatch):
     assert first.get("ratio") == "9:16"
 
 
-def test_first_frame_ratio_skipped_for_img2img(tmp_path, monkeypatch):
+def test_first_frame_ratio_follows_profile_for_img2img(tmp_path, monkeypatch):
+    """参考模式首帧**必须**带档案画幅（2026-09-19 用户实测修正）。
+
+    旧行为：img2img 不传 ratio（怕与"构图保留"冲突）→ Agnes 落回官方默认
+    1:1，首帧全是 2048×2048 方图，与 16:9 成片不符。现按 output_profile 显式传。
+    """
     monkeypatch.setenv("MONTAGE_SKIP_PACING", "1")
     proj = _agnes_vertical_proj(tmp_path)
     images: list[dict] = []
@@ -1669,7 +1685,8 @@ def test_first_frame_ratio_skipped_for_img2img(tmp_path, monkeypatch):
     assert result.success, result.error
     first = next(p for p in images if str(p.get("output_path", "")).endswith("_first.png"))
     assert first.get("operation") == "image_reference"
-    assert "ratio" not in first
+    # 该 fixture 是竖屏项目（douyin_vertical）→ 画幅跟随 output_profile 取 9:16
+    assert first.get("ratio") == "9:16"
 
 
 # ---- R1: pacing 只在缓存未命中时执行 ----
@@ -2830,3 +2847,665 @@ def test_bindings_write_failure_is_non_fatal(tmp_path, monkeypatch):
         "绑定产物写入失败" in f["message"] for f in result.data["findings"]
     )
 
+
+
+# ---- v8.2: P0-runtime-fixes / P0-frame-bridge ----
+
+def test_resolved_agnes_mode_explicit_wins_over_packet():
+    """explicit agnes_mode wins; empty/invalid falls back to packet frames_mode."""
+    from montage.tools._shot_route import resolved_agnes_mode
+
+    assert resolved_agnes_mode({"agnes_mode": "text"}, "keyframe") == "text"
+    assert resolved_agnes_mode({"agnes_mode": "keyframe"}, "preview") == "keyframe"
+    assert resolved_agnes_mode({"agnes_mode": "KEYFRAME"}, "preview") == "keyframe"
+    assert resolved_agnes_mode({"agnes_mode": "bogus"}, "keyframe") == "keyframe"
+    assert resolved_agnes_mode({}, "keyframe") == "keyframe"
+    assert resolved_agnes_mode({}, "reference_first") == "reference"
+    assert resolved_agnes_mode({}, "preview") == "reference"
+    assert resolved_agnes_mode(None, "") == "reference"
+
+
+def test_overlay_plan_rework_passes_new_mode_fields():
+    """agnes_mode/seed/tail_frame_state must overlay into shot dicts."""
+    from montage.tools._shot_route import overlay_plan_rework
+
+    shots = [{"shot_id": "sc01_01", "shot_kind": "video", "agnes_mode": "reference"}]
+    scene_plan = {
+        "scenes": [{
+            "id": "sc01",
+            "shots": [{
+                "shot_id": "sc01_01",
+                "shot_kind": "video",
+                "agnes_mode": "keyframe",
+                "seed": 42,
+                "tail_frame_state": "door-open",
+            }],
+        }],
+    }
+    overlay_plan_rework(shots, scene_plan)
+    assert shots[0]["agnes_mode"] == "keyframe"
+    assert shots[0]["seed"] == 42
+    assert shots[0]["tail_frame_state"] == "door-open"
+
+
+def test_agnes_explicit_seed_survives_retry(tmp_path, monkeypatch):
+    """explicit seed locks retry; non-explicit still 1000+attempt."""
+    proj = _agnes_proj(tmp_path)
+    monkeypatch.setenv("MONTAGE_SKIP_PACING", "1")
+    plan = {
+        "scenes": [{
+            "id": "sc01",
+            "shots": [{
+                "shot_id": "s1",
+                "shot_kind": "video",
+                "duration_seconds": 5,
+                "seed": 777,
+                "visual_details": {"environment": "rain"},
+            }],
+        }],
+    }
+    seeds_seen = []
+
+    def video_track(inputs):
+        seeds_seen.append(inputs.get("seed"))
+        if len(seeds_seen) < 3:
+            return ToolResult(success=False, error="429")
+        return _fake_video(inputs)
+
+    tool = ShotRunner(
+        image_execute=_fake_image,
+        video_execute=video_track,
+        image_estimate=lambda i: 0.0,
+        video_estimate=lambda i: 0.0,
+        quality_check=_pass_quality,
+        extract_last_frame=_fake_tail,
+    )
+    result = tool.execute({"scene_plan": plan, "project_dir": str(proj), "dry_run": False})
+    assert result.success, result.error
+    assert seeds_seen
+    assert all(s == 777 for s in seeds_seen)
+
+
+def test_agnes_tail_persisted_to_manifest(tmp_path, monkeypatch):
+    """Agnes success also extracts tail and records in manifest."""
+    proj = _agnes_proj(tmp_path)
+    monkeypatch.setenv("MONTAGE_SKIP_PACING", "1")
+    plan = {
+        "scenes": [{
+            "id": "sc01",
+            "shots": [{
+                "shot_id": "s1",
+                "shot_kind": "video",
+                "duration_seconds": 5,
+                "visual_details": {"environment": "rain"},
+            }],
+        }],
+    }
+    tool = ShotRunner(
+        image_execute=_fake_image,
+        video_execute=_fake_video,
+        image_estimate=lambda i: 0.0,
+        video_estimate=lambda i: 0.0,
+        quality_check=_pass_quality,
+        extract_last_frame=_fake_tail,
+    )
+    result = tool.execute({"scene_plan": plan, "project_dir": str(proj), "dry_run": False})
+    assert result.success, result.error
+    manifest = result.data["asset_manifest"]
+    tail_items = [i for i in manifest["items"] if i.get("id") == "s1_tail"]
+    assert tail_items
+    assert tail_items[0]["kind"] == "image"
+
+
+def test_agnes_keyframe_mode_skips_portrait_gate(tmp_path, monkeypatch):
+    """explicit keyframe shot exempt from portrait gate; reference shot still blocked."""
+    proj = _agnes_proj(tmp_path)
+    monkeypatch.setenv("MONTAGE_SKIP_PACING", "1")
+    base = {
+        "shot_kind": "video",
+        "duration_seconds": 5,
+        "visual_details": {
+            "environment": "rain",
+            "subjects": [{"id": "a", "appearance_anchor": "black-hair", "action": {"verb": "walk"}}],
+        },
+    }
+    plan = {
+        "character_registry": [{"id": "a", "name": "A", "appearance": "black-hair"}],
+        "scenes": [{
+            "id": "sc01",
+            "character_ids": ["a"],
+            "shots": [
+                dict(base, shot_id="kf", agnes_mode="keyframe"),
+                dict(base, shot_id="ref", agnes_mode="reference"),
+            ],
+        }],
+    }
+    script = {"characters": [{"id": "a", "appearance": "black-hair", "outfit": "robe"}]}
+
+    def fail_portrait(inputs):
+        if "portrait_" in str(inputs.get("output_path") or ""):
+            return ToolResult(success=False, error="portrait boom")
+        return _fake_image(inputs)
+
+    tool = ShotRunner(
+        image_execute=fail_portrait,
+        video_execute=_fake_video,
+        image_estimate=lambda i: 0.0,
+        video_estimate=lambda i: 0.0,
+        quality_check=_pass_quality,
+        extract_last_frame=_fake_tail,
+    )
+    result = tool.execute({
+        "scene_plan": plan, "project_dir": str(proj), "dry_run": False, "script": script,
+    })
+    data = result.data or {}
+    blocked = data.get("blocked")
+    assert blocked is True  # reference shot missing portrait still blocks
+    # 门禁拦截是 critical 级；kf 镜可能只剩能力提示类 warning，不算拦
+    kf_critical = [
+        f for f in (data.get("findings") or [])
+        if str(f.get("field") or "").endswith("sc01/kf")
+        and f.get("severity") == "critical"
+    ]
+    ref_critical = [
+        f for f in (data.get("findings") or [])
+        if str(f.get("field") or "").endswith("sc01/ref")
+        and f.get("severity") == "critical"
+    ]
+    assert kf_critical == []
+    assert ref_critical
+
+
+def test_auto_agnes_mode_fallback_rules():
+    """auto fallback: tail_frame_state/bridge -> keyframe; refs -> reference; else text."""
+    from montage.tools._shot_route import auto_agnes_mode
+
+    assert auto_agnes_mode({"tail_frame_state": "door-open"}) == ("keyframe", "tail_frame_state")
+    assert auto_agnes_mode({"reference_asset_ids": "img1"}) == ("reference", "reference_asset_ids")
+    assert auto_agnes_mode({"cut": "hard"}) == ("text", "broll")
+    assert auto_agnes_mode({"shot_id": "s2", "cut": "bridge"}) == ("keyframe", "bridge")
+    assert auto_agnes_mode({
+        "shot_id": "s2", "cut": "bridge",
+        "prev_location_id": "L1", "location_id": "L2",
+    }) == ("text", "broll")
+
+
+def test_mode_conflict_finding_only_when_characters_and_bridge():
+    """conflict finding fires only for keyframe shots with declared characters."""
+    from montage.tools._shot_route import mode_conflict_finding
+
+    with_char = {
+        "shot_id": "s1", "scene_id": "sc01",
+        "visual_details": {"subjects": [{"id": "a"}]},
+    }
+    hit = mode_conflict_finding(with_char, auto_mode="keyframe")
+    assert hit and hit["severity"] == "warning" and hit["field"] == "sc01/s1"
+    # no characters -> no conflict
+    assert mode_conflict_finding({"shot_id": "s1"}, auto_mode="keyframe") is None
+    # not keyframe -> no conflict
+    assert mode_conflict_finding(with_char, auto_mode="reference") is None
+
+
+def test_build_mode_plan_explicit_wins_and_conflicts_listed():
+    """mode_plan: explicit wins with reason=explicit; conflict finding listed; no runtime table."""
+    from montage.tools._shot_route import build_mode_plan
+
+    shots = [
+        {"shot_id": "s1", "scene_id": "sc01", "agnes_mode": "text",
+         "visual_details": {"subjects": [{"id": "a"}]}, "cut": "bridge"},
+        {"shot_id": "s2", "scene_id": "sc01", "tail_frame_state": "door-open"},
+        {"shot_id": "s3", "scene_id": "sc01", "seed": 7},
+        {"shot_id": "s4", "scene_id": "sc01",
+         "visual_details": {"subjects": [{"id": "a"}]}, "cut": "bridge"},
+    ]
+    plan = build_mode_plan(shots, frames_mode="")
+    rows = {r["shot_id"]: r for r in plan["modes"]}
+    assert rows["s1"]["mode"] == "text" and rows["s1"]["reason"] == "explicit"
+    assert rows["s1"]["explicit"] is True
+    assert rows["s2"]["mode"] == "keyframe" and rows["s2"]["tail_frame_state"] == "door-open"
+    assert rows["s3"]["seed"] == 7
+    # s1 explicit text: no conflict despite character+bridge; s4 implicit keyframe+char: conflict
+    assert "conflict" not in rows["s1"]
+    assert rows["s4"].get("conflict") is True
+    fields = [f["field"] for f in plan["findings"]]
+    assert fields == ["sc01/s4"]
+
+
+def test_build_mode_plan_packet_keyframe_overrides_auto():
+    """packet frames_mode=keyframe overrides auto broll default (but not explicit)."""
+    from montage.tools._shot_route import build_mode_plan
+
+    shots = [
+        {"shot_id": "s1", "scene_id": "sc01", "cut": "hard"},
+        {"shot_id": "s2", "scene_id": "sc01", "agnes_mode": "reference", "cut": "hard"},
+    ]
+    plan = build_mode_plan(shots, frames_mode="keyframe")
+    rows = {r["shot_id"]: r for r in plan["modes"]}
+    assert rows["s1"]["mode"] == "keyframe" and rows["s1"]["reason"] == "packet_frames_mode"
+    assert rows["s2"]["mode"] == "reference" and rows["s2"]["reason"] == "explicit"
+
+
+def test_execute_writes_mode_plan_and_surfaces_conflict(tmp_path, monkeypatch):
+    """run writes mode_plan.json snapshot and conflict finding reaches findings."""
+    proj = _agnes_proj(tmp_path)
+    monkeypatch.setenv("MONTAGE_SKIP_PACING", "1")
+    plan = {
+        "character_registry": [{"id": "a", "name": "A", "appearance": "black-hair"}],
+        "scenes": [{
+            "id": "sc01",
+            "character_ids": ["a"],
+            "shots": [
+                # s1: character + bridge intent, no explicit mode -> conflict finding
+                {"shot_id": "s1", "shot_kind": "video", "duration_seconds": 5,
+                 "visual_details": {
+                     "environment": "rain",
+                     "subjects": [{"id": "a", "appearance_anchor": "black-hair"}],
+                 }},
+                # s2: explicit text -> no conflict, mode recorded
+                {"shot_id": "s2", "shot_kind": "video", "duration_seconds": 5,
+                 "agnes_mode": "text",
+                 "visual_details": {
+                     "environment": "rain",
+                     "subjects": [{"id": "a", "appearance_anchor": "black-hair"}],
+                 }},
+            ],
+        }],
+    }
+    tool = ShotRunner(
+        image_execute=_fake_image,
+        video_execute=_fake_video,
+        image_estimate=lambda i: 0.0,
+        video_estimate=lambda i: 0.0,
+        quality_check=_pass_quality,
+        extract_last_frame=_fake_tail,
+    )
+    result = tool.execute({"scene_plan": plan, "project_dir": str(proj), "dry_run": False})
+    assert result.success, result.error
+    stored = ArtifactStore(proj).read("mode_plan")
+    assert stored and stored.get("version") == "1"
+    rows = {r["shot_id"]: r for r in stored["modes"]}
+    assert rows["s2"]["mode"] == "text" and rows["s2"].get("explicit") is True
+    assert rows["s1"].get("conflict") is True
+    fields = [f.get("field") for f in stored["findings"]]
+    assert "sc01/s1" in fields
+    assert any("sc01/s1" == f.get("field") for f in result.data["findings"])
+
+
+def test_shot_audio_ref_urls_rhythm_first_and_drops_local():
+    """audio refs: rhythm(BGM) sorts before timbre; local path dropped with note."""
+    from montage.tools._shot_route import shot_audio_ref_urls, audios_compatible_with_mode
+
+    shot = {
+        "shot_id": "s1",
+        "audio_prompt": {"audio_ref": [
+            {"id": "v1", "url": "https://x/v.mp3", "role": "timbre"},
+            {"id": "b1", "url": "https://x/b.mp3", "role": "rhythm"},
+            {"id": "loc", "path": "assets/audio/local.mp3"},
+            {"id": "b2", "url": "https://x/b2.mp3", "role": "rhythm"},
+            {"id": "v2", "url": "https://x/v2.mp3", "role": "timbre"},
+        ]},
+    }
+    urls, notes = shot_audio_ref_urls(shot)
+    # rhythm first, then timbre; local dropped; capped at 3
+    assert urls == ["https://x/b.mp3", "https://x/b2.mp3", "https://x/v.mp3"]
+    assert any("无公网 URL" in n and "loc" in n for n in notes)
+    assert audios_compatible_with_mode("reference") is True
+    assert audios_compatible_with_mode("keyframe") is False
+
+
+def test_agnes_reference_overlays_audios_with_images(tmp_path, monkeypatch):
+    """reference mode payload carries images+audios together; keyframe drops audios."""
+    proj = _agnes_proj(tmp_path)
+    monkeypatch.setenv("MONTAGE_SKIP_PACING", "1")
+    manifest = {
+        "items": [],
+        "reference_assets": [
+            {"id": "portrait_a", "kind": "portrait", "character_id": "a",
+             "path": "assets/images/portrait_a.png", "url": "https://x/a.png"},
+            {"id": "scene_rain", "kind": "scene_ref", "location_id": "rain",
+             "path": "assets/images/scene_rain.png", "url": "https://x/rain.png"},
+        ],
+    }
+    base = {
+        "shot_kind": "video",
+        "duration_seconds": 5,
+        "visual_details": {
+            "environment": "rain",
+            "subjects": [{"id": "a", "appearance_anchor": "black-hair"}],
+        },
+        "audio_prompt": {"audio_ref": [
+            {"id": "b1", "url": "https://x/bgm.mp3", "role": "rhythm"},
+        ]},
+    }
+    plan = {
+        "character_registry": [{"id": "a", "name": "A", "appearance": "black-hair"}],
+        "scenes": [{
+            "id": "sc01",
+            "character_ids": ["a"],
+            "shots": [
+                dict(base, shot_id="ref_shot", agnes_mode="reference"),
+                dict(base, shot_id="kf_shot", agnes_mode="keyframe"),
+            ],
+        }],
+    }
+    payloads: list[dict] = []
+
+    def track_video(inputs):
+        payloads.append(dict(inputs))
+        return _fake_video(inputs)
+
+    tool = ShotRunner(
+        image_execute=_fake_image,
+        video_execute=track_video,
+        image_estimate=lambda i: 0.0,
+        video_estimate=lambda i: 0.0,
+        quality_check=_pass_quality,
+        extract_last_frame=_fake_tail,
+    )
+    result = tool.execute({
+        "scene_plan": plan, "project_dir": str(proj), "dry_run": False,
+        "asset_manifest": manifest,
+    })
+    assert result.success, result.error
+    by_shot = {p.get("output_path", "").rsplit("_", 1)[-1].replace(".mp4", ""): p for p in payloads}
+    ref_payload = next(p for p in payloads if "ref_shot" in str(p.get("output_path") or ""))
+    kf_payload = next(p for p in payloads if "kf_shot" in str(p.get("output_path") or ""))
+    assert ref_payload.get("mode") == "reference"
+    assert ref_payload.get("images") and "https://x/bgm.mp3" in (ref_payload.get("audios") or [])
+    assert kf_payload.get("mode") == "keyframe"
+    assert not kf_payload.get("audios")
+    assert any("audios" in str(f.get("message") or "") and "sc01/kf_shot" == f.get("field")
+               for f in result.data["findings"])
+
+
+# ---- v8.2 P0-scheduler: 跨天断点续跑 + 档位池 ----
+
+@pytest.fixture
+def _tier_env(monkeypatch, tmp_path):
+    """档位池测试环境：tokenplan 主档 + 隔离的 usage 记账文件。"""
+    import os
+
+    usage = tmp_path / "usage.json"
+    monkeypatch.setenv("MONTAGE_AGNES_USAGE_PATH", str(usage))
+    monkeypatch.setenv("AGNES_ACCESS_TYPE", "tokenplan")
+    monkeypatch.delenv("MONTAGE_TIER_DECLARED", raising=False)
+    yield monkeypatch
+    if usage.exists():
+        usage.unlink()
+
+
+def test_agnes_credentials_per_tier_keys(monkeypatch):
+    from montage.providers.agnes import agnes_credentials
+
+    monkeypatch.setenv("AGNES_API_KEY", "generic")
+    monkeypatch.delenv("AGNES_CN_API_KEY", raising=False)
+    monkeypatch.delenv("AGNES_API_BASE_URL", raising=False)
+    monkeypatch.delenv("AGNES_BASE_URL", raising=False)
+    monkeypatch.setenv("AGNES_TOKENPLAN_API_KEY", "tp-key")
+    monkeypatch.setenv("AGNES_TOKENPLAN_BASE_URL", "https://apihub.agnes-ai.com/v1")
+    monkeypatch.setenv("AGNES_DEFAULT_API_KEY", "free-key")
+    monkeypatch.setenv("AGNES_ACCESS_TYPE", "tokenplan")
+    key, base = agnes_credentials()
+    assert key == "tp-key" and "apihub" in base
+    monkeypatch.setenv("AGNES_ACCESS_TYPE", "default")
+    key, base = agnes_credentials()
+    assert key == "free-key"
+    monkeypatch.delenv("AGNES_TOKENPLAN_API_KEY", raising=False)
+    monkeypatch.setenv("AGNES_ACCESS_TYPE", "tokenplan")
+    key, base = agnes_credentials("tokenplan")
+    assert key == "generic"  # 专用键缺失回落通用键
+
+
+def test_scheduler_day_capacity_and_pick(monkeypatch, tmp_path):
+    monkeypatch.setenv("MONTAGE_AGNES_USAGE_PATH", str(tmp_path / "u.json"))
+    from montage.providers.agnes_usage import add_video_seconds
+    from montage.engine import scheduler as S
+
+    monkeypatch.setenv("AGNES_ACCESS_TYPE", "tokenplan")
+    rows = S.day_capacity()
+    assert [(r["tier"], r["unlimited"]) for r in rows] == [("tokenplan", False), ("default", True)]
+    assert rows[0]["video_remaining"] == 500.0
+    assert S.tier_has_video_quota("tokenplan", 100) is True
+    assert S.tier_exhausted("tokenplan") is False
+    assert S.pick_next_tier("default") == "tokenplan"  # 耗尽前候选有余量
+    add_video_seconds("tokenplan", 500)
+    assert S.tier_exhausted("tokenplan") is True
+    assert S.tier_has_video_quota("tokenplan", 1) is False
+    assert S.pick_next_tier("tokenplan") == "default"
+    assert S.pick_next_tier("default") is None  # 池尽：唯一候选已耗尽
+
+
+def test_scheduler_activate_and_restore(monkeypatch, tmp_path):
+    monkeypatch.setenv("MONTAGE_AGNES_USAGE_PATH", str(tmp_path / "u.json"))
+    monkeypatch.setenv("AGNES_ACCESS_TYPE", "tokenplan")
+    monkeypatch.setenv("MONTAGE_TIER_DECLARED", "tokenplan")
+    from montage.providers.capabilities import agnes_access_tier, agnes_video_rpm
+    from montage.engine import scheduler as S
+
+    assert S.activate_tier("tokenplan") is False  # 同档 no-op
+    assert S.activate_tier("default") is True
+    assert agnes_video_rpm() == 1.0  # RPM 跟档
+    assert S.restore_tier() is True
+    assert agnes_access_tier() == "tokenplan"
+
+
+def test_runner_switches_tier_when_tokenplan_exhausted(_tier_env, tmp_path):
+    import os
+
+    from montage.providers.agnes_usage import add_video_seconds
+    from montage.engine import scheduler as S
+
+    add_video_seconds("tokenplan", 500)  # 本档耗尽
+    proj = _agnes_proj(tmp_path)
+    tool = ShotRunner(
+        image_execute=_fake_image,
+        video_execute=_fake_video,
+        image_estimate=lambda i: 0.0,
+        video_estimate=lambda i: 0.0,
+        quality_check=_pass_quality,
+        extract_last_frame=_fake_tail,
+    )
+    result = tool.execute({"scene_plan": _two_shots(), "project_dir": str(proj), "dry_run": False})
+    assert result.success, result.error
+    # 已切 default 并透出 finding；结束后 restore 回声明档
+    assert result.data.get("tier_switched", {}).get("to") == "default"
+    assert any(f.get("field") == "agnes_tier" for f in result.data["findings"])
+    assert S.activate_tier("tokenplan") is False  # 已 restore，同档 no-op
+    assert os.environ.get("AGNES_ACCESS_TYPE") == "tokenplan"
+
+
+def test_runner_no_switch_when_quota_ok(_tier_env, tmp_path):
+    proj = _agnes_proj(tmp_path)
+    tool = ShotRunner(
+        image_execute=_fake_image,
+        video_execute=_fake_video,
+        image_estimate=lambda i: 0.0,
+        video_estimate=lambda i: 0.0,
+        quality_check=_pass_quality,
+        extract_last_frame=_fake_tail,
+    )
+    result = tool.execute({"scene_plan": _two_shots(), "project_dir": str(proj), "dry_run": False})
+    assert result.success, result.error
+    assert "tier_switched" not in result.data
+    assert not any(f.get("field") == "agnes_tier" for f in result.data["findings"])
+
+
+# ---------------------------------------------------------------------------
+# P0-identity-memory：canonical 身份锚 + VLM 过检保守更新 + 漂移重拍定妆
+# ---------------------------------------------------------------------------
+
+
+def _vlm_pass(score=0.9):
+    return {"ok": True, "score": score, "issues": [], "skipped": False}
+
+
+def _vlm_drift(message="脸型不对"):
+    return {
+        "ok": False,
+        "score": 0.2,
+        "issues": [{"severity": "critical", "kind": "人物不一致", "message": message}],
+        "skipped": False,
+    }
+
+
+def test_cast_records_canonical_identity_anchor(tmp_path):
+    """定妆过检后写 identity_memory.json，并在 manifest ref 上打 canonical 标记。"""
+    from montage.engine.identity import canonical_ref_id, load_memory
+
+    proj = tmp_path / "p"
+    (proj / "artifacts").mkdir(parents=True)
+    tool = ShotRunner(
+        image_execute=_fake_image,
+        video_execute=_fake_video,
+        image_estimate=lambda i: 0.04,
+        video_estimate=lambda i: 0.2,
+        quality_check=_pass_quality,
+        vlm_review=lambda path, ctx: _vlm_pass(0.9),
+    )
+    result = tool.execute({
+        "stage": "cast", "bible": _cast_bible(), "project_dir": str(proj), "dry_run": False,
+    })
+    assert result.success, result.error
+    assert result.data["identity_retakes"] == []
+    portrait = [
+        r for r in result.data["asset_manifest"]["reference_assets"]
+        if r["kind"] == "portrait" and r["character_id"] == "a"
+    ][0]
+    assert portrait.get("canonical") is True
+    assert portrait.get("identity_key") == "a"
+    mem = load_memory(proj)
+    assert canonical_ref_id(mem, "a") == "portrait_a"
+    assert any(f.get("field") == "identity/portrait/a" for f in result.data["findings"])
+    # 落盘的 asset_manifest 也带 canonical 标记（写产物在锚更新之后）
+    persisted = ArtifactStore(proj).read("asset_manifest")
+    assert any(
+        r.get("canonical") and r.get("id") == "portrait_a"
+        for r in persisted["reference_assets"] if r["kind"] == "portrait"
+    )
+
+
+def test_ref_index_prefers_canonical_over_later_ref():
+    """canonical 优先于「最后一张胜」：重拍定妆后旧图不会静默顶掉真源。"""
+    from montage.tools._shot_refs import _portrait_refs_by_form, resolve_shot_refs
+
+    manifest = {
+        "items": [],
+        "reference_assets": [
+            {"id": "portrait_a", "kind": "portrait", "character_id": "a",
+             "path": "/canon.png", "canonical": True},
+            {"id": "portrait_a_old", "kind": "portrait", "character_id": "a",
+             "path": "/old.png"},
+        ],
+    }
+    assert _portrait_refs_by_form(manifest)[("a", "")]["path"] == "/canon.png"
+    refs = resolve_shot_refs(
+        {"shot_id": "s1", "scene_id": "sc01",
+         "visual_details": {"subjects": [{"id": "a"}]}},
+        manifest, None, None,
+    )
+    assert [r["path"] for r in refs if r["kind"] == "portrait"] == ["/canon.png"]
+
+
+def test_cast_holds_anchor_when_new_portrait_fails_review(tmp_path):
+    """保守更新：重拍定妆未过检时保住旧 canonical 锚。"""
+    from montage.engine.identity import empty_memory, evaluate_candidate, load_memory, save_memory
+
+    proj = tmp_path / "p"
+    (proj / "artifacts").mkdir(parents=True)
+    mem = empty_memory()
+    evaluate_candidate(mem, "a", review=_vlm_pass(0.97), ref_id="portrait_a", path="/old.png")
+    save_memory(proj, mem)
+
+    tool = ShotRunner(
+        image_execute=_fake_image,
+        video_execute=_fake_video,
+        image_estimate=lambda i: 0.04,
+        video_estimate=lambda i: 0.2,
+        quality_check=_pass_quality,
+        vlm_review=lambda path, ctx: _vlm_drift(),
+    )
+    result = tool.execute({
+        "stage": "cast", "bible": _cast_bible(), "project_dir": str(proj),
+        "dry_run": False, "retry_ids": ["portrait/a"],
+    })
+    assert result.success, result.error
+    after = load_memory(proj)
+    assert after["characters"]["a"]["canonical"]["ref_id"] == "portrait_a"
+    assert after["characters"]["a"]["canonical"]["score"] == 0.97
+    assert any(
+        f.get("field") == "identity/portrait/a" and "hold" in str(f.get("message"))
+        for f in result.data["findings"]
+    )
+
+
+def test_identity_retake_marker_forces_portrait_regeneration(tmp_path):
+    """漂移 retake 标记：下一轮 cast 自动把定妆排进 retry 集重拍。"""
+    from montage.engine.identity import (
+        empty_memory, evaluate_candidate, load_memory, record_drift, save_memory,
+    )
+
+    proj = tmp_path / "p"
+    (proj / "assets" / "images").mkdir(parents=True)
+    (proj / "artifacts").mkdir(parents=True)
+    # 已有定妆文件存在 → 正常运行会被跳过；retake 必须覆盖这个跳过
+    (proj / "assets" / "images" / "portrait_a.png").write_bytes(b"old")
+    mem = empty_memory()
+    evaluate_candidate(
+        mem, "a",
+        review=_vlm_pass(),
+        ref_id="portrait_a",
+        path=str(proj / "assets" / "images" / "portrait_a.png"),
+    )
+    record_drift(mem, "a", shot_id="sc01_01", threshold=1)
+    save_memory(proj, mem)
+
+    calls: list[str] = []
+
+    def counting_image(inputs):
+        calls.append(str(inputs.get("output_path") or ""))
+        return _fake_image(inputs)
+
+    tool = ShotRunner(
+        image_execute=counting_image,
+        video_execute=_fake_video,
+        image_estimate=lambda i: 0.04,
+        video_estimate=lambda i: 0.2,
+        quality_check=_pass_quality,
+        vlm_review=lambda path, ctx: _vlm_pass(0.95),
+    )
+    result = tool.execute({
+        "stage": "cast", "bible": _cast_bible(), "project_dir": str(proj), "dry_run": False,
+    })
+    assert result.success, result.error
+    assert any(path.endswith("portrait_a.png") for path in calls)
+    after = load_memory(proj)
+    assert after["characters"]["a"].get("retake") is False
+    assert after["characters"]["a"]["drift_count"] == 0
+
+
+def test_shot_stage_records_drift_and_queues_retake(tmp_path):
+    """镜级 VLM 连续报「人物不一致」达阈值 → identity_memory 置 retake。"""
+    from montage.engine.identity import empty_memory, evaluate_candidate, load_memory, save_memory
+
+    proj = tmp_path / "p"
+    (proj / "artifacts").mkdir(parents=True)
+    mem = empty_memory()
+    evaluate_candidate(mem, "a", review=_vlm_pass(), ref_id="portrait_a", path="/a.png")
+    save_memory(proj, mem)
+
+    tool = ShotRunner(
+        image_execute=_fake_image,
+        video_execute=_fake_video,
+        image_estimate=lambda i: 0.0,
+        video_estimate=lambda i: 0.0,
+        quality_check=_pass_quality,
+        extract_last_frame=_fake_tail,
+        vlm_review=lambda path, ctx: _vlm_drift(),
+    )
+    result = tool.execute({"scene_plan": _two_shots(), "project_dir": str(proj), "dry_run": False})
+    after = load_memory(proj)
+    assert after["characters"]["a"]["drift_count"] >= 2
+    assert after["characters"]["a"]["retake"] is True
+    assert "portrait/a" in (result.data.get("identity_retakes") or [])
+    vlm = ArtifactStore(proj).read("vlm_review")
+    assert vlm is not None and vlm["pass"] is False

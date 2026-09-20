@@ -156,7 +156,9 @@ def _series_bag():
                 raw = str(row.get("clip_path") or "")
                 if raw and is_still_image(raw):
                     dest = dest_dir / f"{row.get('shot_id') or 'shot'}_kb.mp4"
-                    dest.write_bytes(b"vid")
+                    from conftest import write_tiny_video
+
+                    write_tiny_video(dest)
                     row["clip_path"] = str(dest)
                 cuts.append(row)
             decisions["cuts"] = cuts
@@ -803,3 +805,139 @@ def test_copy_sibling_prop_file(tmp_path):
     dest = ep02 / "assets" / "images" / "prop_lighter.png"
     assert dest.is_file()
     assert dest.read_bytes() == b"prop-bytes"
+
+
+# ---- v8.2 P0-6: 分层合成 short→segment→longform ----
+
+def _chaptered_bible() -> dict:
+    """3 集 × 4 场，章边界与集边界对齐（每集一章，章 BGM 各异）。"""
+    bible = _three_by_four_bible()
+    bible["chapters"] = [
+        {"id": "ch01", "title": "第一章·雨夜", "start_scene": "sc01", "bgm_id": "rain_theme"},
+        {"id": "ch02", "title": "第二章·追击", "start_scene": "sc05", "bgm_id": "chase_theme"},
+        {"id": "ch03", "title": "第三章·了结", "start_scene": "sc09", "bgm_id": "calm_theme"},
+    ]
+    return bible
+
+
+def test_chapter_layers_from_scene_plan():
+    from montage.engine.story_outline import chapter_layers
+
+    plan = {
+        "chapters": [
+            {"id": "ch1", "bgm_id": "b1"},
+            {"id": "ch2", "bgm_id": ""},
+        ],
+        "scenes": [
+            {"id": "sc01", "chapter_id": "ch1"},
+            {"id": "sc02", "chapter_id": "ch1"},
+            {"id": "sc03", "chapter_id": "ch2"},
+            {"id": "sc04"},  # 未归属章：不进任何段
+        ],
+    }
+    layers = chapter_layers(plan)
+    assert [l["chapter_id"] for l in layers] == ["ch1", "ch2"]
+    assert layers[0]["scene_ids"] == ["sc01", "sc02"]
+    assert layers[1]["scene_ids"] == ["sc03"]
+    assert chapter_layers({"scenes": [{"id": "sc01"}]}) == []
+
+
+def test_layer_bgm_ownership_rules():
+    from montage.engine.story_outline import layer_bgm_ownership
+
+    layers = [
+        {"chapter_id": "ch1", "bgm_id": "b1", "scene_ids": ["sc01", "sc02"]},
+        {"chapter_id": "ch2", "bgm_id": "", "scene_ids": ["sc03"]},
+    ]
+    rows = layer_bgm_ownership(layers, {"sc02": "sx"})
+    assert rows[0] == {
+        "chapter_id": "ch1", "bgm_id": "b1",
+        "scene_bgm_ids": [{"scene_id": "sc02", "bgm_id": "sx"}], "has_music": True,
+    }
+    assert rows[1]["has_music"] is False
+    assert rows[1]["scene_bgm_ids"] == []
+
+
+def test_compile_bible_drops_foreign_chapters_in_episode():
+    """子集物化：集边界外的章不进子集 scene_plan 快照（分层锚沿层传递）。"""
+    series = _seed_series(tmp_path := __import__("pathlib").Path(
+        __import__("tempfile").mkdtemp()
+    ))
+    store = ArtifactStore(series)
+    bible = _chaptered_bible()
+    # 加一章不属于任何子集的场（sc13 只在第 4 集，但 episodes 只有 3 集）
+    bible["scenes"].append(_scene("sc13", "a", "talk"))
+    bible["chapters"].append({"id": "ch04", "start_scene": "sc13", "bgm_id": "x"})
+    store.write("series_bible", bible)
+    store.write("episodes", {
+        "episodes": [
+            {"episode_id": "ep01", "scene_ids": ["sc01", "sc02", "sc03", "sc04"], "character_ids": ["a"]},
+        ]
+    })
+    mat = materialize_episodes(series)
+    assert mat["runnable"]
+    plan = ArtifactStore(series / "episodes" / "ep01").read("scene_plan")
+    ids = [str(c.get("id")) for c in (plan.get("chapters") or [])]
+    assert ids == ["ch01"]  # 只带本集覆盖的章
+
+
+def test_season_concat_segments_when_chaptered(tmp_path):
+    """有 chapters 的系列：季拼按章段产出 segment 层，longform 由段拼。"""
+    series = init_project(tmp_path, "show", "分层演示", "cinematic")
+    store = ArtifactStore(series)
+    store.write("series_bible", _chaptered_bible())
+    store.write("episodes", {
+        "episodes": [
+            {"episode_id": "ep01", "scene_ids": ["sc01", "sc02", "sc03", "sc04"], "character_ids": ["a"]},
+            {"episode_id": "ep02", "scene_ids": ["sc05", "sc06", "sc07", "sc08"], "character_ids": ["a", "b"]},
+        ]
+    })
+    tools, _, _ = _series_bag()
+    result = _run(series, tools, review="none")
+    assert result["progress"]["status"] == "ok"
+    tools2, _, _ = _series_bag()
+    second = _run(series, tools2, resume=True, season_concat=True)
+    assert second["success"], second.get("error")
+    assert (series / "renders" / "season.mp4").is_file()
+    # segment 层：每集一段（章边界=集边界），段文件 + 段清单都落盘
+    seg1 = series / "renders" / "segments" / "ep01__ch01.mp4"
+    seg2 = series / "renders" / "segments" / "ep02__ch02.mp4"
+    assert seg1.is_file() and seg2.is_file()
+    seg_plan = ArtifactStore(series).read("segment_plan")
+    kinds = [s.get("kind") for s in seg_plan["segments"]]
+    assert kinds == ["chapter", "chapter"]
+    bgms = [s.get("bgm_id") for s in seg_plan["segments"]]
+    assert bgms == ["rain_theme", "chase_theme"]
+    # longform 的 concat 输入是段文件（不是集 final）
+    concat_calls = [
+        c for c in tools2["ffmpeg_compose"].calls
+        if c.get("operation") == "concat"
+    ]
+    season_call = next(
+        c for c in concat_calls
+        if "season.mp4" in str(c.get("output_path") or "")
+    )
+    season_clips = [str(Path(p).name) for p in season_call.get("clips") or []]
+    assert season_clips == ["ep01__ch01.mp4", "ep02__ch02.mp4"]
+
+
+def test_season_concat_unchaptered_keeps_episode_finals(tmp_path):
+    """无 chapters 的系列（旧路径）：集 finals 直接拼，不产 segment 层。"""
+    series = _seed_series(tmp_path)
+    tools, _, _ = _series_bag()
+    _run(series, tools, review="none")
+    tools2, _, _ = _series_bag()
+    second = _run(series, tools2, resume=True, season_concat=True)
+    assert second["success"], second.get("error")
+    assert (series / "renders" / "season.mp4").is_file()
+    assert not (series / "renders" / "segments").exists()
+    concat_calls = [
+        c for c in tools2["ffmpeg_compose"].calls
+        if c.get("operation") == "concat"
+    ]
+    season_call = next(
+        c for c in concat_calls
+        if "season.mp4" in str(c.get("output_path") or "")
+    )
+    season_clips = [str(Path(p).name) for p in season_call.get("clips") or []]
+    assert season_clips == ["final.mp4", "final.mp4", "final.mp4"]

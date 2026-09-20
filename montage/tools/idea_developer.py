@@ -89,6 +89,19 @@ class IdeaDeveloper(BaseTool):
                 meta={"operation": "skeleton"},
             )
 
+        if not isinstance(bible, dict) and op == "compile" and project_dir:
+            # V29 直读回退：compile 时 bible 缺省且 project_dir 存在 → 从项目目录直读
+            # series_bible（复用 format_card 同款回退惯例）。用于停点改 bible 后的手动
+            # 重编译（inputs 仅 {"operation":"compile"}，免手抄数万字 JSON）。
+            # validate 分支不改：其语义就是校验显式传入的稿。
+            stored = ArtifactStore(project_dir).read("series_bible")
+            if isinstance(stored, dict):
+                bible = stored
+                self._bible_from_project_dir = True
+            else:
+                self._bible_from_project_dir = False
+        else:
+            self._bible_from_project_dir = False
         if not isinstance(bible, dict):
             return ToolResult(success=False, error="'bible' 必填")
         if card is None and idea:
@@ -126,6 +139,7 @@ class IdeaDeveloper(BaseTool):
                 "scene_plan": compiled["scene_plan"],
                 "findings": (report.get("findings") or []) + (compiled.get("findings") or []),
                 "pass": True,
+                "bible_source": "project_dir" if self._bible_from_project_dir else "inputs",
             },
             meta={"operation": "compile"},
         )
