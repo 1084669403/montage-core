@@ -210,7 +210,10 @@ def test_agnes_prompt_missing_dialogue_is_warning():
 def test_video_caps_agnes_continuity():
     caps = video_caps(tool="agnes_video")
     assert caps["api_id"] == "agnes_v25"
-    assert caps["last_frame"] is False
+    # keyframe 模式开（first/last 至少一帧）；continuity 仍走 reference 图锚。
+    assert caps["first_frame"] is True
+    assert caps["last_frame"] is True
+    assert tuple(caps["modes"]) == ("text", "keyframe", "reference")
     assert caps["continuity_mode"] == "image_ref"
     assert caps["max_ref_images"] == 5
     assert caps["video_ref"] is False
@@ -696,3 +699,66 @@ def test_http_error_status_propagated_for_429(monkeypatch, tmp_path):
     r_vid = agnes.AgnesVideo().execute({"prompt": "x", "seconds": 5})
     assert not r_vid.success
     assert (r_vid.meta or {}).get("http_status") == 429
+
+
+# ---- golden fixture 锁：v8.2 P0-agnes-modes ----
+
+def test_golden_payload_keyframe_first_last_no_media_conflict():
+    """keyframe 锁：first/last 落位、无 images/audios、无 aspect_ratio 冲突。"""
+    payload, warnings = agnes._payload_v25(
+        {
+            "prompt": "衔接上镜",
+            "seconds": 6,
+            "aspect_ratio": "16:9",
+            "first_frame": "https://cdn.example/tail.png",
+            "last_frame": "https://cdn.example/next.png",
+        },
+        "m",
+        "p",
+    )
+    assert warnings == []
+    assert payload["mode"] == "keyframe"
+    assert payload["first_frame"] == "https://cdn.example/tail.png"
+    assert payload["last_frame"] == "https://cdn.example/next.png"
+    assert "aspect_ratio" not in payload  # 首帧定画幅，禁叠加
+    assert "images" not in payload
+    assert "audios" not in payload
+    assert payload["seconds"] == "6"
+    assert payload["n"] == 1
+
+
+def test_golden_payload_reference_images_plus_audios_overlay():
+    """叠加锁：reference 模式 images+audios 并存，且 <Picture N>/<Audio N> 同现。"""
+    payload, warnings = agnes._payload_v25(
+        {
+            "prompt": "广场",
+            "seconds": 5,
+            "images": ["https://cdn.example/p1.png", "https://cdn.example/p2.png"],
+            "audios": ["https://cdn.example/a1.mp3"],
+        },
+        "m",
+        "p",
+    )
+    assert warnings == []
+    assert payload["mode"] == "reference"
+    assert payload["images"] == ["https://cdn.example/p1.png", "https://cdn.example/p2.png"]
+    assert payload["audios"] == ["https://cdn.example/a1.mp3"]
+    assert "<Picture 1>" in payload["prompt"]
+    assert "<Audio 1>" in payload["prompt"]
+    assert "first_frame" not in payload
+    assert "last_frame" not in payload
+
+
+def test_golden_surface_modes_doctor_and_route_caps():
+    """能力面锁：v25 surface 带 modes、doctor 面透出 modes、_route_caps 拷贝 modes。"""
+    from montage.providers.capabilities import doctor_video_surfaces
+    from montage.tools._shot_route import _route_caps
+
+    surface = video_surface("agnes_v25")
+    assert tuple(surface["modes"]) == ("text", "keyframe", "reference")
+    assert surface["first_frame"] is True and surface["last_frame"] is True
+    doctor = {row["api_id"]: row for row in doctor_video_surfaces()}
+    assert tuple(doctor["agnes_v25"]["modes"]) == ("text", "keyframe", "reference")
+    caps = _route_caps("agnes_v25", "agnes_video", "agnes")
+    assert tuple(caps["modes"]) == ("text", "keyframe", "reference")
+    assert caps["max_ref_audios"] == 3

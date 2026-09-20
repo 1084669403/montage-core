@@ -124,14 +124,17 @@ VIDEO_BY_TOOL: dict[str, dict[str, Any]] = {
         "api_id": "seedance_25",
     },
     "agnes_video": {
-        "first_frame": False,
-        "last_frame": False,
+        # 2.5 Flash 三模式全开（text / keyframe / reference）：keyframe 至少一帧由
+        # 适配器 _payload_v25 运行时判定；requires_first_frame 仍 False（纯文生合法）。
+        "first_frame": True,
+        "last_frame": True,
         "first_url_fields": ("first_frame",),
         "first_path_fields": (),
         "last_url_fields": ("last_frame",),
         "last_path_fields": (),
         "requires_first_frame": False,
-        "mode": "reference",
+        # mode 逐请求决定（text/keyframe/reference），表上不锁死。
+        "mode": "",
         "continuity_mode": "image_ref",
         "max_ref_images": 5,  # 官方 Flash 文档：images ≤ 5
         "max_ref_audios": 3,  # 官方 Flash 文档：audios ≤ 3（agnes._payload_v25 实际消费）
@@ -511,8 +514,10 @@ VIDEO_SURFACES: dict[str, dict[str, Any]] = {
         "tool": "agnes_video",
         "wired": True,
         "fallback_api_id": "",
-        "first_frame": False,
-        "last_frame": False,
+        # 2.5 Flash 支持 keyframe 模式（first/last 至少一帧）；requires_first_frame
+        # 仍 False：text / reference 不需要帧。适配器 _payload_v25 按请求实际改 mode。
+        "first_frame": True,
+        "last_frame": True,
         "first_url_fields": ("first_frame",),
         "first_path_fields": (),
         "last_url_fields": ("last_frame",),
@@ -537,8 +542,9 @@ VIDEO_SURFACES: dict[str, dict[str, Any]] = {
         "models": ["agnes-video-2.5-flash"],
         "continuity_mode": "image_ref",
         "max_ref_images": 5,  # 官方 Flash 文档：images ≤ 5
-        "max_ref_audios": 3,  # 官方 Flash 文档：audios ≤ 3（纯占位，无消费者）
+        "max_ref_audios": 3,  # 官方 Flash 文档：audios ≤ 3
         "video_ref": False,
+        "modes": ("text", "keyframe", "reference"),
         "env_keys_hint": ("AGNES_CN_API_KEY", "AGNES_API_KEY"),
     },
 }
@@ -566,6 +572,7 @@ _DOCTOR_SURFACE_KEYS = (
     "continuity_mode",
     "max_ref_images",
     "video_ref",
+    "modes",
 )
 
 

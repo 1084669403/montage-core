@@ -27,6 +27,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from montage.engine.retry_policy import provider_meta
 from montage.providers.http import HttpError, get_json, post_json
 from montage.toolbase import BaseTool, ToolResult, ToolRuntime, ToolStatus
 
@@ -66,12 +67,44 @@ _RUNNING = frozenset({"queued", "in_progress", "processing", "pending", "running
 _FAILED = frozenset({"failed", "error", "cancelled", "canceled"})
 
 
-def agnes_credentials() -> tuple[str, str]:
-    """返回 (api_key, base_url)；未配置时抛 ValueError。默认中国站。"""
+AGNES_TIER_POOL: tuple[str, ...] = ("tokenplan", "default")
+
+
+def _active_tier() -> str:
+    """当前激活档（agnes_access_tier）；惰性导入防环（capabilities 不引 agnes）。"""
+    try:
+        from montage.providers.capabilities import agnes_access_tier
+
+        return agnes_access_tier()
+    except Exception:  # noqa: BLE001
+        return "default"
+
+
+def agnes_credentials(tier: str | None = None) -> tuple[str, str]:
+    """返回 (api_key, base_url)；未配置时抛 ValueError。默认中国站。
+
+    档位键池（v8.2 P0-scheduler）：``tier`` 为 None 时取当前激活档
+    （AGNES_ACCESS_TYPE，经 agnes_access_tier）——scheduler 切档后
+    AgnesImage/AgnesVideo/_headers 零改动自动跟档。命中档位专用键
+    ``AGNES_{TIER}_API_KEY``（如 ``AGNES_TOKENPLAN_API_KEY``）时优先；
+    可配 ``AGNES_{TIER}_BASE_URL`` 指定该档独立站点（国际/中国站混用时
+    轮询 origin 需跟随）；未配专用键回落通用键（AGNES_CN_API_KEY /
+    AGNES_API_KEY），行为与历史版本完全一致。
+    """
+    if tier is None:
+        tier = _active_tier()
     key = os.environ.get("AGNES_CN_API_KEY") or os.environ.get("AGNES_API_KEY")
+    base = os.environ.get("AGNES_API_BASE_URL") or os.environ.get("AGNES_BASE_URL")
+    if tier:
+        t = str(tier).strip().upper().replace("-", "_")
+        tkey = os.environ.get(f"AGNES_{t}_API_KEY")
+        if tkey:
+            key = tkey
+            tbase = os.environ.get(f"AGNES_{t}_BASE_URL")
+            if tbase:
+                base = tbase
     if not key:
         raise ValueError("缺少 AGNES_API_KEY 或 AGNES_CN_API_KEY")
-    base = os.environ.get("AGNES_API_BASE_URL") or os.environ.get("AGNES_BASE_URL")
     if not base:
         base = _CN_BASE
     return key, base.rstrip("/")
@@ -88,6 +121,20 @@ def api_origin(base: str) -> str:
 def _headers() -> dict[str, str]:
     key, _ = agnes_credentials()
     return {"Authorization": f"Bearer {key}"}
+
+
+def tier_pool(tier: str | None = None) -> list[str]:
+    """档位池（v8.2 P0-scheduler）：以传入档为起点、AGNES_TIER_POOL 顺序轮转。
+
+    确定性：tokenplan 耗尽后依次尝试池内其余档（default 最后）。未声明
+    AGNES_ACCESS_TYPE 时 agnes_access_tier() 归 default，池退化为 [default]。
+    """
+    from montage.providers.capabilities import agnes_access_tier
+
+    start = str(tier or "").strip().lower() or agnes_access_tier()
+    ordered = [t for t in AGNES_TIER_POOL]
+    rest = [t for t in ordered if t != start]
+    return [start] + rest
 
 
 def _save_b64(b64: str, output_path: str | None, hint: str) -> str | None:
@@ -405,7 +452,17 @@ class AgnesImage(BaseTool):
             data = post_json(f"{base}/images/generations", payload, headers=_headers(), timeout=300)
         except HttpError as exc:
             # 透传状态码供上层 429 退避（字符串匹配不可靠）
-            return ToolResult(success=False, error=str(exc), meta={"http_status": exc.status})
+            return ToolResult(
+                success=False,
+                error=str(exc),
+                meta=provider_meta(
+                    provider="agnes",
+                    model=model,
+                    error=str(exc),
+                    http_status=exc.status,
+                    recovery_action="retry_or_fail",
+                ),
+            )
 
         items = (data or {}).get("data") or []
         if not items:
@@ -476,6 +533,65 @@ class AgnesVideo(BaseTool):
         # 2.5 免费期实价 $0（图/视频同策略）；配额走 agnes_usage，不计入 usd。
         return 0.0
 
+    def poll_result(self, inputs: dict[str, Any]) -> ToolResult:
+        """Recover an existing provider task instead of creating a new one."""
+        try:
+            _, base = agnes_credentials()
+        except ValueError as exc:
+            return ToolResult(success=False, error=str(exc))
+        model = resolve_video_model(inputs.get("model"))
+        task_id = str(inputs.get("provider_task_id") or "")
+        if not task_id:
+            return ToolResult(
+                success=False,
+                error="provider_task_id is required to recover a video task",
+                meta=provider_meta(provider="agnes", model=model),
+            )
+        headers = _headers()
+        url, err = _poll_video(
+            base=base,
+            video_id=task_id,
+            headers=headers,
+            model=model,
+        )
+        if err:
+            return ToolResult(
+                success=False,
+                error=err,
+                data={"provider_task_id": task_id},
+                meta=provider_meta(
+                    provider="agnes",
+                    model=model,
+                    provider_task_id=task_id,
+                    error=err,
+                    recovery_action="poll",
+                ),
+            )
+        local = None
+        out = inputs.get("output_path")
+        if out:
+            try:
+                local = _download(url, str(out))
+            except (OSError, urllib.error.URLError) as exc:
+                return ToolResult(
+                    success=False,
+                    error=f"下载视频失败: {exc}",
+                    data={"provider_task_id": task_id, "url": url},
+                    meta=provider_meta(
+                        provider="agnes",
+                        model=model,
+                        provider_task_id=task_id,
+                        error=f"download failed: {exc}",
+                        recovery_action="download",
+                    ),
+                )
+        return ToolResult(
+            success=True,
+            data={"url": url, "local_path": local, "model": model, "id": task_id},
+            meta=provider_meta(provider="agnes", model=model, provider_task_id=task_id),
+            cost_usd=0.0,
+        )
+
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         try:
             _, base = agnes_credentials()
@@ -500,7 +616,17 @@ class AgnesVideo(BaseTool):
             created = post_json(f"{base}/videos", payload, headers=headers, timeout=600)
         except HttpError as exc:
             # 透传状态码供上层 429 退避（字符串匹配不可靠）
-            return ToolResult(success=False, error=str(exc), meta={"http_status": exc.status})
+            return ToolResult(
+                success=False,
+                error=str(exc),
+                meta=provider_meta(
+                    provider="agnes",
+                    model=model,
+                    error=str(exc),
+                    http_status=exc.status,
+                    recovery_action="retry_or_fail",
+                ),
+            )
         if not isinstance(created, dict):
             return ToolResult(success=False, error=f"创建任务响应异常: {str(created)[:300]}")
         fail = video_error(created)
@@ -524,7 +650,18 @@ class AgnesVideo(BaseTool):
                 model=model,
             )
             if err:
-                return ToolResult(success=False, error=err)
+                return ToolResult(
+                    success=False,
+                    error=err,
+                    data={"provider_task_id": video_id},
+                    meta=provider_meta(
+                        provider="agnes",
+                        model=model,
+                        provider_task_id=video_id,
+                        error=err,
+                        recovery_action="poll",
+                    ),
+                )
         if not url:
             return ToolResult(success=False, error="轮询结束仍无视频 URL")
         local = None
@@ -534,7 +671,11 @@ class AgnesVideo(BaseTool):
                 local = _download(url, str(out))
             except (OSError, urllib.error.URLError) as exc:
                 return ToolResult(success=False, error=f"下载视频失败: {exc}")
-        meta: dict[str, Any] = {"provider": "agnes", "model": model}
+        meta: dict[str, Any] = provider_meta(
+            provider="agnes",
+            model=model,
+            provider_task_id=video_id,
+        )
         if warnings:
             meta["warnings"] = warnings
         return ToolResult(

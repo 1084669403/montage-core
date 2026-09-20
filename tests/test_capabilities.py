@@ -26,8 +26,11 @@ def test_agnes_image_ref_video_tail():
     img = image_caps(provider="agnes")
     vid = video_caps(provider="agnes")
     assert img["reference_operation"] == "image_reference"
-    assert vid["first_frame"] is False
-    assert vid["last_frame"] is False
+    # 2.5 Flash 三模式全开：keyframe（first/last 至少一帧）+ reference + text。
+    assert vid["first_frame"] is True
+    assert vid["last_frame"] is True
+    assert vid["requires_first_frame"] is False
+    assert tuple(vid["modes"]) == ("text", "keyframe", "reference")
     assert vid["continuity_mode"] == "image_ref"
     assert vid["max_ref_images"] == 5
     assert vid["video_ref"] is False
@@ -48,7 +51,8 @@ def test_apply_video_frames_agnes_v20_accepts_tail_url():
     assert not any("不支持尾帧" in n for n in notes)
 
 
-def test_apply_video_frames_agnes_25_skips_first_last():
+def test_apply_video_frames_agnes_25_fills_keyframe_fields():
+    """2.5 能力表放开后 apply_video_frames 按 url_fields 填 first/last（keyframe 模式）。"""
     payload: dict = {"prompt": "x"}
     notes = apply_video_frames(
         payload,
@@ -56,11 +60,9 @@ def test_apply_video_frames_agnes_25_skips_first_last():
         last_url="http://x/t.png",
         caps=video_caps(tool="agnes_video"),
     )
-    assert "image_url" not in payload
-    assert "last_frame_url" not in payload
-    # 文案不再说"降级纯文生"：Agnes 2.5 由 reference 分支接管，首帧只是不接入。
-    assert any("未声明首帧" in n for n in notes)
-    assert any("不支持尾帧" in n for n in notes)
+    assert payload.get("first_frame") == "http://x/f.png"
+    assert payload.get("last_frame") == "http://x/t.png"
+    assert notes == []
 
 
 def test_wan_no_i2v():

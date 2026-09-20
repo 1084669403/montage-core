@@ -105,6 +105,7 @@ def test_dashscope_finalize_normalizes_timestamps():
 def test_selectors_route_or_report_missing(monkeypatch):
     monkeypatch.delenv("AGNES_API_KEY", raising=False)
     monkeypatch.delenv("AGNES_CN_API_KEY", raising=False)
+    monkeypatch.delenv("ARK_API_KEY", raising=False)
     reg = ToolRegistry()
     reg.discover()
     sel = selectors.ImageSelector()

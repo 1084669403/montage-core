@@ -138,15 +138,13 @@ def test_m3_tools_discovered():
         assert reg.get(name) is not None, name
 
 
-def test_selector_routes_new_providers():
+def test_selector_routes_new_providers(monkeypatch):
     """选型器应能发现新供应商（无密钥时给出明确提示）。"""
     from montage.providers import selectors
 
     # 无密钥时 video_selector 报"没有可用"而非崩溃
-    import os
-
     for k in ("DASHSCOPE_API_KEY", "ZHIPU_API_KEY", "KLING_API_KEY", "HUNYUAN_API_KEY",
               "AGNES_API_KEY", "AGNES_CN_API_KEY", "VOLC_ACCESSKEY", "VOLC_SECRETKEY"):
-        os.environ.pop(k, None)
+        monkeypatch.delenv(k, raising=False)
     result = selectors.VideoSelector().execute({"prompt": "x"})
     assert not result.success

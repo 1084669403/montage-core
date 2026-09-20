@@ -1,36 +1,34 @@
-"""agnes_usage — Agnes Token Plan 每日配额记帐（best-effort）。
+"""agnes_usage - Agnes Token Plan 每日配额记账。
 
-官方 Token Plan FAQ（视频 RPM 更新 2026-06-28）：
-  - 图片：4000 张/天
-  - 视频：500 秒/天（v2.0 与 2.5-flash 同池）
-  - default / enterprise 档无订阅配额；配额与 RPM 同时生效。
+官方 Token Plan：图片 4000 张/天、视频 500 秒/天。default/enterprise 档没有
+订阅配额。状态保存在用户级 ``~/.montage/agnes_usage.json``，可用
+``MONTAGE_AGNES_USAGE_PATH`` 覆写。跨自然日读取时归零。
 
-状态存用户级 ``~/.montage/agnes_usage.json``（``MONTAGE_AGNES_USAGE_PATH`` 覆写），
-按 tier 分桶（同一天多档互不污染），跨本地日期归零（文档未规定时区，取本地日期）。
-只统计 + 告警，不阻断出片；写失败静默降级。
-
-重要：本模块在 import 期不得有文件 I/O / 副作用——``montage.registry`` 会 import
-``montage.providers`` 下所有非 ``_`` 开头模块做工具发现，import 报错会进 doctor。
+写入语义：
+- 进程内使用 ``RLock`` 串行化读改写，保证多线程生成不丢账；
+- 落盘使用唯一临时文件 + ``os.replace``，避免并发争用同一个 ``.tmp``；
+- 写盘失败仍然静默降级，不阻断出片。
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
+import tempfile
+import threading
 from datetime import date
 from pathlib import Path
 from typing import Any
 
-# 文档配额；图片列只写 agnes-image-2.1-flash，保守假设 2.5 共用同池（文档单列再改）。
 _QUOTA: dict[str, dict[str, float]] = {
     "tokenplan": {"image": 4000.0, "video": 500.0},
 }
 _KNOWN_TIERS = ("default", "enterprise", "tokenplan")
+_USAGE_LOCK = threading.RLock()
 
 
 def usage_path() -> Path:
-    """惰性解析：import 期不触发文件系统访问。"""
+    """返回账本路径；import 期间不做文件 I/O。"""
     override = str(os.environ.get("MONTAGE_AGNES_USAGE_PATH") or "").strip()
     if override:
         return Path(override)
@@ -59,38 +57,51 @@ def _load() -> dict[str, Any]:
 
 
 def _save(data: dict[str, Any]) -> None:
-    # 原子写（同 generation_cache）：tmp + move；失败静默，不阻断出片。
+    """原子写账本；每个写入线程使用唯一临时文件。"""
     path = usage_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        shutil.move(str(tmp), str(path))
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=path.name + ".",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
     except OSError:
         return
 
 
 def read_usage(tier: str) -> dict[str, float]:
-    """读某 tier 当日用量；文件损坏/缺失返回零值（静默降级）。"""
-    bucket = (_load().get("tiers") or {}).get(str(tier or "default")) or {}
-    return {
-        "images": float(bucket.get("images") or 0),
-        "video_seconds": float(bucket.get("video_seconds") or 0.0),
-    }
+    """读某 tier 当日用量；文件损坏或缺失时返回零值。"""
+    with _USAGE_LOCK:
+        bucket = (_load().get("tiers") or {}).get(str(tier or "default")) or {}
+        return {
+            "images": float(bucket.get("images") or 0),
+            "video_seconds": float(bucket.get("video_seconds") or 0.0),
+        }
 
 
 def add_images(tier: str, n: int = 1) -> None:
-    data = _load()
-    bucket = data["tiers"].setdefault(str(tier or "default"), {})
-    bucket["images"] = float(bucket.get("images") or 0) + int(n)
-    _save(data)
+    with _USAGE_LOCK:
+        data = _load()
+        bucket = data["tiers"].setdefault(str(tier or "default"), {})
+        bucket["images"] = float(bucket.get("images") or 0) + int(n)
+        _save(data)
 
 
 def add_video_seconds(tier: str, seconds: float) -> None:
-    data = _load()
-    bucket = data["tiers"].setdefault(str(tier or "default"), {})
-    bucket["video_seconds"] = float(bucket.get("video_seconds") or 0.0) + float(seconds or 0)
-    _save(data)
+    with _USAGE_LOCK:
+        data = _load()
+        bucket = data["tiers"].setdefault(str(tier or "default"), {})
+        bucket["video_seconds"] = float(bucket.get("video_seconds") or 0.0) + float(seconds or 0)
+        _save(data)
 
 
 def quota_status(tier: str, kind: str) -> tuple[float, float | None, float | None]:
@@ -105,7 +116,7 @@ def quota_status(tier: str, kind: str) -> tuple[float, float | None, float | Non
 
 
 def usage_snapshot() -> dict[str, Any]:
-    """doctor 用：当前 tier 与当日图片/视频用量。"""
+    """doctor 使用的当前档位用量快照。"""
     tier = "default"
     try:
         from montage.providers.capabilities import agnes_access_tier
