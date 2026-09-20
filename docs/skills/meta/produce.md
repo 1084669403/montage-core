@@ -2,6 +2,49 @@
 
 Cursor 项目 Skill 在 `.cursor/skills/montage-produce/SKILL.md`，与本页同锁。
 
+**接管项目先三读（V40）**：项目内 `PROGRESS_TRACKER.md`（静态手册，禁改写重生成）→
+`artifacts/produce_progress.json`（机器事实，"下一步"唯一依据）→ `STATUS.md`（手账，
+唯一手写可覆盖文件）。收尾把跨会话值得留的写 STATUS.md ≤5 行，不写流水账。
+`init`/集物化自动复制这两份随行文件；老项目缺属正常，可从 `docs/PROJECT_TEMPLATE.md` 补复制。
+
+**多角色评审纪律**：每轮 REVISE 必须 `review_logger record`（V21，不 record=无效轮）；
+子 Agent 关卡首审 record 带 `phase=first_pass` 不占 4 轮额度（V36 定案/V47）；
+停点汇报并读 REVIEW.md + review_log 摘要（V24）。详见 `docs/ROLES.md`。
+**在场清单/承接表归属（B2.5）**：`presence` 与编译器产出的 `continuity` 走
+**镜头级字段路径**（写 `bible.scenes[].shots[]` → 先重编译 → 再 `--resume`）；
+执笔是**编剧**，内容分属美术（场景方位/光位/道具/服装）·动作（人物状态）·导演
+（进出场与承接），审在点位一 `await_shots` 并行做并 `record(subject=checkpoint_1)`。
+`continuity` 是**只读产物**，禁手改。
+
+**参考图规范（2026-09-19 用户拍板，实施时照此配置）**：
+
+- **人物参考一律四视图**：新项目在 `proposal_packet` 写 `cast_ref_kind: "turnaround"`；
+  四视图必须配"这张是**同一个人**的四个角度、不是四个人/多胞胎、画面中该角色只出现一次、
+  禁分格复制"的图例说明（`lib/shot_prompt_builder._ref_header_lines` 已内置）。
+- **道具参考也是四视图**：`_prop_prompt` 产出 2×2 四角度拼板，图例同样声明"是同一件物品"。
+- **画幅**：首帧/场景参考=16:9（跟随 `output_profile`）；定妆/四视图=**9:16 全身**（头脚完整）；
+  道具四视图=1:1。参考模式（image_reference）首帧也必须显式传 `ratio`，否则落 Agnes 默认 1:1。
+- **提示词内容规范**：剧情/环境可以简洁，**动作与台词不可省**；压缩只允许砍
+  "全片统一BGM：…" 与超长参考图说明（`lib/shot_prompt_builder._compress_agnes_v25`），
+  shot_runner 在压缩后会检查"本镜对白是否还在提示词里"，丢了就出 warning。
+**特效帽（P0-8）**：`vfx_director` 已进 `REVIEW_LOG_ROLES`——点位一点位二与美术/动作
+并行换帽（制定 `bible.scenes[].shots[].vfx[]`，美术审风格）；compile 自带确定性 vfx
+自审（layer/post kind/onset/密度/sfx 同步，全 warning 不挡）；`await_outline` 加美术帽
+轻审；`await_clips` 加美术风格终检+特效观感抽检（vlm `mode=video_clip`，成本护栏
+同 P0-7a：抽帧 ≤12、缺 `DASHSCOPE_API_KEY` 跳过降级）。细则 `docs/VFX_DIRECTOR.md`。
+
+**assemble 前客观量规（P0-4）**：`await_clips` 人审时跑一次
+`review_logger operation=metrics`（读产物算 DIRECT m1/m2/m5/m6+身份漂移，写
+`artifacts/edit_metrics.json` 并落 `edit_director`/`edit_plan` 一行，findings 带
+metric/value/threshold）。停点卡会显示量规摘要（`!`=未过、`~`=跳过、`c`=自我满足）；
+`~` 是"没测到"不是"已达标"，`c`（P0-5 能量波切点接管时 m5/m6 必然达标）也**不作放行证据**。
+m3（光流）/m4（显著性）不采——本管线镜为独立生成，无流场约束。
+
+**重编译强制条款（V23/V29/V37，P0 级）**：await_shots/await_frames/await_final_prompt/
+await_clips 状态下改 `series_bible.json` 后禁止直接 `--resume`——先确认 status 为
+`await_*`，再 `python -m montage run <dir> idea_developer --input inputs.json`
+（inputs 仅 `{"operation":"compile"}`，bible 直读），最后 `--resume`。改 scene_plan 不受限。
+
 W0：磁盘上**已经有**分镜 clip 时，一条命令按死顺序配乐 → 编译 → Ken Burns → 叠音 → 拼接 → **finish → release** → 打包。
 
 W1：`--idea` 只收想法（级联写出 `format_card`）。无圣经 → `need_bible`（Agent 按方位写 `series_bible.json` 后再 `--idea`）；有圣经 → **停在 `await_bible`，此时还不编译**。人点头后第二次 `produce`（不要 `--idea`）才校验+编译 script/scene_plan。不是「一句话想法出片」。
@@ -34,7 +77,7 @@ python -m montage produce <project_dir> --retry sh01 --yes
 python -m montage produce <series_dir> --season-concat
 ```
 
-可选：`--skip-export`、`--strict-audio`（缺 BGM 失败）、`--keep-scratch`、`--prune-exports N`（导出后只保留最新 N 个 zip；默认 0=只增不删）。`--idea` 需要已有 `project.json`（`montage init`），不自动建项目。`--skip-finish` 仍会跑 release（写 `publish_log`）。`--profile` 只给 finish，不读管线 `default_profile`。`--burn-subs` 才把字幕烧进像素（默认只写 `renders/final.srt`）。
+可选：`--skip-export`、`--strict-audio`（缺 BGM 失败）、`--keep-scratch`、`--prune-exports N`（导出后只保留最新 N 个 zip；默认 0=只增不删）。`--accept-degraded-vlm` 仅在 `quality_mode=degraded|manual_only` 且 VLM 未验证时生效，显式写 `produce_progress.human_review.decision=accepted_with_degraded_vlm`；delivery report 仍是 `degraded`。`--idea` 需要已有 `project.json`（`montage init`），不自动建项目。`--skip-finish` 仍会跑 release（写 `publish_log`）。`--profile` 只给 finish，不读管线 `default_profile`。`--burn-subs` 才把字幕烧进像素（默认只写 `renders/final.srt`）。
 
 `--retry a,b` 未确认时只 dry_run，`await_retry`（code=0，`--resume` 继续，不是人审）。`--retry a,b --yes` 一趟确认：强制 GEN、关掉样品停。可灵（`video_loop=kling`）未写 `rework_mode` 默认 **regenerate**；确认卡二选一 `regenerate` / `feature`（≤10s 且需公网成片 URL；`edit` 不在默认二选一）。Seedance 有公网成片 URL 时仍优先 **edit/extend**，否则整镜重抽。系列根 / clip_factory / `await_sample` / `--idea` 时 retry 失败。成片已齐也会重跑指定镜。
 
@@ -117,7 +160,7 @@ python -m montage produce <series_dir>/episodes/ep02    # 只动这一集，不�
 - `need_bible`：`argv` 为空。按 Skill 写 `series_bible.json`（地点 `sensory` 交叉方位），再 `produce --idea`
 - `await_bible`：无 `--idea`、无 `--review none`（尚未编译；改完 `series_bible.json` 再跑）
 - `await_prompt`：`argv` 为空。要改圣经就改完后 `produce`（不要 `--resume`）；不改则 `produce --resume` 走压缩兜底。Skill 禁止立刻 exec
-- `await_setup` / `await_outline` / `await_design` / `await_cast` / `await_shots` / `await_frames` / `await_final_prompt` / `await_clips`：只加 `--resume`（导演档；先读 `artifacts/REVIEW.md` 摘要，改 JSON，不要 `--idea`）。`await_cast` 有失败则 `--retry portrait/<id>`（或 `turnaround/` / `scene_ref/` / `prop/`）后再 `--resume`。`await_frames` / `await_clips` 有失败则 `--retry <shot_id> --resume`。`await_final_prompt` 只读预览，改提示词回 `scene_plan` / `series_bible`，`--resume` 才全量 I2V。可灵 `await_retry` / 失败镜可写 `scene_plan.shots[].rework_mode`（`regenerate` 默认 / `feature` ≤10s）。`await_frames` 通过后先进 `await_final_prompt`，不再插 `await_sample`
+- `await_setup` / `await_outline` / `await_design` / `await_cast` / `await_shots` / `await_frames` / `await_final_prompt` / `await_clips`：只加 `--resume`（导演档；先读 `artifacts/REVIEW.md` 摘要，改 JSON，不要 `--idea`）。`await_cast` 有失败则 `--retry portrait/<id>`（或 `turnaround/` / `scene_ref/` / `prop/`）后再 `--resume`。`await_frames` / `await_clips` 有失败则 `--retry <shot_id> --resume`。`await_final_prompt` 只读预览，改提示词回 `scene_plan` / `series_bible`（**改 bible 先走上方重编译强制条款**），`--resume` 才全量 I2V。可灵 `await_retry` / 失败镜可写 `scene_plan.shots[].rework_mode`（`regenerate` 默认 / `feature` ≤10s）。`await_frames` 通过后先进 `await_final_prompt`，不再插 `await_sample`
 - `compiled`：无 `--idea`、有 `--review none`（已经跳过 bible 停，可以立刻跑）
 - `await_sample` / `await_retry` / `await_episode`：只加 `--resume`（样品/retry 等人点头）
 - `ok`：`argv` 为空

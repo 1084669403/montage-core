@@ -69,6 +69,8 @@
 <header>
   <h1>🎬 montage-core 看板</h1>
   <span class="sub">AI 视频生产 · 阶段/产物/成本/决策</span>
+  <span class="sub" id="live" title="SSE 实时刷新（只刷视图，不出片）">○ 实时</span>
+  <span class="back" id="live-refresh" style="display:none" onclick="refreshCurrentView(true)">有更新 · 点我刷新</span>
   <div class="tabs">
     <div class="tab active" data-tab="projects">项目</div>
     <div class="tab" data-tab="tools">工具</div>
@@ -87,6 +89,66 @@ async function api(url, opts) {
   const res = await fetch(url, opts);
   if (!res.ok) { let d = null; try { d = await res.json(); } catch(e) {} throw new Error((d && d.detail) || res.status); }
   return res.json();
+}
+
+// P0-7c：SSE 实时刷新。只刷视图（列表/详情），不放行任何写操作。
+const CURRENT = { apiBase: '', projectId: '', readonly: false };
+const LIVE = { es: null, pending: false };
+
+function setLive(on, text) {
+  const el = document.getElementById('live');
+  if (!el) return;
+  el.textContent = text || (on ? '● 实时' : '○ 重连中');
+  el.style.color = on ? 'var(--ok)' : 'var(--muted)';
+}
+
+function showLiveHint() {
+  LIVE.pending = true;
+  const el = document.getElementById('live-refresh');
+  if (el) el.style.display = 'inline-block';
+}
+
+// 用户正在输入/看片时不要重画：重画会冲掉 review 表单里的未保存改动，也会让 <video> 从头开始。
+function autoRefreshBlocked() {
+  const box = document.getElementById('review-fields');
+  if (box && box.style.display === 'block') return true;
+  const video = document.querySelector('#view-detail video');
+  if (video && !video.paused) return true;
+  return false;
+}
+
+async function refreshCurrentView(force) {
+  const detailOpen = document.getElementById('view-detail').style.display === 'block';
+  if (detailOpen && CURRENT.apiBase) {
+    if (!force && autoRefreshBlocked()) { showLiveHint(); return; }
+    const p = await api(CURRENT.apiBase);
+    renderDetail(p, CURRENT.apiBase, CURRENT.readonly);
+  } else {
+    await renderProjects();
+  }
+  LIVE.pending = false;
+  const hint = document.getElementById('live-refresh');
+  if (hint) hint.style.display = 'none';
+}
+
+function connectEvents() {
+  if (!window.EventSource) { setLive(false, '○ 无 SSE'); return; }
+  const es = new EventSource('/api/events');
+  LIVE.es = es;
+  es.onopen = () => setLive(true);
+  es.onerror = () => setLive(false, '○ 重连中');
+  es.onmessage = ev => {
+    let msg = null;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (!msg || msg.type !== 'changed') return;
+    const detailOpen = document.getElementById('view-detail').style.display === 'block';
+    if (detailOpen) {
+      if (!CURRENT.apiBase) return;
+      if (msg.project_id && CURRENT.projectId && msg.project_id !== CURRENT.projectId) return;
+    }
+    if (autoRefreshBlocked()) { showLiveHint(); return; }
+    refreshCurrentView(true).catch(() => {});
+  };
 }
 
 function pills(progress) {
@@ -129,6 +191,12 @@ async function openEpisode(parentId, episodeId) {
 }
 
 function renderDetail(p, apiBase, readonly) {
+  CURRENT.apiBase = apiBase;
+  CURRENT.projectId = p.project_id || p.meta.project_id || '';
+  CURRENT.readonly = !!readonly;
+  LIVE.pending = false;
+  const hint = document.getElementById('live-refresh');
+  if (hint) hint.style.display = 'none';
   $('#view-projects').style.display = 'none';
   $('#view-detail').style.display = 'block';
   const el = $('#view-detail');
@@ -267,9 +335,11 @@ async function retryProduce(path, confirm) {
 }
 
 function backToList() {
+  CURRENT.apiBase = '';
+  CURRENT.projectId = '';
   $('#view-detail').style.display = 'none';
   $('#view-projects').style.display = 'block';
-  renderProjects();
+  refreshCurrentView(true).catch(e => alert('加载失败：' + e.message));
 }
 
 function choiceList(choices, path) {
@@ -388,6 +458,7 @@ document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
 });
 
 renderProjects().catch(e => alert('加载失败：' + e.message));
+connectEvents();
 </script>
 </body>
 </html>

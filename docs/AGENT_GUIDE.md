@@ -38,10 +38,16 @@
 python -m montage auto_edit <project_dir> --video raw.mp4 --style documentary
 python -m montage auto_edit <project_dir> --clips a.mp4 b.mp4 --style cinematic --preview
 python -m montage auto_edit <project_dir> --audio-only voice.wav --style fresh --is-speech
+python -m montage auto_edit <project_dir> --video mv.mp4 --style beat --has-bgm --bpm 128
 ```
 
 - **三选一**：`--video` / `--clips`（多段顺序拼接，段内独立分析，不先 concat） /
   `--audio-only`（黑场 + 音轨）。
+- **叙事对齐（P0-2）**：先 `python -m montage run <dir> scene_pipeline --input in.json`
+  产出 `artifacts/scene_index.json`；`plan` 会自动读它，把情节单元边界并进断镜点。
+  `--no-scene-index` 可关掉，`--scene-index PATH` 可指定别的索引。注意单元边界仍受
+  风格包 `min_hold` 约束：被吃掉的数量在 `plan` 输出的 `scene_index.dropped` 里
+  显式回报（例如 documentary 的 min_hold=4.0 会吃掉 3 秒一换的段落）。
 - **风格包**（`montage/style_packs.py`）：cinematic / documentary / beat / classic /
   fresh / cyber。管节奏、LUT、转场、`output_profile`；`bind_playbook` 只写入
   `plan.json` 元数据，MVP **不**调用 `visual_prompt_builder`。
@@ -50,9 +56,51 @@ python -m montage auto_edit <project_dir> --audio-only voice.wav --style fresh -
 - **缺 `project.json`**：在 `project_dir` **原地**写最小元数据，**不**调用
   `init_project`（不会落到 `<root>/projects/<id>`）。看板只扫
   `webui --root` 下的 `projects/<id>`，任意目录快速剪辑能出片但默认不出现在看板。
-- **人机闭环**：改 `plan.json` 后用工具 `operation=replan` 或 CLI
-  `--overrides '{"seg_0":{"action":"drop"}}'`；决策日志
-  `category=auto_edit, subject=auto_edit/<project_id>/<session_id>`，本地 ffmpeg 账本 $0。
+- **人机闭环（P0-3 版本链）**：改 `plan.json` 后用工具 `operation=replan` 或 CLI
+  `--overrides '{"seg_0":{"action":"drop"}}'`。每次 `plan`/`replan`/`revert` 都会：
+  1. 往 `tmp_autoedit/plan_history/` 追加一版快照（`v0001.json`…）+ 索引
+     `plan_history.json`；
+  2. 记一条**字段级 diff**（`重定时/改速率/增删镜/段 action/参数/转场/时长`），
+     只改一个镜的速率不会被报成「整片全变」；
+  3. 往 `decisions.jsonl`（`category=auto_edit`）写一行 `rev N: <reason>` + diff 摘要——
+     **快照目录被 `export_bundle` 排除，所以审计痕迹落在 decisions.jsonl 这份导出的日志里**。
+  - 查询/回滚：`operation=history`（带 `rev` 则连正文一起返回）、
+    `operation=revert`（`{"rev": N}`）。幂等：与上一版内容等价则**不新增版本**
+    （`changed=false`），所以反复跑同一 `--overrides` 不会灌水。
+  - **回滚后必须重渲**（`reverted_to` 的回报里 `note` 会写明）：`revert` 只换
+    `plan.json`，产物仍绑旧版。
+  - `--reason "..."` 给本版命名（写进版本链与审计）；`max_versions` 是**项目级**上限
+    （首次默认 50，0=不限），设过一次后续沿用，不会不传就悄悄回默认。
+- **断点认 plan 版本**：`resume` 的单镜中间产物按**镜内容寻址**
+  （`shot_0000_<hash>.mp4`，hash 含源/in/out/速率），`stitch/grade/profile` 的
+  断点记录带 `plan_sha`。**改了 plan 再渲会真的重跑受影响的步骤**；plan 没变则照旧跳过。
+  `report.render_log` 逐步记 `done/skipped` 与原因，`report.plan_sha` 是本次渲染绑的版本。
+- **镜级后期特效（P0-8 后续小刀）**：`--vfx` 接 JSON 对象或文件路径
+  （`{"seg_0_shot_0":[{"layer":"post","kind":"impact_flash"}]}`），只支持已落盘镜；
+  空数组清除该镜特效。特效产物按 vfx 摘要独立缓存，改特效不重 trim，但拼接链会重跑。
+  post 层 onset 缺省时读 `beat_map.json`，按镜窗内能量最高 bar 的起点换算成**镜内相对秒**；
+  显式 onset 优先，无 beat_map 回落 0。`MONTAGE_NO_VFX=1` 跳过整条 auto_edit 特效路径。
+- **能量波切点（P0-5，`--has-bgm` 才接管）**：给了 `--has-bgm` 时，`plan` 会量这段音频的
+  **能量包络**（ffmpeg `ebur128` 瞬时响度 M；不可用则退 PCM RMS）→ 拍网格 → **Bar-DP**：
+  在拍位上选切点，让每 bar 的切点数跟着能量走（安静段 0–1 刀、高潮段 2 刀），
+  `min_hold`/`max_hold` 仍是风格包那套硬约束（**P0-5 不新增旋钮**）。
+  - bpm 来路：`--bpm 128`（曲库/人给）优先；没给就自相关估拍，此时 `bpm_source=estimated`
+    且**必带 warning**（`plan` 输出与 `tmp_autoedit/beat_map.json` 都有），别当曲库数据用。
+  - 上闸三条：`--has-bgm` 没给 / `--no-beat-cuts` 显式关 / `--is-speech`（对白片切在拍上会
+    切断句子）→ 一律**保持 scene-change 切点**，并在 `beat_cuts.reason` 写明原因。
+  - 接管是**替换**而非并集：并上 scene 切点会把安静段又切碎，两种策略互相打架。
+    逐源 `replaced/kept_scene_cuts` 回报在 `auto_edit/plan.json` 同级的
+    `tmp_autoedit/beat_map.json`（`export_bundle` 排除它，所以审计行落在 `decisions.jsonl`：
+    `P0-5 能量波切点接管：bpm=…（explicit/estimated）× min–maxs 硬约束`）。
+  - `plan.params.bpm` 记下这次用的 bpm；与 `--target-duration` 同时给会 warn——
+    `_fit_target_duration` 整体缩放镜长，切点会离开拍位。
+  - **闸门关掉时会把 `tmp_autoedit/beat_map.json` 删掉**：留着就是「本次切点被能量波
+    接管」的假证据，量规层会照它把 m5/m6 误标 circular（真跑踩过：`--no-beat-cuts`
+    后旧产物还在盘上）。重跑一次下闸的 plan 即自动清掉。
+  - **量规会因此变「自证」**：切点既然按网格+能量生成，m5（吸拍）与 m6（密度∝能量）必然达标。
+    量规层（`edit_metrics`）把这两条打 `circular=true`、一行摘要标 `c`（`m5c1.0`），
+    **只当回归哨兵，不作质量证据**。DP 不可行（如 bpm 都估不出）时不标 circular——
+    那时指标是真证据。
 - **只读铁律**：输入素材任意本地可读路径即可；输出必须落在 `auto_edit/` 或
   `tmp_autoedit/`。`report.source_integrity` 按 probe 时的 sha256 复核。
 
@@ -111,8 +159,29 @@ python -m montage auto_edit <project_dir> --audio-only voice.wav --style fresh -
 5. **素材分析**：`video_analyzer`（分辨率/fps/编码/音轨）、`scene_detect`（镜头切点）、
    `frame_sampler`（抽帧审阅）、`audio_probe`/`audio_energy`（音轨信息/响度电平，
    混音前先查电平）、`downloader`（素材 URL 落盘，可 verify）。
+   **剪现有素材先过 `scene_pipeline`（V41 P0-2）**：把 `scene_detect` 的视觉碎切
+   聚成**情节单元**（8x8 RGB 指纹判换场 × 台词连读，或 `grouping=vlm` 窗口问 VLM），
+   写 `artifacts/scene_index.json`。之后 `auto_edit plan` 会自动读它，把单元边界并进
+   断镜点（被风格包 `min_hold` 吃掉时回报 `scene_index.dropped`，不静默成功）。
+   LLM 只允许回**索引**，时间戳一律由切点推导。
 6. 所有 API 调用先 `estimate_cost` 记账，执行后 `settle`；重要决策写入
    `DecisionLog`（append-only，(category, subject) 最新覆盖展示）。
+7. **多角色评审与时长闭环（新增）**：角色审停点（await_setup/outline/design/shots/
+   final_prompt/frames/clips）每轮 REVISE 用 `review_logger` record（role/subject 按
+   `docs/ROLES.md` 枚举表；返修轮 `phase=revise`，子 Agent 关卡首审 `phase=first_pass`
+   不占额度）；`operation=summary` 出轮次/振荡/role 级额度合计；`operation=metrics`
+   算 DIRECT 客观量规（m1/m2/m5/m6+身份漂移，写 `artifacts/edit_metrics.json` 并落
+   `edit_director`/`edit_plan` 一行，findings 带 metric/value/threshold）供 assemble
+   前人审。时长问题用
+   `duration_advisor`（`estimate` 双路径逐场估时+建议 / `recommend` 类型节奏锚点）。
+8. **项目随行文件（V39+）**：`montage init` / 集物化自动复制 `PROGRESS_TRACKER.md`
+   （静态手册，禁改写重生成）与 `STATUS.md` 手账骨架（唯一手写可覆盖文件）。
+   接管项目先三读：手册 → `artifacts/produce_progress.json` → `STATUS.md`；
+   "下一步"永远以 progress.json 的 status/next.argv 为准（手册只答怎么干）。
+   收尾把跨会话值得留的决策写 STATUS.md（≤5 行/停点）。
+   **导出包边界（V44）**：`export_bundle` 不收这两份随行文件（与 REVIEW.md 同待遇），
+   交付第三方前须手动补或改 glob；老项目缺随行文件属正常（V50），按需从
+   `docs/PROJECT_TEMPLATE.md` 手动补复制。
 
 ## 知识资产层（开源库）
 
@@ -173,7 +242,15 @@ A/B 选择用 `asset_picker`（锐度 + 分辨率评分选最优）；重跑不�
 
 **成片健康（发布前）**：produce 在打 zip **之前**跑 `film_health`（ffprobe 整片：存在/视频流/时长）。critical 挡 `export_bundle`；`--skip-export` 与 `MONTAGE_RELAX_GATES=1` 不挡。不要对成片再跑 `asset_quality_gate` 的模糊检测。
 
+**film_health 长片指标（P0-7a）**：critical 永远只报确定性硬伤，长片指标一律 warning：
+- 时长口径：目标 ≥300s（或 bible 带 `chapters`）自动收紧到 10% 容差，短片仍 20%；`duration_check` 落盘实值（delta/tolerance/longform），输入 `duration_tolerance` 可显式覆盖（0=只报数）。
+- 段间响度一致性：复用 P0-5 能量包络（ebur128 优先、PCM 兜底）按 60s 分块，落差 >6LU、单块偏离中位 >4LU 逐条 warning（最多 3 条+汇总）；ebur128 是绝对 LU、PCM 是相对 dB，`audio_source` 必看，跨片比较只认 LU。
+- 镜连续性抽检：`continuity_samples` **默认 0（零 API）**，给点数才按 `scene_index` 锚点抽帧走 VLM（上限 12，超出截断并 warning）；结果永不进 critical——VLM 是指路（哪段该重抽），不是闸门。
+- 成片路径回落：`renders/final.mp4` 缺则回落 `auto_edit/final.mp4`（`path_source` 标明来源）——剪辑现有视频的成片同样吃这套体检。
+
 **一致性（生成后）**：`shot_runner` 在确定性质量门之后跑 `vlm_reviewer`（千问 VL）。缺 `DASHSCOPE_API_KEY` 则跳过、不挡成片。VLM critical（如定妆黑发、成片金发）进 `retryable_ids`，并让机器收口跳过 assets。场记写在 `artifacts/continuity.json`；即梦/可灵方言会带一行「场记」，Agnes 2.0 只把定妆/四视图 URL 放进关键帧，不改提示词。
+
+**vlm_reviewer 分段抽帧（P0-7b）**：`mode="video_clip"` 现在真的抽多帧了——整段等距取 3 点（每段中点，避开首尾黑场），显式 `timestamps` 可指名抽帧位置，`max_frames` 截断（默认 3）。多帧会提示 VLM「跨帧不一致要报人物不一致」。返回多 `sampled`（抽样点/失败点）；不传参仍是单帧老行为，shot_runner 零改动。「禁止据回复填 retake_segment」不变。
 
 **返工**：`--retry sh01` 仍是唯一入口。Seedance 2.5 / Kling Omni 在成片还有公网 URL 时走 edit/extend（不重编好段）；否则整镜重抽。ffmpeg `retake_segment` 仅当镜头写了 `retake_segment` 时间范围。不要新 CLI。
 
@@ -197,6 +274,16 @@ A/B 选择用 `asset_picker`（锐度 + 分辨率评分选最优）；重跑不�
 - `cut_silence`：静音剪切/跳切（`silence_action=remove|mark`，`silence_threshold_db`/`silence_min_duration`）
 - `auto_reframe`：智能重构图（`reframe_target=9:16|16:9|1:1|...`，`reframe_mode=center|face`；face 模式 OpenCV 可选，缺失自动降级 center）
 - `assemble` 的转场已带**音频 acrossfade**（片段全有音轨时，转场处声音同步交叉淡化）
+
+**后期特效（P0-8，`montage/compose/effects.py`）**：`impact_flash`（eq 时间窗亮度脉冲）/
+`zoom_punch`（zoompan d=1 急推回弹）/`camera_shake`（crop x/y 正弦抖动）+ `apply_post_vfx`
+分发器（按 onset 链式；`MONTAGE_NO_VFX=1` 一键直通）。三个特效**时长守恒**（不改输出时长，
+保护 film_health duration_check）。数据流：特效指导写 `bible.scenes[].shots[].vfx[]`
+（唯一事实源）→ compile 自审（layer/post kind 白名单/onset 越界/密度红线/sfx 同步，
+全 warning）→ compose_planner 透传 `cuts[].vfx` → assemble 拼接前逐 cut 应用。
+**顺序定死：先 vfx 后 LUT**（闪白被统一调色）。提示词层走【特效】段
+（`_SECTION_ORDER`/动态专属/压缩优先级三处已注册；静态首帧不带——特效是时间点事件）。
+`vfx_director` 角色细则见 `docs/VFX_DIRECTOR.md`。
 
 **风格锁定**：proposal 阶段同时从 `montage/playbooks/` 选一个 playbook
 （`get_playbook(name)`，7 个内置：chinese_elegance / cyberpunk_neon /
@@ -250,6 +337,8 @@ python -m montage webui --port 8399               # 启动看板
 ```
 
 看板系列根只播已有 `renders/season.mp4`，不在根上拼季；季片不是默认产物（须 `--season-concat`）。子集 / 扁平仍播 `final.mp4`。导演档停点会显示折叠确认卡（摘要默认，展开后改 bible/scene_plan 再 CLI `--resume`）；看板**不会**一键出片。保存走带 id 的叶子（`bible.characters[a].appearance`、`scene_plan.shots[sh01].shot_language.camera_movement=dolly_in`）；通配 `scenes[].shots[]` 和中文「慢推」都不会写盘。
+
+**SSE 实时刷新（P0-7c）**：看板经 `/api/events` 收 SSE——artifacts/decisions/cost/成片/plan_history 一变（mtime+size 指纹）就推 `changed`，前端照旧走既有 GET 重画。只刷视图，**不放行写操作**；review 表单展开或 `<video>` 播放中不重画（防冲掉输入/打断播放），改挂「有更新 · 点我刷新」。事件只带 status/next 不塞 detail；`max_idle` 防连接泄漏（EventSource 自动重连）。
 
 ## 外壳与出错率（经验，非 SLA）
 

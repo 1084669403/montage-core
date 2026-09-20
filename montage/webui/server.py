@@ -12,13 +12,14 @@ from typing import Any
 from montage.engine.project import init_project
 from montage.engine.stages import CheckpointStore, StageStatus
 from montage.registry import ToolRegistry
+from montage.webui.events import DEFAULT_MAX_IDLE
 from montage.webui.state import (
+    _safe_id,
     collect_projects,
     project_detail,
     resolve_media_file,
     resolve_produce_media,
     resolve_thumb,
-    _safe_id,
 )
 
 _INDEX_HTML: str | None = None
@@ -32,11 +33,15 @@ def _load_index() -> str:
     return _INDEX_HTML
 
 
-def create_app(root: str | Path = "projects") -> "Any":
+def create_app(root: str | Path = "projects") -> Any:
     """构建 FastAPI 应用（惰性导入，核心包无 fastapi 依赖）。"""
     try:
         from fastapi import FastAPI, HTTPException
-        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+        from fastapi.responses import (
+            FileResponse,
+            HTMLResponse,
+            StreamingResponse,
+        )
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
             "缺少 WebUI 依赖：pip install \"montage-core[webui]\"（fastapi + uvicorn）"
@@ -81,6 +86,46 @@ def create_app(root: str | Path = "projects") -> "Any":
             "catalog": reg.capability_catalog(),
             "menu": reg.provider_menu_summary(),
         }
+
+    @app.get("/api/events")
+    def api_events(
+        project_id: str = "",
+        interval: float = 1.0,
+        max_events: int = 0,
+        max_idle: float = DEFAULT_MAX_IDLE,
+    ) -> Any:
+        """SSE：产物/进度一变就推一条 ``changed``（P0-7c）。只刷视图，不放行写操作。"""
+        from montage.webui.events import sse_format, watch_events
+
+        wanted = project_id.strip()
+        if wanted and "::" in wanted:
+            parent, _, episode = wanted.partition("::")
+            if not (_safe_id(parent) and _safe_id(episode)):
+                raise HTTPException(status_code=404, detail="项目不存在")
+        elif wanted and not _safe_id(wanted):
+            raise HTTPException(status_code=404, detail="项目不存在")
+
+        def _stream() -> Any:
+            first = True
+            for event in watch_events(
+                root,
+                project_id=wanted,
+                interval=interval,
+                max_events=max(0, int(max_events or 0)),
+                max_idle=max(0.0, float(max_idle or 0.0)),
+            ):
+                yield sse_format(event, retry_ms=event.get("retry_ms") if first else None)
+                first = False
+
+        return StreamingResponse(
+            _stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.post("/api/projects")
     def api_init(body: dict[str, Any]) -> dict[str, Any]:

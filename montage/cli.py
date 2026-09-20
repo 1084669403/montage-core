@@ -10,6 +10,8 @@
   montage produce <project_dir> [--resume] [--skip-export] [--strict-audio] [--keep-scratch] [--tts]
   montage produce <project_dir> --idea "讲量子计算" [--review bible]
   montage auto_edit <project_dir> --video/--clips/--audio-only --style ...
+  montage delivery_report <project_dir> [--summary]
+  montage srt_rebuild <project_dir> [--write]
   montage webui [--port 8399]
 
 本文件为全新原创代码。
@@ -18,13 +20,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
 
 from montage.engine.project import init_project
-from montage.engine.stages import CheckpointStore, StageStatus, STAGE_ORDER
+from montage.engine.stages import STAGE_ORDER, CheckpointStore, StageStatus
 from montage.registry import ToolRegistry
 
 
@@ -56,7 +60,10 @@ def _doctor_payload(reg: ToolRegistry, args: argparse.Namespace) -> dict:
         "dotenv_injected": injected_key_count(),
     }
     if getattr(args, "pipeline", None) or getattr(args, "project", None):
-        from montage.engine.policy import skill_paths_for_pipeline, skill_paths_for_project
+        from montage.engine.policy import (
+            skill_paths_for_pipeline,
+            skill_paths_for_project,
+        )
 
         payload["skills"] = (
             skill_paths_for_project(args.project)
@@ -163,7 +170,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
-    from montage.engine.gates import GateError, check_tool_allowlist, validate_completion
+    from montage.engine.gates import (
+        GateError,
+        check_tool_allowlist,
+        validate_completion,
+    )
 
     store = CheckpointStore(Path(args.project_dir))
 
@@ -202,6 +213,37 @@ def _cmd_check(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
+
+
+def _load_vfx_arg(raw: str) -> dict[str, list]:
+    """解析 ``--vfx``：JSON 对象或指向 JSON 文件的路径。
+
+    形状 ``{shot_id: [vfx_item, ...]}``；值也可直接是单条 vfx dict（自动包成列表）。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("空字符串")
+    path = Path(text)
+    if path.is_file():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise TypeError("必须是 JSON 对象（shot_id → vfx[]）")
+    out: dict[str, list] = {}
+    for key, val in payload.items():
+        sid = str(key or "").strip()
+        if not sid:
+            continue
+        if isinstance(val, dict):
+            out[sid] = [val]
+        elif isinstance(val, list):
+            out[sid] = list(val)
+        else:
+            raise TypeError(f"{sid!r} 的值必须是 vfx 对象或数组")
+    if not out:
+        raise ValueError("没有有效的 shot_id 条目")
+    return out
 
 
 def _cmd_auto_edit(args: argparse.Namespace) -> int:
@@ -251,10 +293,35 @@ def _cmd_auto_edit(args: argparse.Namespace) -> int:
         base["profile"] = args.profile
     if args.target_duration is not None:
         base["target_duration"] = args.target_duration
-
+    if args.no_scene_index:
+        base["use_scene_index"] = False
+    elif args.scene_index:
+        base["scene_index_path"] = args.scene_index
+    if args.bpm:
+        base["bpm"] = float(args.bpm)
+    if args.beats_per_bar and int(args.beats_per_bar) != 4:
+        base["beats_per_bar"] = int(args.beats_per_bar)
+    if args.no_beat_cuts:
+        base["beat_cuts"] = False
+    if args.reason:
+        base["reason"] = args.reason
     pack_keys = {"lut", "transitions", "pacing", "output_profile", "bind_playbook"}
     pack_over = {k: overrides[k] for k in pack_keys if k in overrides}
     replan_over = {k: v for k, v in overrides.items() if k not in pack_keys}
+
+    # P0-8：--vfx 作者面 → 转成 replan overrides（shot_id → {vfx: [...]}）
+    if getattr(args, "vfx", None):
+        try:
+            vfx_map = _load_vfx_arg(args.vfx)
+        except (OSError, TypeError, json.JSONDecodeError, ValueError) as exc:
+            print(f"错误: --vfx 解析失败（{exc}）", file=sys.stderr)
+            return 2
+        for sid, items in vfx_map.items():
+            row = replan_over.setdefault(sid, {})
+            if not isinstance(row, dict):
+                print(f"错误: --overrides 与 --vfx 冲突于 {sid!r}", file=sys.stderr)
+                return 2
+            row["vfx"] = items
 
     plan_inputs = dict(base)
     plan_inputs["operation"] = "plan"
@@ -264,18 +331,46 @@ def _cmd_auto_edit(args: argparse.Namespace) -> int:
     if not result.success:
         print(f"错误: plan 失败 — {result.error}", file=sys.stderr)
         return 2
-    print(f"plan: {result.data.get('path')}")
+    print(f"plan: {result.data.get('path')}  (rev {result.data.get('rev')})")
+    note = result.data.get("scene_index") or {}
+    if note.get("used"):
+        print(f"情节单元: {note.get('unit_count')} 个，叙事切点 {note.get('narrative_cuts')}，"
+              f"落成断镜 {note.get('applied')}")
+        if note.get("note"):
+            print(f"  注意: {note['note']}")
+    else:
+        print(f"情节单元: 未启用（{note.get('reason') or '无匹配源'}）")
+
+    beat = result.data.get("beat_cuts") or {}
+    if beat.get("used"):
+        bm = result.data.get("beat_map") or {}
+        print(f"能量波切点(P0-5): bpm={bm.get('bpm')}（{bm.get('bpm_source')}）"
+              f" 能量源={bm.get('energy_source')} 刀数={len(bm.get('cuts') or [])}")
+        for row in bm.get("per_source") or []:
+            name = Path(str(row.get("path"))).name
+            if row.get("mode") == "replaced":
+                print(f"  {name}: {row.get('cuts')} 刀（替换 {row.get('scene_cuts_before')} 个 scene 切点）")
+            else:
+                print(f"  {name}: 未接管（保留 {row.get('scene_cuts_before')} 个 scene 切点）")
+        for w in bm.get("warnings") or []:
+            print(f"  注意: {w}")
+    elif beat.get("reason"):
+        print(f"能量波切点(P0-5): 未启用（{beat['reason']}）")
 
     if replan_over:
         r2 = tool.execute({
             "operation": "replan",
             "project_dir": project_dir,
             "overrides": replan_over,
+            "reason": args.reason or "CLI --overrides",
         })
         if not r2.success:
             print(f"错误: replan 失败 — {r2.error}", file=sys.stderr)
             return 2
-        print(f"replan: changed={r2.data.get('changed')}")
+        print(f"replan: rev {r2.data.get('rev')} changed={r2.data.get('changed')} "
+              f"（{r2.data.get('diff_summary')}）")
+        if not r2.data.get("recorded"):
+            print("  （与上一版无实质差异，未新增版本）")
 
     render_inputs = dict(base)
     render_inputs["operation"] = "preview" if args.preview else "render"
@@ -283,6 +378,9 @@ def _cmd_auto_edit(args: argparse.Namespace) -> int:
     if not rendered.success:
         print(f"错误: {render_inputs['operation']} 失败 — {rendered.error}", file=sys.stderr)
         return 2
+    steps = rendered.data.get("render_log") or []
+    if steps:
+        print("六步: " + " / ".join(f"{s.get('step')}={s.get('status')}" for s in steps))
     print(f"output: {rendered.data.get('output_path')}")
     return 0
 
@@ -367,6 +465,7 @@ def _cmd_produce(args: argparse.Namespace) -> int:
         ],
         retry_confirmed=bool(getattr(args, "yes", False)),
         season_concat=bool(getattr(args, "season_concat", False)),
+        accept_degraded_vlm=bool(getattr(args, "accept_degraded_vlm", False)),
     )
     status = str((result.get("progress") or {}).get("status") or "")
     if result.get("success"):
@@ -418,6 +517,205 @@ def _cmd_webui(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_delivery_report(args: argparse.Namespace) -> int:
+    from montage.engine.delivery_report import (
+        build_project_delivery_report,
+        format_vlm_state,
+        format_subtitle_timeline,
+        format_transition_junctions,
+    )
+    from montage.engine.subtitle_timeline import format_srt_audit
+    from montage.engine.cut_points import (
+        format_cut_point_projection,
+        format_m5_parallel_audit,
+        format_m6_parallel_audit,
+    )
+    from montage.engine.transition_contract import (
+        format_transition_contract_projection,
+    )
+
+    try:
+        report = build_project_delivery_report(
+            args.project_dir,
+            quality_mode=args.quality_mode,
+        )
+    except Exception as exc:  # noqa: BLE001 - CLI surfaces a compact operator error
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    if args.summary:
+        material = report.get("material_contract") or {}
+        quality = report.get("quality_gate") or {}
+        trace = report.get("traceability") or {}
+        process = report.get("process_status") or {}
+        vlm = quality.get("vlm") or {}
+        duration = report.get("duration_reconciliation") or {}
+        print(
+            f"delivery={report.get('status')} "
+            f"process={process.get('status')} "
+            f"material={material.get('actual_ai_video')}/{material.get('required_shots')} "
+            f"quality={quality.get('mode')} "
+            f"vlm={format_vlm_state(vlm)} "
+            f"vlm_verified={vlm.get('verified')} "
+            f"events_healthy={trace.get('generation_events_healthy')}"
+        )
+        if duration:
+            print(f"transitions={format_transition_junctions(duration)}")
+        subtitle = report.get("subtitle_timeline")
+        if subtitle is not None:
+            print(f"subtitle={format_subtitle_timeline(subtitle)}")
+        srt_audit = report.get("subtitle_srt_audit")
+        if srt_audit is not None:
+            print(f"srt={format_srt_audit(srt_audit)}")
+        cuts = report.get("cut_points")
+        if cuts is not None:
+            print(f"cut_points={format_cut_point_projection(cuts)}")
+        m5_audit = report.get("m5_parallel_audit")
+        if m5_audit is not None:
+            print(f"m5_audit={format_m5_parallel_audit(m5_audit)}")
+        m6_audit = report.get("m6_parallel_audit")
+        if m6_audit is not None:
+            print(f"m6_audit={format_m6_parallel_audit(m6_audit)}")
+        transition_contracts = report.get("transition_contracts")
+        if transition_contracts is not None:
+            print(
+                "transition_contracts="
+                f"{format_transition_contract_projection(transition_contracts)}"
+            )
+    else:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _cmd_review_findings(args: argparse.Namespace) -> int:
+    from montage.engine.review_findings import (
+        build_review_findings,
+        load_review_log,
+        query_finding_id_index,
+    )
+
+    project_dir = Path(args.project_dir)
+    try:
+        rows, parse_errors = load_review_log(
+            project_dir / "artifacts" / "review_log.jsonl"
+        )
+        projection = build_review_findings(rows)
+        findings = query_finding_id_index(
+            projection,
+            finding_id=args.finding_id,
+            status=args.status,
+            severity=args.severity,
+            target=args.target,
+        )
+    except Exception as exc:  # noqa: BLE001 - CLI surfaces a compact operator error
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+
+    filters = {
+        "finding_id": args.finding_id,
+        "status": args.status,
+        "severity": args.severity,
+        "target": args.target,
+    }
+    if args.summary:
+        print(
+            f"log_present={rows is not None} "
+            f"total={projection.get('finding_count', 0)} "
+            f"matched={len(findings)} "
+            f"occurrences={sum(int(row.get('occurrence_count') or 0) for row in findings)} "
+            f"parse_errors={len(parse_errors)}"
+        )
+        return 0
+
+    print(json.dumps({
+        "schema_version": 1,
+        "log_present": rows is not None,
+        "filters": filters,
+        "total_findings": projection.get("finding_count", 0),
+        "matched_findings": len(findings),
+        "matched_occurrences": sum(
+            int(row.get("occurrence_count") or 0) for row in findings
+        ),
+        "parse_error_count": len(parse_errors),
+        "parse_errors": parse_errors,
+        "findings": findings,
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _cmd_srt_rebuild(args: argparse.Namespace) -> int:
+    from montage.engine.artifacts import ArtifactStore
+    from montage.engine.subtitle_timeline import (
+        audit_srt_sync,
+        build_regenerated_srt,
+    )
+
+    root = Path(args.project_dir)
+    store = ArtifactStore(root)
+    compose_plan = store.read("compose_plan")
+    if compose_plan is None:
+        print("错误: compose_plan.json 缺失", file=sys.stderr)
+        return 2
+    progress = store.read("produce_progress") or {}
+    finish = ((progress.get("steps") or {}).get("finish") or {}) if isinstance(progress, dict) else {}
+    title_offset = float(finish.get("title_dur") or 0)
+    film_health = store.read("film_health") or {}
+    final_duration = (
+        (film_health.get("probe") or {}).get("duration_seconds")
+        if isinstance(film_health, dict) else None
+    )
+    output = Path(args.output) if args.output else root / "renders" / "final.srt"
+    existing = output.read_text(encoding="utf-8") if output.is_file() else None
+
+    try:
+        rebuilt = build_regenerated_srt(
+            compose_plan,
+            title_offset_seconds=title_offset,
+            max_chars_per_line=args.max_chars,
+        )
+    except (ValueError, TypeError) as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+
+    audit_before = audit_srt_sync(
+        compose_plan=compose_plan,
+        srt_text=existing,
+        title_offset_seconds=title_offset,
+        final_duration_seconds=final_duration,
+    )
+    audit_after = audit_srt_sync(
+        compose_plan=compose_plan,
+        srt_text=rebuilt["srt"],
+        title_offset_seconds=title_offset,
+        final_duration_seconds=final_duration,
+    )
+
+    if args.write:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        tmp = output.with_suffix(output.suffix + ".tmp")
+        try:
+            tmp.write_text(rebuilt["srt"], encoding="utf-8")
+            os.replace(tmp, output)
+        except PermissionError:
+            # Windows controlled folders may reject sibling .tmp creation.
+            output.write_text(rebuilt["srt"], encoding="utf-8")
+        status = "written"
+    else:
+        status = "dry_run"
+
+    print(json.dumps({
+        "status": status,
+        "write": bool(args.write),
+        "output_path": str(output),
+        "title_offset_seconds": title_offset,
+        "cue_count": rebuilt.get("cue_count"),
+        "srt_sha256": hashlib.sha256(rebuilt["srt"].encode("utf-8")).hexdigest(),
+        "srt_text": rebuilt["srt"],
+        "audit_before": audit_before,
+        "audit_after": audit_after,
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="montage", description="montage-core CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -463,10 +761,39 @@ def build_parser() -> argparse.ArgumentParser:
     p_ae.add_argument("--overrides", default=None, help="JSON 对象：StylePack 覆写和/或 replan（段/镜头）")
     p_ae.add_argument("--has-bgm", dest="has_bgm", action="store_true")
     p_ae.add_argument("--is-speech", dest="is_speech", action="store_true")
+    p_ae.add_argument(
+        "--bpm", type=float, default=0.0,
+        help="P0-5：曲库/人给的 bpm。0（默认）= 对能量包络自相关估拍（estimated，必带 warning）",
+    )
+    p_ae.add_argument(
+        "--beats-per-bar", dest="beats_per_bar", type=int, default=4,
+        help="P0-5：每 bar 拍数（默认 4/4）",
+    )
+    p_ae.add_argument(
+        "--no-beat-cuts", dest="no_beat_cuts", action="store_true",
+        help="P0-5：有 --has-bgm 也不用能量波接管切点（回到纯 scene-change 切点）",
+    )
+    p_ae.add_argument(
+        "--vfx", dest="vfx", default=None, metavar="JSON",
+        help=(
+            "P0-8：按镜写后期特效（JSON 对象 shot_id→vfx[]，或 JSON 文件路径）。"
+            "例：'{\"seg_0_shot_0\":[{\"layer\":\"post\",\"kind\":\"impact_flash\"}]}' "
+            "——onset 缺省时吸附 beat_map 能量峰；走 replan 写入 plan"
+        ),
+    )
     p_ae.add_argument("--language", default="zh")
     p_ae.add_argument("--target-duration", dest="target_duration", type=float, default=None)
     p_ae.add_argument("--preview", action="store_true", help="只出 480p 预览到 tmp_autoedit/preview.mp4")
     p_ae.add_argument("--no-resume", dest="no_resume", action="store_true", help="忽略中间产物，全量重渲")
+    p_ae.add_argument(
+        "--scene-index", dest="scene_index", default=None, metavar="PATH",
+        help="P0-2 情节单元索引 JSON（默认自动读 <project>/artifacts/scene_index.json）",
+    )
+    p_ae.add_argument(
+        "--no-scene-index", dest="no_scene_index", action="store_true",
+        help="忽略 scene_index，纯视觉切点断镜",
+    )
+    p_ae.add_argument("--reason", default="", help="本版改动说明（写入 plan_history + decisions.jsonl）")
 
     p_prod = sub.add_parser("produce", help="已有分镜片段拼片，或 --idea 收编圣经")
     p_prod.add_argument("project_dir")
@@ -481,7 +808,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_prod.add_argument("--idea", default=None, help="W1：级联分析并收编圣经（不生成、不拼片）")
     p_prod.add_argument("--tts", action="store_true", help="W2：生成后合成对白（默认不合成）")
     p_prod.add_argument("--trim-hero", dest="trim_hero", action="store_true", help="W3：把超额 pending hero 降为 talk")
-    p_prod.add_argument("--all-video", dest="all_video", action="store_true", help="W3：全镜 I2V，跳过 30%（成片已齐则忽略）")
+    p_prod.add_argument("--all-video", dest="all_video", action="store_true", help="W3：全镜 I2V，跳过 30%%（成片已齐则忽略）")
     p_prod.add_argument("--skip-finish", dest="skip_finish", action="store_true", help="跳过 LUT/profile/片头（release 仍跑）")
     p_prod.add_argument("--burn-subs", dest="burn_subs", action="store_true", help="finish 把字幕烧进像素（默认只写 SRT 旁路）")
     p_prod.add_argument("--profile", default="", help="finish 显式平台档案；不读管线 default_profile")
@@ -494,6 +821,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="系列根：全集完成后拼接 renders/season.mp4（默认不拼）",
     )
     p_prod.add_argument(
+        "--accept-degraded-vlm",
+        dest="accept_degraded_vlm",
+        action="store_true",
+        help=(
+            "仅 degraded/manual_only 且 VLM 未验证时有效：显式记录 "
+            "human_review.decision=accepted_with_degraded_vlm；不改变 delivery=degraded"
+        ),
+    )
+    p_prod.add_argument(
         "--review",
         default="director",
         choices=["bible", "none", "each_episode", "director"],
@@ -504,6 +840,64 @@ def build_parser() -> argparse.ArgumentParser:
     p_webui.add_argument("--host", default="127.0.0.1")
     p_webui.add_argument("--port", type=int, default=8399)
     p_webui.add_argument("--root", default=str(Path.cwd()))
+    p_delivery = sub.add_parser(
+        "delivery_report",
+        help="生成只读交付快照（默认输出 JSON，不写 artifact）",
+    )
+    p_delivery.add_argument("project_dir")
+    p_delivery.add_argument(
+        "--summary",
+        action="store_true",
+        help="仅输出一行关键状态",
+    )
+    p_delivery.add_argument(
+        "--quality-mode",
+        dest="quality_mode",
+        choices=["full", "strict", "degraded", "manual_only"],
+        default="degraded",
+        help="质量策略语义（full/strict 阻断行为将在下一小步接入）",
+    )
+    p_srt = sub.add_parser(
+        "srt_rebuild",
+        help="按 xfade 投影重生成 SRT；默认 dry-run，--write 才写盘",
+    )
+    p_srt.add_argument("project_dir")
+    p_srt.add_argument(
+        "--write",
+        action="store_true",
+        help="显式写回 renders/final.srt；不加则只预览",
+    )
+    p_srt.add_argument(
+        "--output",
+        default=None,
+        help="可选输出路径；默认 renders/final.srt",
+    )
+    p_srt.add_argument(
+        "--max-chars",
+        dest="max_chars",
+        type=int,
+        default=20,
+        help="每行最大字符数（默认 20）",
+    )
+    p_findings = sub.add_parser(
+        "review_findings",
+        help="只读查询 review finding 生命周期（默认输出 JSON，不写 artifact）",
+    )
+    p_findings.add_argument("project_dir")
+    p_findings.add_argument("--finding-id", dest="finding_id", default=None)
+    p_findings.add_argument(
+        "--status",
+        dest="status",
+        default=None,
+        choices=["open", "in_progress", "fixed", "verified", "waived", "invalid"],
+    )
+    p_findings.add_argument("--severity", dest="severity", default=None)
+    p_findings.add_argument("--target", dest="target", default=None)
+    p_findings.add_argument(
+        "--summary",
+        action="store_true",
+        help="仅输出一行总量、匹配数和日志健康状态",
+    )
     return parser
 
 
@@ -528,6 +922,12 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_auto_edit(args)
     if args.cmd == "produce":
         return _cmd_produce(args)
+    if args.cmd == "delivery_report":
+        return _cmd_delivery_report(args)
+    if args.cmd == "srt_rebuild":
+        return _cmd_srt_rebuild(args)
+    if args.cmd == "review_findings":
+        return _cmd_review_findings(args)
     if args.cmd == "webui":
         return _cmd_webui(args)
     return 1

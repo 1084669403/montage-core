@@ -7,6 +7,10 @@ __pycache__/
 # 测试临时目录（minitest 工作区）
 .tmp_tests/
 
+# 临时工作区与探针文件
+.tmp/
+tmp_quote_probe.txt
+
 # 项目生产工作区（可再生）
 projects/
 

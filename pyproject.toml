@@ -10,7 +10,10 @@ dependencies = ["jsonschema>=4.20"]
 [project.optional-dependencies]
 http = []  # 已废弃：HTTP 走标准库 urllib，无需 requests
 validate = ["jsonschema>=4.20"]  # 别名：jsonschema 已进核心
-webui = ["fastapi>=0.110", "uvicorn>=0.29"]
+# starlette 1.x 移除了 APIRouter(on_startup=...)，与 fastapi<0.116 不兼容：
+# 实测 fastapi 0.115 + starlette 1.6 会在建应用时直接
+# "Router.__init__() got an unexpected keyword argument 'on_startup'"。
+webui = ["fastapi>=0.110,<0.116", "starlette>=0.40,<0.42", "uvicorn>=0.29"]
 dev = ["pytest>=8.0", "jsonschema>=4.20"]
 
 [build-system]

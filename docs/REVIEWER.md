@@ -4,6 +4,11 @@
 > 借鉴行业通行的"准确-完整-建设性"审查三要素与严重度分级共识，文本为原创。
 > 配合确定性工具使用：schema 校验（ArtifactStore）、`script_validator`、
 > `edit_advisor`、playbook 的 `quality_rules`。
+>
+> **多角色底座**：本协议是所有角色（编剧/导演/美术指导/动作指导）审查的公共底座；
+> 角色分工/轮次规则/record 纪律/振荡检测见 [ROLES.md](ROLES.md)——finding 须带
+> `role` 字段（screenwriter/director/art_director/action_director），评审记录走
+> `review_logger`（artifacts/review_log.jsonl），不再只写决策日志。
 
 ## 何时使用
 
